@@ -118,40 +118,150 @@ const MANAGERS_MOD_RS: &str = include_str!("mod.rs");
 
 const MANAGER_RS: &str = include_str!("manager.rs");
 
-fn code_skeleton(line: &str, in_block_comment: &mut bool, in_string: &mut bool) -> String {
+#[derive(Clone, Copy, Default)]
+enum SkeletonState {
+    #[default]
+    Code,
+    BlockComment(u32),
+    Str,
+    RawStr(usize),
+}
+
+fn raw_string_open(chars: &[char], start: usize) -> Option<(usize, usize)> {
+    let mut i = start;
+    if chars[i] == 'b' {
+        if chars.get(i + 1) != Some(&'r') {
+            return None;
+        }
+        i += 1;
+    }
+    if chars[i] != 'r' {
+        return None;
+    }
+    i += 1;
+    let mut hashes = 0;
+    while chars.get(i) == Some(&'#') {
+        hashes += 1;
+        i += 1;
+    }
+    if chars.get(i) == Some(&'"') {
+        Some((hashes, i + 1 - start))
+    } else {
+        None
+    }
+}
+
+fn char_literal_len(chars: &[char], start: usize) -> Option<usize> {
+    let mut i = start + 1;
+    match chars.get(i) {
+        Some('\\') => {
+            i += 1;
+            if chars.get(i) == Some(&'u') && chars.get(i + 1) == Some(&'{') {
+                i += 2;
+                while chars.get(i).is_some_and(|c| *c != '}') {
+                    i += 1;
+                }
+                i += 1;
+            } else {
+                i += 1;
+            }
+        }
+        Some(_) => i += 1,
+        None => return None,
+    }
+    if chars.get(i) == Some(&'\'') {
+        Some(i + 1 - start)
+    } else {
+        None
+    }
+}
+
+fn code_skeleton(line: &str, state: &mut SkeletonState) -> String {
+    let chars: Vec<char> = line.chars().collect();
     let mut out = String::new();
-    let mut chars = line.chars().peekable();
-    while let Some(c) = chars.next() {
-        if *in_block_comment {
-            if c == '*' && chars.peek() == Some(&'/') {
-                chars.next();
-                *in_block_comment = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match *state {
+            SkeletonState::BlockComment(depth) => {
+                if c == '/' && chars.get(i + 1) == Some(&'*') {
+                    *state = SkeletonState::BlockComment(depth + 1);
+                    i += 2;
+                } else if c == '*' && chars.get(i + 1) == Some(&'/') {
+                    *state = if depth <= 1 {
+                        SkeletonState::Code
+                    } else {
+                        SkeletonState::BlockComment(depth - 1)
+                    };
+                    i += 2;
+                } else {
+                    i += 1;
+                }
             }
-            continue;
-        }
-        if *in_string {
-            if c == '\\' {
-                chars.next();
-                continue;
+            SkeletonState::Str => {
+                if c == '\\' {
+                    i += 2;
+                } else {
+                    if c == '"' {
+                        *state = SkeletonState::Code;
+                    }
+                    i += 1;
+                }
             }
-            if c == '"' {
-                *in_string = false;
+            SkeletonState::RawStr(hashes) => {
+                if c == '"'
+                    && (0..hashes).all(|offset| chars.get(i + 1 + offset) == Some(&'#'))
+                {
+                    *state = SkeletonState::Code;
+                    i += 1 + hashes;
+                } else {
+                    i += 1;
+                }
             }
-            continue;
+            SkeletonState::Code => {
+                if c == '/' && chars.get(i + 1) == Some(&'/') {
+                    break;
+                }
+                if c == '/' && chars.get(i + 1) == Some(&'*') {
+                    *state = SkeletonState::BlockComment(1);
+                    i += 2;
+                    continue;
+                }
+                if c == '"' {
+                    *state = SkeletonState::Str;
+                    i += 1;
+                    continue;
+                }
+                if c == 'r' || c == 'b' {
+                    if let Some((hashes, len)) = raw_string_open(&chars, i) {
+                        *state = SkeletonState::RawStr(hashes);
+                        i += len;
+                        continue;
+                    }
+                }
+                if c == 'b' && chars.get(i + 1) == Some(&'"') {
+                    *state = SkeletonState::Str;
+                    i += 2;
+                    continue;
+                }
+                if c == '\'' || (c == 'b' && chars.get(i + 1) == Some(&'\'')) {
+                    let quote_at = if c == 'b' { i + 1 } else { i };
+                    match char_literal_len(&chars, quote_at) {
+                        Some(len) => {
+                            i = quote_at + len;
+                            continue;
+                        }
+                        None => {
+                            out.push(c);
+                            i += 1;
+                            continue;
+                        }
+                    }
+                }
+                out.push(c);
+                i += 1;
+            }
         }
-        if c == '/' && chars.peek() == Some(&'/') {
-            break;
-        }
-        if c == '/' && chars.peek() == Some(&'*') {
-            chars.next();
-            *in_block_comment = true;
-            continue;
-        }
-        if c == '"' {
-            *in_string = true;
-            continue;
-        }
-        out.push(c);
     }
     out
 }
@@ -214,10 +324,9 @@ fn scan_manager_types(source: &str) -> ManagerTypeScan {
     let mut depth: i32 = 0;
     let mut test_block_at: Option<i32> = None;
     let mut pending_test = false;
-    let mut in_block_comment = false;
-    let mut in_string = false;
+    let mut skeleton_state = SkeletonState::default();
     for raw_line in source.lines() {
-        let line = code_skeleton(raw_line, &mut in_block_comment, &mut in_string);
+        let line = code_skeleton(raw_line, &mut skeleton_state);
         let mut rest = line.trim();
         let mut line_cfg_test = false;
         while let Some(inner) = rest.strip_prefix("#[") {
@@ -596,6 +705,59 @@ fn manager_type_scan_ignores_comments_and_strings() {
 }
 
 #[test]
+fn manager_type_scan_ignores_char_literals_raw_strings_and_nested_comments() {
+    let quote_char = "let q = '\"';\npub struct Real;\nimpl Manager for Real {}\n";
+    let scan = scan_manager_types(quote_char);
+    assert_eq!(scan.structs, vec!["Real".to_string()]);
+    assert_eq!(scan.impls, vec!["Real".to_string()]);
+    let brace_char_in_tests = "#[cfg(test)]\nmod tests {\n let open = '{';\n pub struct Hidden;\n}\npub struct After;\nimpl Manager for After {}\n";
+    let scan = scan_manager_types(brace_char_in_tests);
+    assert_eq!(scan.structs, vec!["After".to_string()]);
+    assert_eq!(scan.impls, vec!["After".to_string()]);
+    let quote_char_in_tests = "#[cfg(test)]\nmod tests {\n let q = '\"';\n}\npub struct After;\n";
+    assert_eq!(
+        scan_manager_types(quote_char_in_tests).structs,
+        vec!["After".to_string()]
+    );
+    let raw_inner_quote = "let s = r#\"a \" b\"#;\npub struct Real;\n";
+    assert_eq!(
+        scan_manager_types(raw_inner_quote).structs,
+        vec!["Real".to_string()]
+    );
+    let raw_multiline = "let s = r#\"a \"\npub struct Hidden;\n\"#;\npub struct Real;\n";
+    assert_eq!(
+        scan_manager_types(raw_multiline).structs,
+        vec!["Real".to_string()]
+    );
+    let nested_comment = "/* outer /* inner */ pub struct Hidden; */\npub struct Real;\n";
+    assert_eq!(
+        scan_manager_types(nested_comment).structs,
+        vec!["Real".to_string()]
+    );
+    let multiline_string = "let s = \"start\npub struct Hidden;\nend\";\npub struct Real;\n";
+    assert_eq!(
+        scan_manager_types(multiline_string).structs,
+        vec!["Real".to_string()]
+    );
+    let unicode_escape_before_tests = "let smile = '\\u{1F600}';\n#[cfg(test)]\nmod tests {\n pub struct Hidden;\n}\npub struct After;\n";
+    assert_eq!(
+        scan_manager_types(unicode_escape_before_tests).structs,
+        vec!["After".to_string()]
+    );
+    let unicode_escape_inside_tests = "#[cfg(test)]\nmod tests {\n let smile = '\\u{1F600}';\n pub struct Hidden;\n}\npub struct After;\n";
+    assert_eq!(
+        scan_manager_types(unicode_escape_inside_tests).structs,
+        vec!["After".to_string()]
+    );
+    let lifetimes_and_escaped_char =
+        "fn f<'a>(x: &'a str) -> &'a str { x }\nlet q = '\\'';\nlet brace = '\\u{7d}';\npub struct Real;\n";
+    assert_eq!(
+        scan_manager_types(lifetimes_and_escaped_char).structs,
+        vec!["Real".to_string()]
+    );
+}
+
+#[test]
 fn shipped_module_scan_catches_every_declaration_shape() {
     let shapes = [
         "pub mod npm;\n",
@@ -797,5 +959,26 @@ fn conformance_missing_runtime_errors_instead_of_panicking() {
         let result = (case.run)(&repo_config(&fixture.repo_dir), &missing);
         assert!(result.is_err(), "{}: missing runtime was not an error", case.name);
         fixture.cleanup();
+    }
+}
+
+#[test]
+fn manager_type_scan_catches_generic_manager_shapes() {
+    let cases: [(&str, &str); 10] = [
+        ("generic lifetime tuple", "pub struct OrphanManager<'a>(&'a str);\nimpl<'a> Manager for OrphanManager<'a> {}\n"),
+        ("phantom lifetime", "pub struct OrphanManager<'a> { pub marker: std::marker::PhantomData<&'a ()> }\nimpl Manager for OrphanManager<'_> {}\n"),
+        ("char const default", "pub struct OrphanManager<const C: char = '{'>;\nimpl Manager for OrphanManager<'{'> {}\n"),
+        ("static ref default", "pub struct OrphanManager<T = &'static str>(pub T);\nimpl<T> Manager for OrphanManager<T> {}\n"),
+        ("apostrophe comments", "pub struct OrphanManager; // don't\nimpl Manager for OrphanManager {} // it's fine\n"),
+        ("slash star chars", "let a = '/';\nlet b = '*';\npub struct OrphanManager;\nimpl Manager for OrphanManager {}\n"),
+        ("byte string", "let s = b\"abc\";\npub struct OrphanManager;\nimpl Manager for OrphanManager {}\n"),
+        ("comment with quote", "/* it's a \"test\" */ pub struct OrphanManager;\nimpl Manager for OrphanManager {}\n"),
+        ("string with comment opener", "let s = \"/*\";\npub struct OrphanManager;\nimpl Manager for OrphanManager {}\n"),
+        ("raw identifier field", "pub struct OrphanManager { pub r#type: u8 }\nimpl Manager for OrphanManager {}\n"),
+    ];
+    for (label, source) in cases {
+        let scan = scan_manager_types(source);
+        assert_eq!(scan.structs, vec!["OrphanManager".to_string()], "structs missed: {label}");
+        assert_eq!(scan.impls, vec!["OrphanManager".to_string()], "impls missed: {label}");
     }
 }
