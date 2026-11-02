@@ -1479,9 +1479,22 @@ impl RepoProcessor {
         match git2::Repository::open(full_path) {
             Ok(sub_repo) => {
                 if let Some(head) = sub_repo.head().ok().and_then(|head| head.target()) {
-                    return head == expected;
+                    if head != expected {
+                        return false;
+                    }
+                    let mut status_options = git2::StatusOptions::new();
+                    status_options.include_untracked(true);
+                    return matches!(
+                        sub_repo.statuses(Some(&mut status_options)),
+                        Ok(statuses) if statuses.is_empty()
+                    );
                 }
-                sub_repo.is_empty().unwrap_or(false)
+                match std::fs::read_dir(full_path) {
+                    Ok(entries) => entries
+                        .filter_map(|entry| entry.ok())
+                        .all(|entry| entry.file_name() == ".git"),
+                    Err(_) => false,
+                }
             }
             Err(_) => match std::fs::read_dir(full_path) {
                 Ok(mut entries) => entries.next().is_none(),
@@ -3309,6 +3322,40 @@ mod tests {
     }
 
     #[test]
+    fn rollback_preserves_gitlink_with_uncommitted_edits() {
+        let (root, watched_path, v1, v2, _sub_a, _sub_b) =
+            gitlink_fixture("rollback-gitlink-dirty");
+        std::fs::write(watched_path.join("sub/sub.txt"), "user edit\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
+            "user edit\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_gitlink_with_an_untracked_file() {
+        let (root, watched_path, v1, v2, _sub_a, _sub_b) =
+            gitlink_fixture("rollback-gitlink-untracked");
+        std::fs::write(watched_path.join("sub/notes.txt"), "user notes\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/notes.txt")).unwrap(),
+            "user notes\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn rollback_restores_uninitialized_gitlink_directory() {
         let (root, watched_path, v1, v2, _sub_a, _sub_b) =
             gitlink_fixture("rollback-gitlink-uninitialized");
@@ -3335,6 +3382,35 @@ mod tests {
         std::fs::remove_file(watched_path.join("thing")).unwrap();
         std::fs::create_dir_all(watched_path.join("thing/nested")).unwrap();
         std::fs::write(watched_path.join("thing/a.txt"), "a\n").unwrap();
+        std::fs::write(watched_path.join("thing/nested/b.txt"), "b\n").unwrap();
+        let v2 = commit_all(&watched, "v2");
+        drop(watched);
+
+        let processor = processor_for(&watched_path);
+        assert!(processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("thing")).unwrap(),
+            "file version\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_restores_typechange_directory_with_a_symlink_child() {
+        let root = temp_dir("rollback-typechange-dir-symlink");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        std::fs::write(watched_path.join("thing"), "file version\n").unwrap();
+        let v1 = commit_all(&watched, "v1");
+        std::fs::remove_file(watched_path.join("thing")).unwrap();
+        std::fs::create_dir_all(watched_path.join("thing/nested")).unwrap();
+        std::fs::write(watched_path.join("thing/f.txt"), "f\n").unwrap();
+        std::os::unix::fs::symlink("f.txt", watched_path.join("thing/link")).unwrap();
         std::fs::write(watched_path.join("thing/nested/b.txt"), "b\n").unwrap();
         let v2 = commit_all(&watched, "v2");
         drop(watched);
