@@ -110,6 +110,79 @@ fn case_for_strategy(strategy: &BuildStrategy) -> ConformanceCase {
     }
 }
 
+const MANAGERS_MOD_RS: &str = include_str!("mod.rs");
+
+fn mod_declaration_name(declaration: &str) -> Option<String> {
+    let after_pub = match declaration.strip_prefix("pub") {
+        Some(rest) if rest.starts_with(|c: char| c.is_whitespace() || c == '(') => {
+            let rest = rest.trim_start();
+            match rest.strip_prefix('(') {
+                Some(inner) => inner.split(')').nth(1)?.trim_start(),
+                None => rest,
+            }
+        }
+        _ => declaration,
+    };
+    let after_mod = after_pub.strip_prefix("mod")?;
+    if !after_mod.starts_with(|c: char| c.is_whitespace()) {
+        return None;
+    }
+    let name: String = after_mod
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+fn declared_shipped_modules_from(source: &str) -> Vec<String> {
+    let mut modules = Vec::new();
+    let mut cfg_test = false;
+    for line in source.lines() {
+        let mut rest = line.trim();
+        while let Some(inner) = rest.strip_prefix("#[") {
+            let Some(end) = inner.find(']') else { break };
+            let attr = inner[..end].replace(' ', "");
+            if attr == "cfg(test)" || attr.contains("cfg(all(test") || attr.contains("cfg(any(test")
+            {
+                cfg_test = true;
+            }
+            rest = inner[end + 1..].trim_start();
+        }
+        if rest.is_empty() {
+            continue;
+        }
+        match mod_declaration_name(rest) {
+            Some(name) => {
+                if !cfg_test {
+                    modules.push(name);
+                }
+                cfg_test = false;
+            }
+            None => {
+                cfg_test = false;
+            }
+        }
+    }
+    modules.sort();
+    modules
+}
+
+fn declared_shipped_modules() -> Vec<String> {
+    declared_shipped_modules_from(MANAGERS_MOD_RS)
+}
+
+fn kind_module_name(kind: BuildStrategyKind) -> String {
+    serde_json::to_string(&kind)
+        .unwrap()
+        .trim_matches('"')
+        .to_string()
+}
+
 fn registered_kinds() -> Vec<BuildStrategyKind> {
     BuildStrategyKind::ALL.to_vec()
 }
@@ -215,6 +288,61 @@ fn registered_kinds_are_exactly_all_kinds_once_each() {
             );
         }
     }
+}
+
+#[test]
+fn every_shipped_manager_module_is_reachable_from_a_build_strategy() {
+    let mut expected: Vec<String> = registered_kinds()
+        .iter()
+        .map(|kind| kind_module_name(*kind))
+        .collect();
+    expected.push("manager".to_string());
+    expected.sort();
+    assert_eq!(
+        declared_shipped_modules(),
+        expected,
+        "managers/mod.rs must declare exactly one shipped module per registered build strategy, plus the manager module"
+    );
+}
+
+#[test]
+fn shipped_module_scan_catches_every_declaration_shape() {
+    let shapes = [
+        "pub mod npm;\n",
+        "pub mod npm {\n}\n",
+        "pub(crate) mod npm;\n",
+        "mod npm;\n",
+        "#[cfg(feature = \"npm\")] pub mod npm;\n",
+        "#[cfg(feature = \"npm\")]\npub mod npm;\n",
+    ];
+    for source in shapes {
+        assert_eq!(
+            declared_shipped_modules_from(source),
+            vec!["npm".to_string()],
+            "scan missed declaration shape: {source:?}"
+        );
+    }
+}
+
+#[test]
+fn shipped_module_scan_skips_test_only_modules_in_every_shape() {
+    let shapes = [
+        "#[cfg(test)]\npub mod template;\n",
+        "#[cfg(test)] pub mod template;\n",
+        "#[cfg(all(test, feature = \"x\"))] pub mod template;\n",
+    ];
+    for source in shapes {
+        assert_eq!(
+            declared_shipped_modules_from(source),
+            Vec::<String>::new(),
+            "scan counted a test-only module: {source:?}"
+        );
+    }
+    let mixed = "pub mod bun;\n#[cfg(test)]\npub mod template;\npub mod rust;\n";
+    assert_eq!(
+        declared_shipped_modules_from(mixed),
+        vec!["bun".to_string(), "rust".to_string()]
+    );
 }
 
 #[test]
