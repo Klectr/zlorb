@@ -177,10 +177,7 @@ fn declared_shipped_modules() -> Vec<String> {
 }
 
 fn kind_module_name(kind: BuildStrategyKind) -> String {
-    serde_json::to_string(&kind)
-        .unwrap()
-        .trim_matches('"')
-        .to_string()
+    kind.name().to_string()
 }
 
 fn registered_kinds() -> Vec<BuildStrategyKind> {
@@ -194,13 +191,6 @@ fn registered_cases() -> Vec<ConformanceCase> {
         .collect();
     cases.push(template_case());
     cases
-}
-
-fn strategy_name(kind: BuildStrategyKind) -> &'static str {
-    match kind {
-        BuildStrategyKind::Bun => "bun",
-        BuildStrategyKind::Rust => "rust",
-    }
 }
 
 struct Fixture {
@@ -276,7 +266,7 @@ fn registered_kinds_are_exactly_all_kinds_once_each() {
     let cases = registered_cases();
     assert_eq!(cases.len(), BuildStrategyKind::ALL.len() + 1);
     for (index, kind) in BuildStrategyKind::ALL.iter().enumerate() {
-        assert_eq!(cases[index].name, strategy_name(*kind));
+        assert_eq!(cases[index].name, kind.name());
     }
     assert_eq!(cases[cases.len() - 1].name, template_case().name);
     for (index, case) in cases.iter().enumerate() {
@@ -354,7 +344,7 @@ fn shipped_module_scan_skips_test_only_modules_in_every_shape() {
 fn registered_strategies_resolve_to_their_conformance_cases() {
     for kind in registered_kinds() {
         let mut config = repo_config(Path::new("/tmp/demo"));
-        config.build_strategy = Some(strategy_name(kind).to_string());
+        config.build_strategy = Some(kind.name().to_string());
         let strategy = select_strategy(&config).unwrap();
         assert_eq!(strategy.kind(), kind);
         assert_eq!(case_for_strategy(&strategy).name, case_for_kind(kind).name);
@@ -375,7 +365,7 @@ fn every_build_strategy_variant_maps_to_a_kind_once_each() {
     for strategy in &strategies {
         let case = case_for_strategy(strategy);
         let expected = case_for_kind(strategy.kind());
-        assert_eq!(case.name, strategy_name(strategy.kind()));
+        assert_eq!(case.name, strategy.kind().name());
         assert_eq!(case.name, expected.name);
         assert_eq!(case.runtime_name, expected.runtime_name);
         assert_eq!(case.steps.len(), expected.steps.len());
@@ -427,7 +417,7 @@ fn selected_strategy_payload_runs_its_kinds_steps() {
         let fixture = fixture(case.name, "payload");
         let runtime = write_stand_in(&fixture, &case, None);
         let mut config = repo_config(&fixture.repo_dir);
-        config.build_strategy = Some(strategy_name(kind).to_string());
+        config.build_strategy = Some(kind.name().to_string());
         let strategy = select_strategy(&config).unwrap();
         assert_eq!(strategy.kind(), kind);
         let result = strategy.exec_with_runtime_path(&config, &runtime);
@@ -449,7 +439,7 @@ fn selected_strategy_payload_failure_names_its_kinds_step() {
         let fixture = fixture(case.name, "payload-fail");
         let runtime = write_stand_in(&fixture, &case, Some(0));
         let mut config = repo_config(&fixture.repo_dir);
-        config.build_strategy = Some(strategy_name(kind).to_string());
+        config.build_strategy = Some(kind.name().to_string());
         let strategy = select_strategy(&config).unwrap();
         let err = strategy
             .exec_with_runtime_path(&config, &runtime)
