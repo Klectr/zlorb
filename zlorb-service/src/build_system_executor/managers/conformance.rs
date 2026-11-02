@@ -723,8 +723,9 @@ fn mod_declaration_name(declaration: &str) -> Option<String> {
     }
 }
 
-fn declared_shipped_modules_from(source: &str) -> Vec<String> {
+fn declared_modules_inner(source: &str) -> Vec<(String, bool)> {
     let mut modules = Vec::new();
+    let mut awaiting_terminator: Option<String> = None;
     let mut cfg_test = false;
     let mut pending_mod: Option<String> = None;
     let mut attr_buf: Option<String> = None;
@@ -867,6 +868,13 @@ fn declared_shipped_modules_from(source: &str) -> Vec<String> {
                 }
                 continue;
             }
+            if let Some(awaited) = awaiting_terminator.take() {
+                if seg == ";" {
+                    modules.push((awaited, true));
+                    continue;
+                }
+                modules.push((awaited, false));
+            }
             if gated {
                 pending_mod = None;
                 if seg_opens > seg_closes {
@@ -893,7 +901,13 @@ fn declared_shipped_modules_from(source: &str) -> Vec<String> {
                 continue;
             }
             if let Some(name) = mod_declaration_name(seg) {
-                modules.push(name);
+                if seg.ends_with(';') {
+                    modules.push((name, true));
+                } else if seg.contains(['{', '}']) {
+                    modules.push((name, false));
+                } else {
+                    awaiting_terminator = Some(name);
+                }
                 pending_mod = None;
                 depth += seg_opens - seg_closes;
                 continue;
@@ -901,7 +915,13 @@ fn declared_shipped_modules_from(source: &str) -> Vec<String> {
             if let Some(pending) = pending_mod.take() {
                 let combined = format!("{pending} {seg}");
                 if let Some(name) = mod_declaration_name(&combined) {
-                    modules.push(name);
+                    if seg.ends_with(';') {
+                        modules.push((name, true));
+                    } else if seg.contains(['{', '}']) {
+                        modules.push((name, false));
+                    } else {
+                        awaiting_terminator = Some(name);
+                    }
                     depth += seg_opens - seg_closes;
                     continue;
                 }
@@ -921,8 +941,32 @@ fn declared_shipped_modules_from(source: &str) -> Vec<String> {
             depth += seg_opens - seg_closes;
         }
     }
+    if let Some(awaited) = awaiting_terminator.take() {
+        modules.push((awaited, false));
+    }
     modules.sort();
     modules
+}
+
+fn declared_shipped_modules_from(source: &str) -> Vec<String> {
+    declared_modules_inner(source)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
+}
+
+fn declared_file_submodules_from(source: &str) -> Vec<String> {
+    let mut skeleton_state = SkeletonState::default();
+    let skeleton = source
+        .lines()
+        .map(|line| code_skeleton(line, &mut skeleton_state))
+        .collect::<Vec<String>>()
+        .join("\n");
+    declared_modules_inner(&skeleton)
+        .into_iter()
+        .filter(|(_, file_backed)| *file_backed)
+        .map(|(name, _)| name)
+        .collect()
 }
 
 fn declared_shipped_modules() -> Vec<String> {
@@ -1045,6 +1089,112 @@ fn every_shipped_manager_module_is_reachable_from_a_build_strategy() {
         declared_shipped_modules(),
         expected,
         "managers/mod.rs must declare exactly one shipped module per registered build strategy, plus the manager module"
+    );
+}
+
+#[test]
+fn file_submodule_scan_catches_file_backed_declarations() {
+    let caught = [
+        "pub mod orphan;\n",
+        "mod orphan;\n",
+        "pub(crate) mod orphan;\n",
+        "pub struct BunManager; pub mod orphan;\n",
+        "pub\nmod orphan;\n",
+        "pub mod\norphan;\n",
+        "pub mod orphan\n;\n",
+        "#[cfg(feature = \"x\")] pub mod orphan;\n",
+        "#[allow(dead_code)]\npub mod orphan;\n",
+    ];
+    for source in caught {
+        assert_eq!(
+            declared_file_submodules_from(source),
+            vec!["orphan".to_string()],
+            "scan missed a file-backed submodule: {source:?}"
+        );
+        assert_eq!(
+            declared_shipped_modules_from(source),
+            vec!["orphan".to_string()],
+            "module scan lost a file-backed submodule: {source:?}"
+        );
+    }
+}
+
+#[test]
+fn file_submodule_scan_ignores_comment_contents_and_gaps() {
+    let caught = [
+        "pub mod orphan /* ; */ ;\n",
+        "pub mod orphan /* { */ ;\n",
+        "pub mod orphan /* outer /* ; */ inner */ ;\n",
+        "pub mod orphan /* comment\nmore */ ;\n",
+        "pub mod orphan\n/* comment\nmore */\n;\n",
+        "pub mod /* ; */ orphan;\n",
+        "pub /* comment\nmore */ mod orphan;\n",
+        "pub mod orphan // ;\n;\n",
+    ];
+    for source in caught {
+        assert_eq!(
+            declared_file_submodules_from(source),
+            vec!["orphan".to_string()],
+            "scan missed a file-backed submodule: {source:?}"
+        );
+    }
+    let skipped = [
+        "pub mod orphan /* ; */\n{ }\n",
+        "pub mod orphan {\n /* ; } */\n}\n",
+        "#[cfg(test)] pub mod orphan /* ; */ ;\n",
+    ];
+    for source in skipped {
+        assert_eq!(
+            declared_file_submodules_from(source),
+            Vec::<String>::new(),
+            "scan counted an inline or test-only module as file-backed: {source:?}"
+        );
+    }
+}
+
+#[test]
+fn file_submodule_scan_skips_inline_and_test_only_modules() {
+    let skipped = [
+        "pub mod orphan {}\n",
+        "pub mod orphan {\n pub struct Hidden;\n}\n",
+        "pub mod orphan\n{\n pub struct Hidden;\n}\n",
+        "#[cfg(test)] pub mod orphan;\n",
+        "#[cfg(test)]\npub mod orphan;\n",
+        "#[cfg(all(test, feature = \"x\"))] pub mod orphan;\n",
+        "#[cfg(test)]\nmod tests {\n pub mod orphan;\n}\n",
+        "pub struct OrphanManager;\n",
+    ];
+    for source in skipped {
+        assert_eq!(
+            declared_file_submodules_from(source),
+            Vec::<String>::new(),
+            "scan counted an inline or test-only module as file-backed: {source:?}"
+        );
+    }
+    let mixed = "pub mod inline {} pub mod orphan; #[cfg(test)] pub mod tests;\n";
+    assert_eq!(
+        declared_file_submodules_from(mixed),
+        vec!["orphan".to_string()]
+    );
+    assert_eq!(
+        declared_shipped_modules_from(mixed),
+        vec!["inline".to_string(), "orphan".to_string()]
+    );
+}
+
+#[test]
+fn no_shipped_manager_source_declares_a_file_submodule() {
+    for kind in registered_kinds() {
+        assert_eq!(
+            declared_file_submodules_from(case_for_kind(kind).source),
+            Vec::<String>::new(),
+            "manager source for {kind:?} declares a file-backed submodule, whose types the conformance scans cannot see"
+        );
+    }
+    assert_eq!(
+        declared_file_submodules_from(MANAGER_RS),
+        Vec::<String>::new(),
+        "manager.rs declares a file-backed submodule, whose types the conformance scans cannot see"
     );
 }
 
