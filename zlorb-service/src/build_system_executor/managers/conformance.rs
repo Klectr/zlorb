@@ -162,6 +162,15 @@ fn char_literal_len(chars: &[char], start: usize) -> Option<usize> {
                     i += 1;
                 }
                 i += 1;
+            } else if chars.get(i) == Some(&'x') {
+                i += 1;
+                for _ in 0..2 {
+                    if chars.get(i).is_some_and(|c| c.is_ascii_hexdigit()) {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
             } else {
                 i += 1;
             }
@@ -232,14 +241,16 @@ fn code_skeleton(line: &str, state: &mut SkeletonState) -> String {
                     i += 1;
                     continue;
                 }
-                if c == 'r' || c == 'b' {
+                let at_token_boundary =
+                    i == 0 || !(chars[i - 1].is_alphanumeric() || chars[i - 1] == '_');
+                if at_token_boundary && (c == 'r' || c == 'b') {
                     if let Some((hashes, len)) = raw_string_open(&chars, i) {
                         *state = SkeletonState::RawStr(hashes);
                         i += len;
                         continue;
                     }
                 }
-                if c == 'b' && chars.get(i + 1) == Some(&'"') {
+                if at_token_boundary && c == 'b' && chars.get(i + 1) == Some(&'"') {
                     *state = SkeletonState::Str;
                     i += 2;
                     continue;
@@ -960,6 +971,37 @@ fn conformance_missing_runtime_errors_instead_of_panicking() {
         assert!(result.is_err(), "{}: missing runtime was not an error", case.name);
         fixture.cleanup();
     }
+}
+
+#[test]
+fn manager_type_scan_handles_hex_escapes_and_raw_string_boundaries() {
+    let hex_open = "#[cfg(test)]\nmod tests {\n const X: bool = '\\x41'<'{';\n}\npub struct OrphanManager;\nimpl Manager for OrphanManager {}\n";
+    let scan = scan_manager_types(hex_open);
+    assert_eq!(scan.structs, vec!["OrphanManager".to_string()]);
+    assert_eq!(scan.impls, vec!["OrphanManager".to_string()]);
+    let hex_close = "#[cfg(test)]\nmod tests {\n const X: bool = '\\x41'>'}';\n pub struct TestOnly;\n}\npub struct After;\n";
+    assert_eq!(
+        scan_manager_types(hex_close).structs,
+        vec!["After".to_string()]
+    );
+    let hex_fn_body = "#[cfg(test)]\nmod tests {\n fn t() { let y = '\\x7d'<'{'; }\n}\npub struct After;\n";
+    assert_eq!(
+        scan_manager_types(hex_fn_body).structs,
+        vec!["After".to_string()]
+    );
+    let hex_byte = "#[cfg(test)]\nmod tests {\n const X: bool = b'\\x41'<b'{';\n}\npub struct OrphanManager;\nimpl Manager for OrphanManager {}\n";
+    let scan = scan_manager_types(hex_byte);
+    assert_eq!(scan.structs, vec!["OrphanManager".to_string()]);
+    assert_eq!(scan.impls, vec!["OrphanManager".to_string()]);
+    let hex_spaced = "#[cfg(test)]\nmod tests {\n const X: bool = '\\x41' < '{';\n}\npub struct After;\n";
+    assert_eq!(
+        scan_manager_types(hex_spaced).structs,
+        vec!["After".to_string()]
+    );
+    let macro_raw = "some_macro! {\n ar#\"a\"\n pub struct OrphanManager;\n impl Manager for OrphanManager {}\n \"#\"\n}\n";
+    let scan = scan_manager_types(macro_raw);
+    assert_eq!(scan.structs, vec!["OrphanManager".to_string()]);
+    assert_eq!(scan.impls, vec!["OrphanManager".to_string()]);
 }
 
 #[test]
