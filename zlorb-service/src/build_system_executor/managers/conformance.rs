@@ -481,6 +481,24 @@ fn cfg_attr_is_test_only(attr: &str) -> bool {
     cfg_expr_is_test_only(inner)
 }
 
+fn strip_segment_attrs(segment: &str) -> (String, bool, Option<String>) {
+    let mut rest = segment.trim();
+    let mut cfg_test = false;
+    loop {
+        let Some(inner) = rest.strip_prefix("#[") else {
+            break;
+        };
+        let Some(end) = find_attr_close(inner) else {
+            return (String::new(), cfg_test, Some(inner.to_string()));
+        };
+        if cfg_attr_is_test_only(&normalize_attr(&inner[..end])) {
+            cfg_test = true;
+        }
+        rest = inner[end + 1..].trim_start();
+    }
+    (rest.to_string(), cfg_test, None)
+}
+
 struct ManagerTypeScan {
     structs: Vec<String>,
     impls: Vec<String>,
@@ -546,8 +564,12 @@ fn scan_manager_types(source: &str) -> ManagerTypeScan {
             continue;
         }
         let mut gated = pending_test || line_cfg_test;
-        for segment in declaration_segments(rest) {
-            let seg = segment.trim();
+        let mut segments: std::collections::VecDeque<(String, bool)> =
+            declaration_segments(rest)
+                .into_iter()
+                .map(|segment| (segment, false))
+                .collect();
+        while let Some((segment, entry_cfg)) = segments.pop_front() {
             let opens = segment.matches('{').count() as i32;
             let closes = segment.matches('}').count() as i32;
             if let Some(target) = test_block_at {
@@ -560,10 +582,48 @@ fn scan_manager_types(source: &str) -> ManagerTypeScan {
                 }
                 continue;
             }
+            let (clean, seg_cfg_test, unterminated) = strip_segment_attrs(&segment);
+            if unterminated.is_some() {
+                let mut joined = segment.trim().to_string();
+                for (queued, _) in &segments {
+                    joined.push_str(queued);
+                }
+                let (rest_clean, rest_cfg, rest_unterminated) = strip_segment_attrs(&joined);
+                let total_cfg = entry_cfg || seg_cfg_test || rest_cfg;
+                if let Some(joined_inner) = rest_unterminated {
+                    attr_buf = Some(joined_inner);
+                    attr_saved_test = gated || total_cfg;
+                    break;
+                }
+                segments.clear();
+                if rest_clean.trim().is_empty() {
+                    gated = gated || total_cfg;
+                    if gated {
+                        pending_test = true;
+                    }
+                    continue;
+                }
+                let mut first = true;
+                for piece in declaration_segments(&rest_clean) {
+                    segments.push_back((piece, first && total_cfg));
+                    first = false;
+                }
+                continue;
+            }
+            let seg = clean.trim();
+            let seg_opens = seg.matches('{').count() as i32;
+            let seg_closes = seg.matches('}').count() as i32;
+            gated = gated || entry_cfg || seg_cfg_test;
+            if seg.is_empty() {
+                if gated {
+                    pending_test = true;
+                }
+                continue;
+            }
             if gated {
                 gated = false;
                 pending_decl = None;
-                if opens > closes {
+                if seg_opens > seg_closes {
                     test_block_at = Some(depth);
                     pending_test = false;
                 } else if seg.contains([';', '}']) {
@@ -571,7 +631,7 @@ fn scan_manager_types(source: &str) -> ManagerTypeScan {
                 } else {
                     pending_test = true;
                 }
-                depth += opens - closes;
+                depth += seg_opens - seg_closes;
                 continue;
             }
             let own_struct = struct_name(seg);
@@ -601,7 +661,7 @@ fn scan_manager_types(source: &str) -> ManagerTypeScan {
             } else if is_incomplete_declaration(seg) {
                 pending_decl = Some(seg.to_string());
             }
-            depth += opens - closes;
+            depth += seg_opens - seg_closes;
         }
     }
     structs.sort();
@@ -669,12 +729,20 @@ fn declared_shipped_modules_from(source: &str) -> Vec<String> {
     let mut pending_mod: Option<String> = None;
     let mut attr_buf: Option<String> = None;
     let mut attr_skel = SkeletonState::default();
+    let mut depth: i32 = 0;
+    let mut test_block_at: Option<i32> = None;
+    let mut block_skel = SkeletonState::default();
     for line in source.lines() {
         let mut rest_owned: String;
         let mut rest: &str;
         let mut line_end_state = SkeletonState::default();
         let mut end_state_set = false;
-        if let Some(mut buf) = attr_buf.take() {
+        let mut line_preskel = false;
+        if test_block_at.is_some() {
+            line_preskel = true;
+            rest_owned = code_skeleton(line, &mut block_skel);
+            rest = &rest_owned;
+        } else if let Some(mut buf) = attr_buf.take() {
             let skel_line = code_skeleton(line, &mut attr_skel);
             line_end_state = attr_skel;
             end_state_set = true;
@@ -695,7 +763,10 @@ fn declared_shipped_modules_from(source: &str) -> Vec<String> {
             rest = line.trim();
         }
         let mut incomplete = false;
-        while let Some(inner) = rest.strip_prefix("#[") {
+        while !line_preskel {
+            let Some(inner) = rest.strip_prefix("#[") else {
+                break;
+            };
             let mut frag_state = SkeletonState::default();
             let skel_inner = code_skeleton(inner, &mut frag_state);
             if !end_state_set {
@@ -721,44 +792,133 @@ fn declared_shipped_modules_from(source: &str) -> Vec<String> {
         if rest.is_empty() || rest.starts_with("//") {
             continue;
         }
-        for segment in declaration_segments(rest) {
-            let seg = segment.trim();
+        let mut segments: std::collections::VecDeque<(String, bool, bool)> =
+            declaration_segments(rest)
+                .into_iter()
+                .map(|segment| (segment, false, line_preskel))
+                .collect();
+        while let Some((segment, entry_cfg, preskel)) = segments.pop_front() {
+            let seg_raw = segment.trim();
+            if seg_raw.is_empty() {
+                continue;
+            }
+            if let Some(target) = test_block_at {
+                pending_mod = None;
+                let (opens, closes) = if preskel {
+                    (
+                        segment.matches('{').count() as i32,
+                        segment.matches('}').count() as i32,
+                    )
+                } else {
+                    let skel_seg = code_skeleton(seg_raw, &mut block_skel);
+                    (
+                        skel_seg.matches('{').count() as i32,
+                        skel_seg.matches('}').count() as i32,
+                    )
+                };
+                depth += opens - closes;
+                if depth <= target {
+                    test_block_at = None;
+                    cfg_test = false;
+                    block_skel = SkeletonState::default();
+                }
+                continue;
+            }
+            let mut seg_state = SkeletonState::default();
+            let skel_seg = code_skeleton(seg_raw, &mut seg_state);
+            let (clean, seg_cfg_test, unterminated) = strip_segment_attrs(&skel_seg);
+            if unterminated.is_some() {
+                let mut joined = seg_raw.to_string();
+                for (queued, _, _) in &segments {
+                    joined.push_str(queued);
+                }
+                let mut joined_state = SkeletonState::default();
+                let joined_skel = code_skeleton(&joined, &mut joined_state);
+                let (rest_clean, rest_cfg, rest_unterminated) =
+                    strip_segment_attrs(&joined_skel);
+                let total_cfg = entry_cfg || seg_cfg_test || rest_cfg;
+                if let Some(joined_inner) = rest_unterminated {
+                    cfg_test = cfg_test || total_cfg;
+                    attr_buf = Some(joined_inner);
+                    attr_skel = joined_state;
+                    break;
+                }
+                segments.clear();
+                if rest_clean.trim().is_empty() {
+                    if cfg_test || total_cfg {
+                        cfg_test = true;
+                    }
+                    continue;
+                }
+                let mut first = true;
+                for piece in declaration_segments(&rest_clean) {
+                    segments.push_back((piece, first && total_cfg, false));
+                    first = false;
+                }
+                continue;
+            }
+            let seg = clean.trim();
+            let seg_opens = seg.matches('{').count() as i32;
+            let seg_closes = seg.matches('}').count() as i32;
+            let gated = cfg_test || entry_cfg || seg_cfg_test;
             if seg.is_empty() {
+                if gated {
+                    cfg_test = true;
+                }
+                continue;
+            }
+            if gated {
+                pending_mod = None;
+                if seg_opens > seg_closes {
+                    test_block_at = Some(depth);
+                    block_skel = seg_state;
+                    cfg_test = false;
+                    let mut joined = String::new();
+                    for (queued, _, _) in &segments {
+                        joined.push_str(queued);
+                    }
+                    segments.clear();
+                    if !joined.is_empty() {
+                        let skel_joined = code_skeleton(&joined, &mut block_skel);
+                        for piece in declaration_segments(&skel_joined) {
+                            segments.push_back((piece, false, true));
+                        }
+                    }
+                } else if seg.contains([';', '}']) {
+                    cfg_test = false;
+                } else {
+                    cfg_test = true;
+                }
+                depth += seg_opens - seg_closes;
                 continue;
             }
             if let Some(name) = mod_declaration_name(seg) {
-                if !cfg_test {
-                    modules.push(name);
-                }
-                cfg_test = false;
+                modules.push(name);
                 pending_mod = None;
+                depth += seg_opens - seg_closes;
                 continue;
             }
             if let Some(pending) = pending_mod.take() {
                 let combined = format!("{pending} {seg}");
                 if let Some(name) = mod_declaration_name(&combined) {
-                    if !cfg_test {
-                        modules.push(name);
-                    }
-                    cfg_test = false;
+                    modules.push(name);
+                    depth += seg_opens - seg_closes;
                     continue;
                 }
                 if is_incomplete_declaration(&combined) {
                     pending_mod = Some(combined);
+                    depth += seg_opens - seg_closes;
                     continue;
                 }
-                if seg.contains([';', '{', '}']) {
-                    cfg_test = false;
-                }
+                depth += seg_opens - seg_closes;
                 continue;
             }
             if is_incomplete_declaration(seg) {
                 pending_mod = Some(seg.to_string());
+                depth += seg_opens - seg_closes;
                 continue;
             }
-            if seg.contains([';', '{', '}']) {
-                cfg_test = false;
-            }
+            depth += seg_opens - seg_closes;
         }
     }
     modules.sort();
@@ -1163,6 +1323,150 @@ fn manager_type_scan_reviewer_regression_shapes() {
         scan_manager_types(split_test_only_semicolon_line).structs,
         vec!["After".to_string()]
     );
+}
+
+#[test]
+fn manager_type_scan_per_segment_attributes() {
+    let merged_attr = "pub struct AManager; #[derive(Debug)] pub struct BManager;\n#[allow(dead_code)] impl Manager for AManager {} #[allow(dead_code)] impl Manager for BManager {}\n";
+    let scan = scan_manager_types(merged_attr);
+    assert_eq!(
+        scan.structs,
+        vec!["AManager".to_string(), "BManager".to_string()]
+    );
+    assert_eq!(scan.impls, scan.structs);
+    let merged_cfg = "pub struct AManager; #[cfg(test)] pub struct TestOnlyManager; pub struct BManager;\nimpl Manager for AManager {} #[cfg(test)] impl Manager for TestOnlyManager {} impl Manager for BManager {}\n";
+    let scan = scan_manager_types(merged_cfg);
+    assert_eq!(
+        scan.structs,
+        vec!["AManager".to_string(), "BManager".to_string()]
+    );
+    assert_eq!(scan.impls, scan.structs);
+    let mid_line_block = "fn f() {} #[cfg(test)] mod t { pub struct Hidden; impl Manager for Hidden {} } pub struct After;\nimpl Manager for After {}\n";
+    let scan = scan_manager_types(mid_line_block);
+    assert_eq!(scan.structs, vec!["After".to_string()]);
+    assert_eq!(scan.impls, vec!["After".to_string()]);
+    let split_mid_line_cfg = "pub struct AManager; #[cfg(\n test\n)] pub struct TestOnlyManager; pub struct BManager;\n";
+    let scan = scan_manager_types(split_mid_line_cfg);
+    assert_eq!(
+        scan.structs,
+        vec!["AManager".to_string(), "BManager".to_string()]
+    );
+    let attr_with_semicolon = "pub struct AManager; #[foo(x; y)] pub struct BManager;\nimpl Manager for BManager {}\npub struct CManager;\n";
+    let scan = scan_manager_types(attr_with_semicolon);
+    assert_eq!(
+        scan.structs,
+        vec![
+            "AManager".to_string(),
+            "BManager".to_string(),
+            "CManager".to_string()
+        ]
+    );
+    assert_eq!(scan.impls, vec!["BManager".to_string()]);
+    let attr_with_braces = "pub struct AManager; #[foo({})] pub struct BManager;\nimpl Manager for BManager {}\npub struct CManager;\n";
+    let scan = scan_manager_types(attr_with_braces);
+    assert_eq!(
+        scan.structs,
+        vec![
+            "AManager".to_string(),
+            "BManager".to_string(),
+            "CManager".to_string()
+        ]
+    );
+    assert_eq!(scan.impls, vec!["BManager".to_string()]);
+    let attr_same_line_after = "pub struct AManager; #[foo(x; y)] pub struct BManager; pub struct CManager;\nimpl Manager for BManager {} impl Manager for CManager {}\n";
+    let scan = scan_manager_types(attr_same_line_after);
+    assert_eq!(
+        scan.structs,
+        vec![
+            "AManager".to_string(),
+            "BManager".to_string(),
+            "CManager".to_string()
+        ]
+    );
+    assert_eq!(
+        scan.impls,
+        vec!["BManager".to_string(), "CManager".to_string()]
+    );
+}
+
+#[test]
+fn shipped_module_scan_per_segment_attributes_and_test_blocks() {
+    let merged_attr = "pub mod bun; #[allow(dead_code)] pub mod npm;\n";
+    assert_eq!(
+        declared_shipped_modules_from(merged_attr),
+        vec!["bun".to_string(), "npm".to_string()]
+    );
+    let merged_cfg = "pub mod bun; #[cfg(test)] pub mod template; pub mod npm;\n";
+    assert_eq!(
+        declared_shipped_modules_from(merged_cfg),
+        vec!["bun".to_string(), "npm".to_string()]
+    );
+    let one_line_block = "#[cfg(test)] mod tests { pub mod hidden; } pub mod npm;\n";
+    assert_eq!(
+        declared_shipped_modules_from(one_line_block),
+        vec!["npm".to_string()]
+    );
+    let multiline_block = "#[cfg(test)]\nmod tests {\n pub mod hidden;\n}\npub mod npm;\n";
+    assert_eq!(
+        declared_shipped_modules_from(multiline_block),
+        vec!["npm".to_string()]
+    );
+    let split_block = "#[cfg(test)]\nmod tests\n{\n pub mod hidden;\n}\npub mod npm;\n";
+    assert_eq!(
+        declared_shipped_modules_from(split_block),
+        vec!["npm".to_string()]
+    );
+    let mid_line_block = "fn f() {} #[cfg(test)] mod t { pub mod hidden; } pub mod npm;\n";
+    assert_eq!(
+        declared_shipped_modules_from(mid_line_block),
+        vec!["npm".to_string()]
+    );
+    let split_mid_line_cfg = "pub mod bun; #[cfg(\n test\n)] pub mod template; pub mod npm;\n";
+    assert_eq!(
+        declared_shipped_modules_from(split_mid_line_cfg),
+        vec!["bun".to_string(), "npm".to_string()]
+    );
+    let brace_literals_in_block = [
+        "#[cfg(test)]\nmod tests {\n let x = '}';\n pub mod hidden;\n}\npub mod npm;\n",
+        "#[cfg(test)]\nmod tests {\n let s = \"}\";\n pub mod hidden;\n}\npub mod npm;\n",
+        "#[cfg(test)]\nmod tests {\n /* } */\n pub mod hidden;\n}\npub mod npm;\n",
+        "#[cfg(test)]\nmod tests {\n pub mod hidden; // }\n pub mod hidden2;\n}\npub mod npm;\n",
+        "#[cfg(test)]\nmod tests {\n let x = '{';\n pub mod hidden;\n}\npub mod npm;\n",
+        "#[cfg(test)] mod tests { let x = '}'; pub mod hidden; } pub mod npm;\n",
+    ];
+    for source in brace_literals_in_block {
+        assert_eq!(
+            declared_shipped_modules_from(source),
+            vec!["npm".to_string()],
+            "scan mishandled brace literal in a test block: {source:?}"
+        );
+    }
+    let attr_with_semicolon = "pub mod bun; #[cfg(feature = \"a;b\")] pub mod npm;\npub mod rust;\n";
+    assert_eq!(
+        declared_shipped_modules_from(attr_with_semicolon),
+        vec!["bun".to_string(), "npm".to_string(), "rust".to_string()]
+    );
+    let attr_same_line_after = "pub mod bun; #[cfg(feature = \"a;b\")] pub mod npm; pub mod rust;\n";
+    assert_eq!(
+        declared_shipped_modules_from(attr_same_line_after),
+        vec!["bun".to_string(), "npm".to_string(), "rust".to_string()]
+    );
+    let attr_in_block_at_column_zero = "#[cfg(test)]\nmod tests {\n#[cfg(\ntest\n)]\npub mod hidden;\n}\npub mod npm;\n";
+    assert_eq!(
+        declared_shipped_modules_from(attr_in_block_at_column_zero),
+        vec!["npm".to_string()]
+    );
+    let comment_bracket_in_split_cfg = [
+        "pub mod bun; #[cfg( // gate ]\n not(test)\n)] pub mod npm;\n",
+        "pub mod bun; #[cfg(/* gate ] */\n not(test)\n)] pub mod npm;\n",
+    ];
+    for source in comment_bracket_in_split_cfg {
+        assert_eq!(
+            declared_shipped_modules_from(source),
+            vec!["bun".to_string(), "npm".to_string()],
+            "scan mishandled a comment bracket in a split cfg: {source:?}"
+        );
+    }
 }
 
 #[test]
