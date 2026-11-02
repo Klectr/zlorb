@@ -26,6 +26,7 @@ struct Step {
 struct ConformanceCase {
     name: &'static str,
     runtime_name: &'static str,
+    source: &'static str,
     steps: &'static [Step],
     run: fn(&RepositoryConfiguration, &Path) -> Result<(), ZlorbError>,
 }
@@ -47,6 +48,7 @@ fn bun_case() -> ConformanceCase {
     ConformanceCase {
         name: "bun",
         runtime_name: "bun",
+        source: include_str!("bun.rs"),
         steps: &[
             Step {
                 script: "install",
@@ -67,6 +69,7 @@ fn rust_case() -> ConformanceCase {
     ConformanceCase {
         name: "rust",
         runtime_name: "cargo",
+        source: include_str!("rust.rs"),
         steps: &[Step {
             script: "build",
             label: "build",
@@ -80,6 +83,7 @@ fn template_case() -> ConformanceCase {
     ConformanceCase {
         name: "template",
         runtime_name: "template-runtime",
+        source: include_str!("template.rs"),
         steps: &[
             Step {
                 script: "install",
@@ -111,6 +115,182 @@ fn case_for_strategy(strategy: &BuildStrategy) -> ConformanceCase {
 }
 
 const MANAGERS_MOD_RS: &str = include_str!("mod.rs");
+
+const MANAGER_RS: &str = include_str!("manager.rs");
+
+fn code_skeleton(line: &str, in_block_comment: &mut bool, in_string: &mut bool) -> String {
+    let mut out = String::new();
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if *in_block_comment {
+            if c == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                *in_block_comment = false;
+            }
+            continue;
+        }
+        if *in_string {
+            if c == '\\' {
+                chars.next();
+                continue;
+            }
+            if c == '"' {
+                *in_string = false;
+            }
+            continue;
+        }
+        if c == '/' && chars.peek() == Some(&'/') {
+            break;
+        }
+        if c == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            *in_block_comment = true;
+            continue;
+        }
+        if c == '"' {
+            *in_string = true;
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn struct_name(declaration: &str) -> Option<String> {
+    let after_pub = declaration.strip_prefix("pub")?;
+    if !after_pub.starts_with(|c: char| c.is_whitespace() || c == '(') {
+        return None;
+    }
+    let mut rest = after_pub.trim_start();
+    if let Some(inner) = rest.strip_prefix('(') {
+        rest = inner.split(')').nth(1)?.trim_start();
+    }
+    let after_struct = rest.strip_prefix("struct")?;
+    if !after_struct.starts_with(|c: char| c.is_whitespace()) {
+        return None;
+    }
+    let name: String = after_struct
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+fn manager_impl_name(declaration: &str) -> Option<String> {
+    let after_impl = declaration.strip_prefix("impl")?;
+    if !after_impl.starts_with(|c: char| c.is_whitespace() || c == '<') {
+        return None;
+    }
+    let (trait_part, rest) = after_impl.split_once(" for ")?;
+    let trait_name = trait_part.split_whitespace().last()?.rsplit("::").next()?;
+    if trait_name != "Manager" && !trait_name.starts_with("Manager<") {
+        return None;
+    }
+    let name: String = rest
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+struct ManagerTypeScan {
+    structs: Vec<String>,
+    impls: Vec<String>,
+}
+
+fn scan_manager_types(source: &str) -> ManagerTypeScan {
+    let mut structs = Vec::new();
+    let mut impls = Vec::new();
+    let mut depth: i32 = 0;
+    let mut test_block_at: Option<i32> = None;
+    let mut pending_test = false;
+    let mut in_block_comment = false;
+    let mut in_string = false;
+    for raw_line in source.lines() {
+        let line = code_skeleton(raw_line, &mut in_block_comment, &mut in_string);
+        let mut rest = line.trim();
+        let mut line_cfg_test = false;
+        while let Some(inner) = rest.strip_prefix("#[") {
+            let Some(end) = inner.find(']') else { break };
+            let attr = inner[..end].replace(' ', "");
+            if attr == "cfg(test)" || attr.contains("cfg(all(test") || attr.contains("cfg(any(test")
+            {
+                line_cfg_test = true;
+            }
+            rest = inner[end + 1..].trim_start();
+        }
+        if rest.is_empty() {
+            if line_cfg_test {
+                pending_test = true;
+            }
+            continue;
+        }
+        let opens = rest.matches('{').count() as i32;
+        let closes = rest.matches('}').count() as i32;
+        if let Some(target) = test_block_at {
+            depth += opens - closes;
+            if depth <= target {
+                test_block_at = None;
+            }
+            continue;
+        }
+        if pending_test || line_cfg_test {
+            pending_test = false;
+            if opens > closes {
+                test_block_at = Some(depth);
+            }
+            depth += opens - closes;
+            continue;
+        }
+        if let Some(name) = struct_name(rest) {
+            structs.push(name);
+        }
+        if let Some(name) = manager_impl_name(rest) {
+            impls.push(name);
+        }
+        depth += opens - closes;
+    }
+    structs.sort();
+    impls.sort();
+    ManagerTypeScan { structs, impls }
+}
+
+fn registered_manager_names() -> Vec<String> {
+    let mut names: Vec<String> = BuildStrategy::all()
+        .iter()
+        .map(|strategy| strategy.manager_name().to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+fn shipped_manager_types() -> ManagerTypeScan {
+    let mut structs = Vec::new();
+    let mut impls = Vec::new();
+    for kind in registered_kinds() {
+        let scan = scan_manager_types(case_for_kind(kind).source);
+        structs.extend(scan.structs);
+        impls.extend(scan.impls);
+    }
+    for source in [MANAGERS_MOD_RS, MANAGER_RS] {
+        let scan = scan_manager_types(source);
+        structs.extend(scan.structs);
+        impls.extend(scan.impls);
+    }
+    structs.sort();
+    impls.sort();
+    ManagerTypeScan { structs, impls }
+}
 
 fn mod_declaration_name(declaration: &str) -> Option<String> {
     let after_pub = match declaration.strip_prefix("pub") {
@@ -292,6 +472,126 @@ fn every_shipped_manager_module_is_reachable_from_a_build_strategy() {
         declared_shipped_modules(),
         expected,
         "managers/mod.rs must declare exactly one shipped module per registered build strategy, plus the manager module"
+    );
+}
+
+#[test]
+fn every_shipped_manager_type_is_registered() {
+    let scan = shipped_manager_types();
+    let expected = registered_manager_names();
+    assert_eq!(
+        scan.structs, expected,
+        "shipped manager modules must declare exactly the manager structs registered in the build_strategies! list"
+    );
+    assert_eq!(
+        scan.impls, expected,
+        "shipped manager modules must implement Manager exactly for the manager structs registered in the build_strategies! list"
+    );
+}
+
+#[test]
+fn template_manager_is_the_only_manager_type_in_the_template_source() {
+    let scan = scan_manager_types(template_case().source);
+    assert_eq!(scan.structs, vec!["TemplateManager".to_string()]);
+    assert_eq!(scan.impls, vec!["TemplateManager".to_string()]);
+}
+
+#[test]
+fn manager_type_scan_catches_an_orphan_inside_an_existing_module() {
+    let both = scan_manager_types(
+        "pub struct BunManager;\nimpl Manager for BunManager {}\npub struct OrphanManager;\nimpl Manager for OrphanManager {}\n",
+    );
+    assert_eq!(
+        both.structs,
+        vec!["BunManager".to_string(), "OrphanManager".to_string()]
+    );
+    assert_eq!(both.impls, both.structs);
+    let struct_only = scan_manager_types(
+        "pub struct BunManager;\nimpl Manager for BunManager {}\npub struct OrphanManager;\n",
+    );
+    assert_eq!(
+        struct_only.structs,
+        vec!["BunManager".to_string(), "OrphanManager".to_string()]
+    );
+    assert_eq!(struct_only.impls, vec!["BunManager".to_string()]);
+    let impl_only = scan_manager_types(
+        "pub struct BunManager;\nimpl Manager for BunManager {}\nimpl Manager for OrphanManager {}\n",
+    );
+    assert_eq!(impl_only.structs, vec!["BunManager".to_string()]);
+    assert_eq!(
+        impl_only.impls,
+        vec!["BunManager".to_string(), "OrphanManager".to_string()]
+    );
+}
+
+#[test]
+fn manager_type_scan_catches_common_declaration_shapes() {
+    let struct_shapes = [
+        "pub(crate) struct OrphanManager;\n",
+        "pub struct OrphanManager {}\n",
+        "pub struct OrphanManager(pub u8);\n",
+        "pub struct OrphanManager<T>;\n",
+        "#[derive(Debug)]\npub struct OrphanManager;\n",
+        "#[derive(Debug)] pub struct OrphanManager;\n",
+    ];
+    for source in struct_shapes {
+        assert_eq!(
+            scan_manager_types(source).structs,
+            vec!["OrphanManager".to_string()],
+            "scan missed struct shape: {source:?}"
+        );
+    }
+    let impl_shapes = [
+        "impl Manager for OrphanManager {}\n",
+        "impl crate::build_system_executor::managers::manager::Manager for OrphanManager {}\n",
+        "impl<T> Manager for OrphanManager<T> {}\n",
+    ];
+    for source in impl_shapes {
+        assert_eq!(
+            scan_manager_types(source).impls,
+            vec!["OrphanManager".to_string()],
+            "scan missed impl shape: {source:?}"
+        );
+    }
+}
+
+#[test]
+fn manager_type_scan_skips_test_only_types() {
+    let shapes = [
+        "#[cfg(test)]\npub struct TestOnlyManager;\n",
+        "#[cfg(test)] pub struct TestOnlyManager;\n",
+        "#[cfg(test)]\nimpl Manager for TestOnlyManager {}\n",
+        "#[cfg(test)] // tests only\npub struct TestOnlyManager;\n",
+        "#[cfg(test)]\n// comment\npub struct TestOnlyManager;\n",
+        "#[cfg(test)]\n/// doc\npub struct TestOnlyManager;\n",
+        "#[cfg(all(test, feature = \"x\"))] pub struct TestOnlyManager;\n",
+    ];
+    for source in shapes {
+        let scan = scan_manager_types(source);
+        assert_eq!(scan.structs, Vec::<String>::new(), "scan counted a test-only struct: {source:?}");
+        assert_eq!(scan.impls, Vec::<String>::new(), "scan counted a test-only impl: {source:?}");
+    }
+    let mixed = "#[cfg(test)]\nmod tests {\n pub struct InTests;\n impl Manager for InTests {}\n}\npub struct After;\nimpl Manager for After {}\n";
+    let scan = scan_manager_types(mixed);
+    assert_eq!(scan.structs, vec!["After".to_string()]);
+    assert_eq!(scan.impls, vec!["After".to_string()]);
+    let braced_item = "#[cfg(test)]\nfn helper() {\n let x = 1;\n}\npub struct After;\n";
+    assert_eq!(
+        scan_manager_types(braced_item).structs,
+        vec!["After".to_string()]
+    );
+}
+
+#[test]
+fn manager_type_scan_ignores_comments_and_strings() {
+    let commented = "// pub struct Commented;\n// impl Manager for Commented {}\n/* pub struct Blocked; */\npub struct Real;\n";
+    let scan = scan_manager_types(commented);
+    assert_eq!(scan.structs, vec!["Real".to_string()]);
+    assert_eq!(scan.impls, Vec::<String>::new());
+    let string_brace = "let label = \"{\";\n#[cfg(test)]\nmod tests {\n pub struct Hidden;\n}\npub struct After;\n";
+    assert_eq!(
+        scan_manager_types(string_brace).structs,
+        vec!["After".to_string()]
     );
 }
 
