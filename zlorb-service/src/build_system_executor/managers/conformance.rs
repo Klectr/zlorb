@@ -324,6 +324,83 @@ fn manager_impl_name(declaration: &str) -> Option<String> {
     }
 }
 
+fn split_cfg_args(inner: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut current = String::new();
+    for c in inner.chars() {
+        if in_string {
+            current.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                current.push(c);
+            }
+            '(' => {
+                depth += 1;
+                current.push(c);
+            }
+            ')' => {
+                depth -= 1;
+                current.push(c);
+            }
+            ',' if depth == 0 => {
+                args.push(std::mem::take(&mut current));
+            }
+            _ => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    args
+}
+
+fn cfg_expr_is_test_only(expr: &str) -> bool {
+    let expr = expr.trim();
+    if expr == "test" {
+        return true;
+    }
+    if let Some(inner) = expr
+        .strip_prefix("all(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        return split_cfg_args(inner)
+            .iter()
+            .any(|arg| cfg_expr_is_test_only(arg));
+    }
+    if let Some(inner) = expr
+        .strip_prefix("any(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        let args = split_cfg_args(inner);
+        return !args.is_empty()
+            && args.iter().all(|arg| cfg_expr_is_test_only(arg));
+    }
+    false
+}
+
+fn cfg_attr_is_test_only(attr: &str) -> bool {
+    let Some(inner) = attr
+        .strip_prefix("cfg(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    else {
+        return false;
+    };
+    cfg_expr_is_test_only(inner)
+}
+
 struct ManagerTypeScan {
     structs: Vec<String>,
     impls: Vec<String>,
@@ -343,8 +420,7 @@ fn scan_manager_types(source: &str) -> ManagerTypeScan {
         while let Some(inner) = rest.strip_prefix("#[") {
             let Some(end) = inner.find(']') else { break };
             let attr = inner[..end].replace(' ', "");
-            if attr == "cfg(test)" || attr.contains("cfg(all(test") || attr.contains("cfg(any(test")
-            {
+            if cfg_attr_is_test_only(&attr) {
                 line_cfg_test = true;
             }
             rest = inner[end + 1..].trim_start();
@@ -447,8 +523,7 @@ fn declared_shipped_modules_from(source: &str) -> Vec<String> {
         while let Some(inner) = rest.strip_prefix("#[") {
             let Some(end) = inner.find(']') else { break };
             let attr = inner[..end].replace(' ', "");
-            if attr == "cfg(test)" || attr.contains("cfg(all(test") || attr.contains("cfg(any(test")
-            {
+            if cfg_attr_is_test_only(&attr) {
                 cfg_test = true;
             }
             rest = inner[end + 1..].trim_start();
@@ -703,6 +778,44 @@ fn manager_type_scan_skips_test_only_types() {
 }
 
 #[test]
+fn manager_type_scan_cfg_predicate_matches_test_only_semantics() {
+    let skipped = [
+        "#[cfg(all(feature = \"x\", test))] pub struct TestOnlyManager;\n",
+        "#[cfg(any(test))] pub struct TestOnlyManager;\n",
+        "#[cfg(any(all(test, feature = \"x\"), test))] pub struct TestOnlyManager;\n",
+        "#[cfg(all(any(test, test), feature = \"x\"))] pub struct TestOnlyManager;\n",
+    ];
+    for source in skipped {
+        let scan = scan_manager_types(&source);
+        assert_eq!(
+            scan.structs,
+            Vec::<String>::new(),
+            "scan counted a test-only struct: {source:?}"
+        );
+    }
+    let counted = [
+        "#[cfg(any(test, feature = \"x\"))] pub struct ShippedManager;\n",
+        "#[cfg(any(feature = \"x\", test))] pub struct ShippedManager;\n",
+        "#[cfg(any(test, feature = \"x\"))]\nimpl Manager for ShippedManager {}\n",
+        "#[cfg(not(test))] pub struct ShippedManager;\n",
+        "#[cfg(all(feature = \"x\", any(test, debug_assertions)))] pub struct ShippedManager;\n",
+    ];
+    for source in counted {
+        let scan = scan_manager_types(source);
+        assert_eq!(
+            scan.structs.len() + scan.impls.len(),
+            1,
+            "scan skipped a shipped declaration: {source:?}"
+        );
+    }
+    let mixed = "#[cfg(any(test, feature = \"x\"))]\nmod gated {\n pub struct InGated;\n}\npub struct After;\n";
+    assert_eq!(
+        scan_manager_types(mixed).structs,
+        vec!["After".to_string(), "InGated".to_string()]
+    );
+}
+
+#[test]
 fn manager_type_scan_ignores_comments_and_strings() {
     let commented = "// pub struct Commented;\n// impl Manager for Commented {}\n/* pub struct Blocked; */\npub struct Real;\n";
     let scan = scan_manager_types(commented);
@@ -811,6 +924,38 @@ fn shipped_module_scan_skips_test_only_modules_in_every_shape() {
         declared_shipped_modules_from(mixed),
         vec!["bun".to_string(), "rust".to_string()]
     );
+}
+
+#[test]
+fn shipped_module_scan_cfg_predicate_matches_test_only_semantics() {
+    let skipped = [
+        "#[cfg(all(feature = \"x\", test))] pub mod template;\n",
+        "#[cfg(any(test))] pub mod template;\n",
+        "#[cfg(any(all(test, feature = \"x\"), test))]\npub mod template;\n",
+        "#[cfg(all(feature = \"a,b\", test))] pub mod template;\n",
+        "#[cfg(all(test,))] pub mod template;\n",
+    ];
+    for source in skipped {
+        assert_eq!(
+            declared_shipped_modules_from(source),
+            Vec::<String>::new(),
+            "scan counted a test-only module: {source:?}"
+        );
+    }
+    let counted = [
+        "#[cfg(any(test, feature = \"x\"))] pub mod npm;\n",
+        "#[cfg(any(test, feature = \"x\"))]\npub mod npm;\n",
+        "#[cfg(not(test))] pub mod npm;\n",
+        "#[cfg(any(test, feature = \"a)b\"))] pub mod npm;\n",
+        "#[cfg(any(test, feature = \"a\\\"b\"))] pub mod npm;\n",
+    ];
+    for source in counted {
+        assert_eq!(
+            declared_shipped_modules_from(source),
+            vec!["npm".to_string()],
+            "scan skipped a shipped module: {source:?}"
+        );
+    }
 }
 
 #[test]
