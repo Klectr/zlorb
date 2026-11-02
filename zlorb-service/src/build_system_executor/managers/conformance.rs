@@ -447,6 +447,7 @@ fn cfg_expr_is_test_only(expr: &str) -> bool {
 fn find_attr_close(text: &str) -> Option<usize> {
     let mut in_string = false;
     let mut escaped = false;
+    let mut depth: usize = 0;
     for (index, c) in text.char_indices() {
         if in_string {
             if escaped {
@@ -460,7 +461,13 @@ fn find_attr_close(text: &str) -> Option<usize> {
         }
         match c {
             '"' => in_string = true,
-            ']' => return Some(index),
+            '[' => depth += 1,
+            ']' => {
+                if depth == 0 {
+                    return Some(index);
+                }
+                depth -= 1;
+            }
             _ => {}
         }
     }
@@ -992,11 +999,19 @@ fn macro_rules_name(segment: &str) -> Option<String> {
         let Some(rest) = rest.strip_prefix('!') else {
             continue;
         };
-        let name: String = rest
-            .trim_start()
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect();
+        let rest = rest.trim_start();
+        let mut name = String::new();
+        let rest = match rest.strip_prefix("r#") {
+            Some(after) => {
+                name.push_str("r#");
+                after
+            }
+            None => rest,
+        };
+        name.extend(
+            rest.chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_'),
+        );
         return Some(name);
     }
     None
@@ -1005,8 +1020,20 @@ fn macro_rules_name(segment: &str) -> Option<String> {
 fn macro_invocation_path(segment: &str) -> Option<String> {
     let chars: Vec<char> = segment.trim().chars().collect();
     let mut i = 0;
+    let skip_ws = |chars: &[char], i: &mut usize| {
+        while chars.get(*i).is_some_and(|c| c.is_whitespace()) {
+            *i += 1;
+        }
+    };
+    skip_ws(&chars, &mut i);
+    let mut prefix = "";
+    if chars.get(i) == Some(&':') && chars.get(i + 1) == Some(&':') {
+        prefix = "::";
+        i += 2;
+    }
     let mut parts = Vec::new();
     loop {
+        skip_ws(&chars, &mut i);
         if chars.get(i) == Some(&'r') && chars.get(i + 1) == Some(&'#') {
             i += 2;
         }
@@ -1018,6 +1045,7 @@ fn macro_invocation_path(segment: &str) -> Option<String> {
             return None;
         }
         parts.push(chars[start..i].iter().collect::<String>());
+        skip_ws(&chars, &mut i);
         if chars.get(i) == Some(&':') && chars.get(i + 1) == Some(&':') {
             i += 2;
             continue;
@@ -1028,13 +1056,32 @@ fn macro_invocation_path(segment: &str) -> Option<String> {
         return None;
     }
     i += 1;
-    while chars.get(i).is_some_and(|c| c.is_whitespace()) {
-        i += 1;
-    }
+    skip_ws(&chars, &mut i);
     match chars.get(i) {
-        Some('(') | Some('[') | Some('{') => Some(parts.join("::")),
+        Some('(') | Some('[') | Some('{') => Some(format!("{}{}", prefix, parts.join("::"))),
         _ => None,
     }
+}
+
+fn delimiter_balance(text: &str) -> (i32, i32) {
+    let mut parens: i32 = 0;
+    let mut brackets: i32 = 0;
+    for c in text.chars() {
+        match c {
+            '(' => parens += 1,
+            ')' => parens -= 1,
+            '[' => brackets += 1,
+            ']' => brackets -= 1,
+            _ => {}
+        }
+    }
+    (parens, brackets)
+}
+
+fn brace_opens_scope(segment: &str) -> bool {
+    let inner = &segment[..segment.len().saturating_sub(1)];
+    let (parens, brackets) = delimiter_balance(inner);
+    parens <= 0 && brackets <= 0
 }
 
 fn macro_block_scope(segment: &str) -> MacroScope {
@@ -1061,6 +1108,10 @@ fn macro_generated_type_risks(source: &str, allowed: &[&str]) -> Vec<String> {
     let mut risks = Vec::new();
     let mut scopes: Vec<MacroScope> = vec![MacroScope::Module];
     let mut pending = String::new();
+    let mut paren_depth: i32 = 0;
+    let mut bracket_depth: i32 = 0;
+    let mut used_allowed_defs: Vec<&str> = Vec::new();
+    let mut used_allowed_invocations: Vec<&str> = Vec::new();
     for line in skeleton.lines() {
         let mut segments: std::collections::VecDeque<(String, bool)> =
             declaration_segments(line)
@@ -1085,20 +1136,20 @@ fn macro_generated_type_risks(source: &str, allowed: &[&str]) -> Vec<String> {
                 }
                 continue;
             }
-            let Some(term) = terminator else {
-                if !pending.is_empty() {
-                    pending.push(' ');
-                }
-                pending.push_str(segment.trim());
+            let (parens, brackets) = delimiter_balance(&segment);
+            paren_depth += parens;
+            bracket_depth += brackets;
+            if !pending.is_empty() {
+                pending.push(' ');
+            }
+            pending.push_str(segment.trim());
+            if terminator.is_none() || paren_depth > 0 || bracket_depth > 0 {
                 continue;
-            };
-            let combined = if pending.is_empty() {
-                segment.clone()
-            } else {
-                let combined = format!("{} {}", pending, segment.trim());
-                pending.clear();
-                combined
-            };
+            }
+            let combined = std::mem::take(&mut pending);
+            paren_depth = 0;
+            bracket_depth = 0;
+            let term = terminator.unwrap();
             let (clean, seg_cfg, unterminated) = strip_segment_attrs(&combined);
             if unterminated.is_some() {
                 let mut joined = combined.clone();
@@ -1133,18 +1184,25 @@ fn macro_generated_type_risks(source: &str, allowed: &[&str]) -> Vec<String> {
                 continue;
             }
             if gated {
-                if term == '{' {
+                if term == '{' && brace_opens_scope(&seg) {
                     scopes.push(MacroScope::Test);
                 }
                 continue;
             }
             if let Some(name) = macro_rules_name(&seg) {
-                if !allowed.contains(&name.as_str()) {
-                    if name.is_empty() {
-                        risks.push("macro_rules!".to_string());
-                    } else {
-                        risks.push(format!("macro_rules! {name}"));
-                    }
+                let exempt = allowed.contains(&name.as_str())
+                    && !used_allowed_defs.contains(&name.as_str());
+                if exempt {
+                    used_allowed_defs.push(
+                        allowed
+                            .iter()
+                            .find(|entry| **entry == name.as_str())
+                            .unwrap(),
+                    );
+                } else if name.is_empty() {
+                    risks.push("macro_rules!".to_string());
+                } else {
+                    risks.push(format!("macro_rules! {name}"));
                 }
                 if term == '{' {
                     scopes.push(MacroScope::TokenTree);
@@ -1152,8 +1210,16 @@ fn macro_generated_type_risks(source: &str, allowed: &[&str]) -> Vec<String> {
                 continue;
             }
             if let Some(path) = macro_invocation_path(&seg) {
-                let last = path.rsplit("::").next().unwrap_or(&path);
-                if !allowed.contains(&last) {
+                let exempt = allowed.contains(&path.as_str())
+                    && !used_allowed_invocations.contains(&path.as_str());
+                if exempt {
+                    used_allowed_invocations.push(
+                        allowed
+                            .iter()
+                            .find(|entry| **entry == path.as_str())
+                            .unwrap(),
+                    );
+                } else {
                     risks.push(format!("{path}!"));
                 }
                 if term == '{' {
@@ -1162,7 +1228,11 @@ fn macro_generated_type_risks(source: &str, allowed: &[&str]) -> Vec<String> {
                 continue;
             }
             match term {
-                '{' => scopes.push(macro_block_scope(&seg)),
+                '{' => {
+                    if brace_opens_scope(&seg) {
+                        scopes.push(macro_block_scope(&seg));
+                    }
+                }
                 '}' => {
                     if scopes.len() > 1 {
                         scopes.pop();
@@ -1406,7 +1476,7 @@ fn no_shipped_manager_source_declares_a_file_submodule() {
 
 #[test]
 fn macro_scan_catches_definitions_and_module_scope_invocations() {
-    let caught: [(&str, Vec<&str>); 10] = [
+    let caught: [(&str, Vec<&str>); 19] = [
         (
             "macro_rules! make_manager { () => { pub struct OrphanManager; }; }\n",
             vec!["macro_rules! make_manager"],
@@ -1434,6 +1504,33 @@ fn macro_scan_catches_definitions_and_module_scope_invocations() {
             vec!["make_manager!"],
         ),
         ("include!(\"orphan.rs\");\n", vec!["include!"]),
+        ("make_manager ! (OrphanManager);\n", vec!["make_manager!"]),
+        ("make_manager\n!(OrphanManager);\n", vec!["make_manager!"]),
+        (
+            "crate :: make_manager!(OrphanManager);\n",
+            vec!["crate::make_manager!"],
+        ),
+        (
+            "crate::\nmake_manager!(OrphanManager);\n",
+            vec!["crate::make_manager!"],
+        ),
+        (
+            "crate\n::make_manager!(OrphanManager);\n",
+            vec!["crate::make_manager!"],
+        ),
+        ("::make_manager!(OrphanManager);\n", vec!["::make_manager!"]),
+        (
+            "#[foo(bar[0])] make_manager!(OrphanManager);\n",
+            vec!["make_manager!"],
+        ),
+        (
+            "#[foo([1; 2])] make_manager!(OrphanManager);\n",
+            vec!["make_manager!"],
+        ),
+        (
+            "#[cfg(any(\n test,\n feature = \"x\"\n))]\nmake_manager!(OrphanManager);\n",
+            vec!["make_manager!"],
+        ),
         (
             "macro_rules! make { ($n:ident) => { pub struct $n; }; }\nmake!(OrphanManager);\n",
             vec!["macro_rules! make", "make!"],
@@ -1462,6 +1559,10 @@ fn macro_scan_skips_function_bodies_impl_bodies_and_test_only_code() {
         "#[cfg(any(test, test))] make_manager!(TestOnlyManager);\n",
         "const LABEL: &str = \"make_manager!(OrphanManager);\";\n// make_manager!(OrphanManager);\n/* make_manager!(OrphanManager); */\n",
         "pub struct BunManager;\n#[cfg(test)]\nmod tests {\n fn t() { assert!(true); assert_eq!(1, 1); }\n}\n",
+        "const BUF: [u8; repeat_len!()] = [0; 1];\n",
+        "static BUF: [u8; 16] = [0; repeat_len!()];\n",
+        "type X = [u8; make_len!()];\n",
+        "#[cfg(\n test\n)]\nmake_manager!(TestOnlyManager);\n",
     ];
     for source in skipped {
         assert_eq!(
@@ -1498,6 +1599,24 @@ fn macro_scan_allowlist_covers_only_the_registration_macro() {
     assert_eq!(
         macro_generated_type_risks(&with_extra_rules, &["build_strategies"]),
         vec!["macro_rules! other".to_string()]
+    );
+    assert_eq!(
+        macro_generated_type_risks(
+            "evil::build_strategies!(OrphanManager);\n",
+            &["build_strategies"]
+        ),
+        vec!["evil::build_strategies!".to_string()]
+    );
+    let duplicate_invocation = format!("{registration}build_strategies!(Bun => BunManager);\n");
+    assert_eq!(
+        macro_generated_type_risks(&duplicate_invocation, &["build_strategies"]),
+        vec!["build_strategies!".to_string()]
+    );
+    let duplicate_definition =
+        format!("{registration}macro_rules! build_strategies {{ () => {{}}; }}\n");
+    assert_eq!(
+        macro_generated_type_risks(&duplicate_definition, &["build_strategies"]),
+        vec!["macro_rules! build_strategies".to_string()]
     );
 }
 
