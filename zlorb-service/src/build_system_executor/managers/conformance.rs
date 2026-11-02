@@ -447,6 +447,7 @@ fn cfg_expr_is_test_only(expr: &str) -> bool {
 fn find_attr_close(text: &str) -> Option<usize> {
     let mut in_string = false;
     let mut escaped = false;
+    let mut depth: usize = 0;
     for (index, c) in text.char_indices() {
         if in_string {
             if escaped {
@@ -460,7 +461,13 @@ fn find_attr_close(text: &str) -> Option<usize> {
         }
         match c {
             '"' => in_string = true,
-            ']' => return Some(index),
+            '[' => depth += 1,
+            ']' => {
+                if depth == 0 {
+                    return Some(index);
+                }
+                depth -= 1;
+            }
             _ => {}
         }
     }
@@ -969,6 +976,275 @@ fn declared_file_submodules_from(source: &str) -> Vec<String> {
         .collect()
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MacroScope {
+    Module,
+    Item,
+    Function,
+    Test,
+    TokenTree,
+}
+
+fn macro_rules_name(segment: &str) -> Option<String> {
+    for (index, _) in segment.match_indices("macro_rules") {
+        let before_ok = index == 0
+            || !segment[..index]
+                .chars()
+                .last()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if !before_ok {
+            continue;
+        }
+        let rest = segment[index + "macro_rules".len()..].trim_start();
+        let Some(rest) = rest.strip_prefix('!') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let mut name = String::new();
+        let rest = match rest.strip_prefix("r#") {
+            Some(after) => {
+                name.push_str("r#");
+                after
+            }
+            None => rest,
+        };
+        name.extend(
+            rest.chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_'),
+        );
+        return Some(name);
+    }
+    None
+}
+
+fn macro_invocation_path(segment: &str) -> Option<String> {
+    let chars: Vec<char> = segment.trim().chars().collect();
+    let mut i = 0;
+    let skip_ws = |chars: &[char], i: &mut usize| {
+        while chars.get(*i).is_some_and(|c| c.is_whitespace()) {
+            *i += 1;
+        }
+    };
+    skip_ws(&chars, &mut i);
+    let mut prefix = "";
+    if chars.get(i) == Some(&':') && chars.get(i + 1) == Some(&':') {
+        prefix = "::";
+        i += 2;
+    }
+    let mut parts = Vec::new();
+    loop {
+        skip_ws(&chars, &mut i);
+        if chars.get(i) == Some(&'r') && chars.get(i + 1) == Some(&'#') {
+            i += 2;
+        }
+        let start = i;
+        while chars.get(i).is_some_and(|c| c.is_alphanumeric() || *c == '_') {
+            i += 1;
+        }
+        if i == start {
+            return None;
+        }
+        parts.push(chars[start..i].iter().collect::<String>());
+        skip_ws(&chars, &mut i);
+        if chars.get(i) == Some(&':') && chars.get(i + 1) == Some(&':') {
+            i += 2;
+            continue;
+        }
+        break;
+    }
+    if chars.get(i) != Some(&'!') {
+        return None;
+    }
+    i += 1;
+    skip_ws(&chars, &mut i);
+    match chars.get(i) {
+        Some('(') | Some('[') | Some('{') => Some(format!("{}{}", prefix, parts.join("::"))),
+        _ => None,
+    }
+}
+
+fn delimiter_balance(text: &str) -> (i32, i32) {
+    let mut parens: i32 = 0;
+    let mut brackets: i32 = 0;
+    for c in text.chars() {
+        match c {
+            '(' => parens += 1,
+            ')' => parens -= 1,
+            '[' => brackets += 1,
+            ']' => brackets -= 1,
+            _ => {}
+        }
+    }
+    (parens, brackets)
+}
+
+fn brace_opens_scope(segment: &str) -> bool {
+    let inner = &segment[..segment.len().saturating_sub(1)];
+    let (parens, brackets) = delimiter_balance(inner);
+    parens <= 0 && brackets <= 0
+}
+
+fn macro_block_scope(segment: &str) -> MacroScope {
+    let tokens: Vec<&str> = segment
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|token| !token.is_empty())
+        .collect();
+    if tokens.contains(&"fn") {
+        MacroScope::Function
+    } else if tokens.contains(&"mod") {
+        MacroScope::Module
+    } else {
+        MacroScope::Item
+    }
+}
+
+fn macro_generated_type_risks(source: &str, allowed: &[&str]) -> Vec<String> {
+    let mut skeleton_state = SkeletonState::default();
+    let skeleton = source
+        .lines()
+        .map(|line| code_skeleton(line, &mut skeleton_state))
+        .collect::<Vec<String>>()
+        .join("\n");
+    let mut risks = Vec::new();
+    let mut scopes: Vec<MacroScope> = vec![MacroScope::Module];
+    let mut pending = String::new();
+    let mut paren_depth: i32 = 0;
+    let mut bracket_depth: i32 = 0;
+    let mut used_allowed_defs: Vec<&str> = Vec::new();
+    let mut used_allowed_invocations: Vec<&str> = Vec::new();
+    for line in skeleton.lines() {
+        let mut segments: std::collections::VecDeque<(String, bool)> =
+            declaration_segments(line)
+                .into_iter()
+                .map(|segment| (segment, false))
+                .collect();
+        while let Some((segment, entry_cfg)) = segments.pop_front() {
+            let terminator = segment
+                .chars()
+                .last()
+                .filter(|c| matches!(c, ';' | '{' | '}'));
+            let current = *scopes.last().unwrap_or(&MacroScope::Module);
+            if current != MacroScope::Module {
+                match terminator {
+                    Some('{') => scopes.push(current),
+                    Some('}') => {
+                        if scopes.len() > 1 {
+                            scopes.pop();
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            let (parens, brackets) = delimiter_balance(&segment);
+            paren_depth += parens;
+            bracket_depth += brackets;
+            if !pending.is_empty() {
+                pending.push(' ');
+            }
+            pending.push_str(segment.trim());
+            if terminator.is_none() || paren_depth > 0 || bracket_depth > 0 {
+                continue;
+            }
+            let combined = std::mem::take(&mut pending);
+            paren_depth = 0;
+            bracket_depth = 0;
+            let term = terminator.unwrap();
+            let (clean, seg_cfg, unterminated) = strip_segment_attrs(&combined);
+            if unterminated.is_some() {
+                let mut joined = combined.clone();
+                for (queued, _) in &segments {
+                    joined.push_str(queued);
+                }
+                let (rest_clean, rest_cfg, rest_unterminated) =
+                    strip_segment_attrs(&joined);
+                let total_cfg = entry_cfg || seg_cfg || rest_cfg;
+                if rest_unterminated.is_some() {
+                    pending = joined;
+                    segments.clear();
+                    break;
+                }
+                segments.clear();
+                if rest_clean.trim().is_empty() {
+                    if total_cfg {
+                        pending = joined;
+                    }
+                    continue;
+                }
+                let mut first = true;
+                for piece in declaration_segments(&rest_clean) {
+                    segments.push_back((piece, first && total_cfg));
+                    first = false;
+                }
+                continue;
+            }
+            let gated = entry_cfg || seg_cfg;
+            let seg = clean.trim().to_string();
+            if seg.is_empty() {
+                continue;
+            }
+            if gated {
+                if term == '{' && brace_opens_scope(&seg) {
+                    scopes.push(MacroScope::Test);
+                }
+                continue;
+            }
+            if let Some(name) = macro_rules_name(&seg) {
+                let exempt = allowed.contains(&name.as_str())
+                    && !used_allowed_defs.contains(&name.as_str());
+                if exempt {
+                    used_allowed_defs.push(
+                        allowed
+                            .iter()
+                            .find(|entry| **entry == name.as_str())
+                            .unwrap(),
+                    );
+                } else if name.is_empty() {
+                    risks.push("macro_rules!".to_string());
+                } else {
+                    risks.push(format!("macro_rules! {name}"));
+                }
+                if term == '{' {
+                    scopes.push(MacroScope::TokenTree);
+                }
+                continue;
+            }
+            if let Some(path) = macro_invocation_path(&seg) {
+                let exempt = allowed.contains(&path.as_str())
+                    && !used_allowed_invocations.contains(&path.as_str());
+                if exempt {
+                    used_allowed_invocations.push(
+                        allowed
+                            .iter()
+                            .find(|entry| **entry == path.as_str())
+                            .unwrap(),
+                    );
+                } else {
+                    risks.push(format!("{path}!"));
+                }
+                if term == '{' {
+                    scopes.push(MacroScope::TokenTree);
+                }
+                continue;
+            }
+            match term {
+                '{' => {
+                    if brace_opens_scope(&seg) {
+                        scopes.push(macro_block_scope(&seg));
+                    }
+                }
+                '}' => {
+                    if scopes.len() > 1 {
+                        scopes.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    risks
+}
+
 fn declared_shipped_modules() -> Vec<String> {
     declared_shipped_modules_from(MANAGERS_MOD_RS)
 }
@@ -1195,6 +1471,178 @@ fn no_shipped_manager_source_declares_a_file_submodule() {
         declared_file_submodules_from(MANAGER_RS),
         Vec::<String>::new(),
         "manager.rs declares a file-backed submodule, whose types the conformance scans cannot see"
+    );
+}
+
+#[test]
+fn macro_scan_catches_definitions_and_module_scope_invocations() {
+    let caught: [(&str, Vec<&str>); 19] = [
+        (
+            "macro_rules! make_manager { () => { pub struct OrphanManager; }; }\n",
+            vec!["macro_rules! make_manager"],
+        ),
+        ("make_manager!(OrphanManager);\n", vec!["make_manager!"]),
+        ("make_manager! { OrphanManager }\n", vec!["make_manager!"]),
+        (
+            "make_manager!(\n OrphanManager\n);\n",
+            vec!["make_manager!"],
+        ),
+        (
+            "crate::macros::make_manager!(OrphanManager);\n",
+            vec!["crate::macros::make_manager!"],
+        ),
+        (
+            "pub struct BunManager; make_manager!(OrphanManager);\n",
+            vec!["make_manager!"],
+        ),
+        (
+            "pub mod inner { make_manager!(OrphanManager); }\n",
+            vec!["make_manager!"],
+        ),
+        (
+            "pub mod inner {\n make_manager!(OrphanManager);\n}\n",
+            vec!["make_manager!"],
+        ),
+        ("include!(\"orphan.rs\");\n", vec!["include!"]),
+        ("make_manager ! (OrphanManager);\n", vec!["make_manager!"]),
+        ("make_manager\n!(OrphanManager);\n", vec!["make_manager!"]),
+        (
+            "crate :: make_manager!(OrphanManager);\n",
+            vec!["crate::make_manager!"],
+        ),
+        (
+            "crate::\nmake_manager!(OrphanManager);\n",
+            vec!["crate::make_manager!"],
+        ),
+        (
+            "crate\n::make_manager!(OrphanManager);\n",
+            vec!["crate::make_manager!"],
+        ),
+        ("::make_manager!(OrphanManager);\n", vec!["::make_manager!"]),
+        (
+            "#[foo(bar[0])] make_manager!(OrphanManager);\n",
+            vec!["make_manager!"],
+        ),
+        (
+            "#[foo([1; 2])] make_manager!(OrphanManager);\n",
+            vec!["make_manager!"],
+        ),
+        (
+            "#[cfg(any(\n test,\n feature = \"x\"\n))]\nmake_manager!(OrphanManager);\n",
+            vec!["make_manager!"],
+        ),
+        (
+            "macro_rules! make { ($n:ident) => { pub struct $n; }; }\nmake!(OrphanManager);\n",
+            vec!["macro_rules! make", "make!"],
+        ),
+    ];
+    for (source, expected) in caught {
+        assert_eq!(
+            macro_generated_type_risks(source, &[]),
+            expected,
+            "scan missed a macro-generated type shape: {source:?}"
+        );
+    }
+}
+
+#[test]
+fn macro_scan_skips_function_bodies_impl_bodies_and_test_only_code() {
+    let skipped = [
+        "pub struct BunManager;\nimpl Manager for BunManager {\n fn exec(&self) { let label = format!(\"x\"); }\n}\n",
+        "fn helper() { macro_rules! local { () => {}; } local!(); }\n",
+        "impl Manager for BunManager { make_methods!(); }\n",
+        "#[cfg(test)] make_manager!(TestOnlyManager);\n",
+        "#[cfg(test)]\nmake_manager!(TestOnlyManager);\n",
+        "#[cfg(test)]\nmacro_rules! make_test { () => {}; }\n",
+        "#[cfg(test)] mod tests { make_manager!(TestOnlyManager); }\n",
+        "#[cfg(test)]\nmod tests {\n make_manager!(TestOnlyManager);\n}\npub struct After;\n",
+        "#[cfg(any(test, test))] make_manager!(TestOnlyManager);\n",
+        "const LABEL: &str = \"make_manager!(OrphanManager);\";\n// make_manager!(OrphanManager);\n/* make_manager!(OrphanManager); */\n",
+        "pub struct BunManager;\n#[cfg(test)]\nmod tests {\n fn t() { assert!(true); assert_eq!(1, 1); }\n}\n",
+        "const BUF: [u8; repeat_len!()] = [0; 1];\n",
+        "static BUF: [u8; 16] = [0; repeat_len!()];\n",
+        "type X = [u8; make_len!()];\n",
+        "#[cfg(\n test\n)]\nmake_manager!(TestOnlyManager);\n",
+    ];
+    for source in skipped {
+        assert_eq!(
+            macro_generated_type_risks(source, &[]),
+            Vec::<String>::new(),
+            "scan counted a shape that cannot generate a shipped manager type: {source:?}"
+        );
+    }
+    let after_test_block = "#[cfg(test)]\nmod tests {\n make_manager!(TestOnlyManager);\n}\nmake_manager!(OrphanManager);\n";
+    assert_eq!(
+        macro_generated_type_risks(after_test_block, &[]),
+        vec!["make_manager!".to_string()]
+    );
+    let after_fn = "fn helper() { format!(\"x\"); }\nmake_manager!(OrphanManager);\n";
+    assert_eq!(
+        macro_generated_type_risks(after_fn, &[]),
+        vec!["make_manager!".to_string()]
+    );
+}
+
+#[test]
+fn macro_scan_allowlist_covers_only_the_registration_macro() {
+    let registration = "macro_rules! build_strategies { ($($v:ident => $m:ident),+) => { pub enum BuildStrategy { $($v($m)),+ } }; }\nbuild_strategies!(Bun => BunManager, Rust => RustManager);\n";
+    assert_eq!(
+        macro_generated_type_risks(registration, &["build_strategies"]),
+        Vec::<String>::new()
+    );
+    let with_extra = format!("{registration}make_manager!(OrphanManager);\n");
+    assert_eq!(
+        macro_generated_type_risks(&with_extra, &["build_strategies"]),
+        vec!["make_manager!".to_string()]
+    );
+    let with_extra_rules = format!("{registration}macro_rules! other {{ () => {{}}; }}\n");
+    assert_eq!(
+        macro_generated_type_risks(&with_extra_rules, &["build_strategies"]),
+        vec!["macro_rules! other".to_string()]
+    );
+    assert_eq!(
+        macro_generated_type_risks(
+            "evil::build_strategies!(OrphanManager);\n",
+            &["build_strategies"]
+        ),
+        vec!["evil::build_strategies!".to_string()]
+    );
+    let duplicate_invocation = format!("{registration}build_strategies!(Bun => BunManager);\n");
+    assert_eq!(
+        macro_generated_type_risks(&duplicate_invocation, &["build_strategies"]),
+        vec!["build_strategies!".to_string()]
+    );
+    let duplicate_definition =
+        format!("{registration}macro_rules! build_strategies {{ () => {{}}; }}\n");
+    assert_eq!(
+        macro_generated_type_risks(&duplicate_definition, &["build_strategies"]),
+        vec!["macro_rules! build_strategies".to_string()]
+    );
+}
+
+#[test]
+fn no_shipped_manager_source_generates_types_with_macros() {
+    for kind in registered_kinds() {
+        assert_eq!(
+            macro_generated_type_risks(case_for_kind(kind).source, &[]),
+            Vec::<String>::new(),
+            "manager source for {kind:?} defines or invokes a macro at module scope, whose generated types the conformance scans cannot see"
+        );
+    }
+    assert_eq!(
+        macro_generated_type_risks(template_case().source, &[]),
+        Vec::<String>::new(),
+        "template.rs defines or invokes a macro at module scope, whose generated types the conformance scans cannot see"
+    );
+    assert_eq!(
+        macro_generated_type_risks(MANAGERS_MOD_RS, &[]),
+        Vec::<String>::new(),
+        "managers/mod.rs defines or invokes a macro at module scope, whose generated types the conformance scans cannot see"
+    );
+    assert_eq!(
+        macro_generated_type_risks(MANAGER_RS, &["build_strategies"]),
+        Vec::<String>::new(),
+        "manager.rs defines or invokes a macro at module scope other than the build_strategies registration macro, whose generated types the conformance scans cannot see"
     );
 }
 
