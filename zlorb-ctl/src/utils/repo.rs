@@ -4,11 +4,12 @@ use zlorb_lib::{
     create_config_from_toml,
     error::ZlorbError,
     git::is_git_repo,
+    is_root,
     log::Logger,
 };
 
 pub(crate) fn watch() -> Result<(), ZlorbError> {
-    let is_root = std::env::var("UID").map(|u| u == "0").unwrap_or(false);
+    let is_root = is_root();
     
     let mut cmd = process::Command::new("journalctl");
     cmd.arg("-f");
@@ -75,7 +76,9 @@ pub(crate) fn add() -> Result<(), ZlorbError> {
         path: path_str,
         remote: "origin".to_string(),
         branch: "master".to_string(),
+        build_strategy: None,
         build_command: String::new(),
+        restart_command: None,
         out_dir: None,
     };
 
