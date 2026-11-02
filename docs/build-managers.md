@@ -122,7 +122,11 @@ copy them. Fixing them is separate work from adding a manager.
      `pub mod`, not a `#[cfg(test)]` declaration. This step is what puts
      the manager in the shipped daemon: a module left under
      `#[cfg(test)]` exists only in test builds and the daemon will never
-     run it.
+     run it. Name the module after the strategy string (the way `bun`
+     and `rust` are named): the conformance suite reads `mod.rs` and
+     fails when a shipped module's name matches no registered
+     `BuildStrategyKind`, so a module declared without the registration
+     steps below cannot pass the suite as dead code.
    - Add your variant to the `build_strategies!` list in
      `managers/manager.rs` as one `Variant => YourManager` entry, and
      add your manager to the `use` block at the top of that file. That
@@ -234,7 +238,12 @@ assumption:
       exactly once each, so a passing `cargo test` is the proof this
       item holds.
 - [ ] No new manager shipped unused: the strategy exists because a real
-      project is being watched with it.
+      project is being watched with it. The conformance suite enforces
+      the mechanical half: it reads the module declarations in
+      `managers/mod.rs` and fails when a shipped (non-`#[cfg(test)]`)
+      module matches no registered `BuildStrategyKind`, or a registered
+      kind has no shipped module. The real-project justification stays a
+      human judgment.
 
 ## The template
 
