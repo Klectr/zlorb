@@ -324,6 +324,59 @@ fn manager_impl_name(declaration: &str) -> Option<String> {
     }
 }
 
+fn declaration_segments(text: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    for c in text.chars() {
+        current.push(c);
+        if c == ';' || c == '{' || c == '}' {
+            segments.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.trim().is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+fn is_incomplete_declaration(segment: &str) -> bool {
+    let segment = segment.trim();
+    if segment.is_empty() || segment.contains([';', '{', '}']) {
+        return false;
+    }
+    if segment == "mod" || segment == "pub" || segment == "impl" {
+        return true;
+    }
+    if let Some(after_pub) = segment.strip_prefix("pub") {
+        if after_pub.starts_with(|c: char| c.is_whitespace() || c == '(') {
+            let rest = after_pub.trim_start();
+            if rest.starts_with('(') && !rest.contains(')') {
+                return true;
+            }
+            let rest = match rest.strip_prefix('(') {
+                Some(inner) => match inner.split(')').nth(1) {
+                    Some(rest) => rest.trim_start(),
+                    None => return true,
+                },
+                None => rest,
+            };
+            return rest.is_empty() || rest == "struct" || rest == "mod";
+        }
+    }
+    if let Some(after_impl) = segment.strip_prefix("impl") {
+        if after_impl.starts_with(|c: char| c.is_whitespace() || c == '<') {
+            if !segment.contains(" for ") {
+                return true;
+            }
+            return segment
+                .rsplit(" for ")
+                .next()
+                .is_some_and(|rest| rest.trim().is_empty());
+        }
+    }
+    false
+}
+
 fn split_cfg_args(inner: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut depth: i32 = 0;
@@ -439,6 +492,7 @@ fn scan_manager_types(source: &str) -> ManagerTypeScan {
     let mut depth: i32 = 0;
     let mut test_block_at: Option<i32> = None;
     let mut pending_test = false;
+    let mut pending_decl: Option<String> = None;
     let mut skeleton_state = SkeletonState::default();
     let mut attr_buf: Option<String> = None;
     let mut attr_saved_test = false;
@@ -491,31 +545,64 @@ fn scan_manager_types(source: &str) -> ManagerTypeScan {
             }
             continue;
         }
-        let opens = rest.matches('{').count() as i32;
-        let closes = rest.matches('}').count() as i32;
-        if let Some(target) = test_block_at {
-            depth += opens - closes;
-            if depth <= target {
-                test_block_at = None;
-                pending_test = false;
+        let mut gated = pending_test || line_cfg_test;
+        for segment in declaration_segments(rest) {
+            let seg = segment.trim();
+            let opens = segment.matches('{').count() as i32;
+            let closes = segment.matches('}').count() as i32;
+            if let Some(target) = test_block_at {
+                pending_decl = None;
+                depth += opens - closes;
+                if depth <= target {
+                    test_block_at = None;
+                    pending_test = false;
+                    gated = false;
+                }
+                continue;
             }
-            continue;
-        }
-        if pending_test || line_cfg_test {
-            pending_test = false;
-            if opens > closes {
-                test_block_at = Some(depth);
+            if gated {
+                gated = false;
+                pending_decl = None;
+                if opens > closes {
+                    test_block_at = Some(depth);
+                    pending_test = false;
+                } else if seg.contains([';', '}']) {
+                    pending_test = false;
+                } else {
+                    pending_test = true;
+                }
+                depth += opens - closes;
+                continue;
+            }
+            let own_struct = struct_name(seg);
+            let own_impl = manager_impl_name(seg);
+            if own_struct.is_some() || own_impl.is_some() {
+                if let Some(name) = own_struct {
+                    structs.push(name);
+                }
+                if let Some(name) = own_impl {
+                    impls.push(name);
+                }
+                pending_decl = None;
+            } else if let Some(pending) = pending_decl.take() {
+                let combined = format!("{pending} {seg}");
+                let combined_struct = struct_name(&combined);
+                let combined_impl = manager_impl_name(&combined);
+                if combined_struct.is_some() || combined_impl.is_some() {
+                    if let Some(name) = combined_struct {
+                        structs.push(name);
+                    }
+                    if let Some(name) = combined_impl {
+                        impls.push(name);
+                    }
+                } else if is_incomplete_declaration(&combined) {
+                    pending_decl = Some(combined);
+                }
+            } else if is_incomplete_declaration(seg) {
+                pending_decl = Some(seg.to_string());
             }
             depth += opens - closes;
-            continue;
         }
-        if let Some(name) = struct_name(rest) {
-            structs.push(name);
-        }
-        if let Some(name) = manager_impl_name(rest) {
-            impls.push(name);
-        }
-        depth += opens - closes;
     }
     structs.sort();
     impls.sort();
@@ -579,6 +666,7 @@ fn mod_declaration_name(declaration: &str) -> Option<String> {
 fn declared_shipped_modules_from(source: &str) -> Vec<String> {
     let mut modules = Vec::new();
     let mut cfg_test = false;
+    let mut pending_mod: Option<String> = None;
     let mut attr_buf: Option<String> = None;
     let mut attr_skel = SkeletonState::default();
     for line in source.lines() {
@@ -633,14 +721,42 @@ fn declared_shipped_modules_from(source: &str) -> Vec<String> {
         if rest.is_empty() || rest.starts_with("//") {
             continue;
         }
-        match mod_declaration_name(rest) {
-            Some(name) => {
+        for segment in declaration_segments(rest) {
+            let seg = segment.trim();
+            if seg.is_empty() {
+                continue;
+            }
+            if let Some(name) = mod_declaration_name(seg) {
                 if !cfg_test {
                     modules.push(name);
                 }
                 cfg_test = false;
+                pending_mod = None;
+                continue;
             }
-            None => {
+            if let Some(pending) = pending_mod.take() {
+                let combined = format!("{pending} {seg}");
+                if let Some(name) = mod_declaration_name(&combined) {
+                    if !cfg_test {
+                        modules.push(name);
+                    }
+                    cfg_test = false;
+                    continue;
+                }
+                if is_incomplete_declaration(&combined) {
+                    pending_mod = Some(combined);
+                    continue;
+                }
+                if seg.contains([';', '{', '}']) {
+                    cfg_test = false;
+                }
+                continue;
+            }
+            if is_incomplete_declaration(seg) {
+                pending_mod = Some(seg.to_string());
+                continue;
+            }
+            if seg.contains([';', '{', '}']) {
                 cfg_test = false;
             }
         }
@@ -960,6 +1076,146 @@ fn manager_type_scan_handles_multiline_cfg_attributes() {
             "scan skipped a shipped declaration: {source:?}"
         );
     }
+}
+
+#[test]
+fn manager_type_scan_catches_split_and_merged_declarations() {
+    let split = "pub struct\nOrphanManager;\nimpl Manager\nfor OrphanManager {}\n";
+    let scan = scan_manager_types(split);
+    assert_eq!(scan.structs, vec!["OrphanManager".to_string()]);
+    assert_eq!(scan.impls, vec!["OrphanManager".to_string()]);
+    let split_keywords = "pub\nstruct OrphanManager;\nimpl\nManager for OrphanManager {}\n";
+    let scan = scan_manager_types(split_keywords);
+    assert_eq!(scan.structs, vec!["OrphanManager".to_string()]);
+    assert_eq!(scan.impls, vec!["OrphanManager".to_string()]);
+    let split_impl_generic = "pub(crate)\nstruct OrphanManager;\nimpl<T>\nManager for OrphanManager<T> {}\n";
+    let scan = scan_manager_types(split_impl_generic);
+    assert_eq!(scan.structs, vec!["OrphanManager".to_string()]);
+    assert_eq!(scan.impls, vec!["OrphanManager".to_string()]);
+    let split_body = "pub struct OrphanManager\n{}\nimpl Manager for OrphanManager\n{}\n";
+    let scan = scan_manager_types(split_body);
+    assert_eq!(scan.structs, vec!["OrphanManager".to_string()]);
+    assert_eq!(scan.impls, vec!["OrphanManager".to_string()]);
+    let merged = "pub struct AManager; pub struct BManager;\nimpl Manager for AManager {} impl Manager for BManager {}\n";
+    let scan = scan_manager_types(merged);
+    assert_eq!(
+        scan.structs,
+        vec!["AManager".to_string(), "BManager".to_string()]
+    );
+    assert_eq!(scan.impls, scan.structs);
+    let merged_braced = "pub struct AManager {} pub struct BManager {}\n";
+    assert_eq!(
+        scan_manager_types(merged_braced).structs,
+        vec!["AManager".to_string(), "BManager".to_string()]
+    );
+    let after_statement = "let x = 1; pub struct OrphanManager;\nlet y = 2; impl Manager for OrphanManager {}\n";
+    let scan = scan_manager_types(after_statement);
+    assert_eq!(scan.structs, vec!["OrphanManager".to_string()]);
+    assert_eq!(scan.impls, vec!["OrphanManager".to_string()]);
+    let after_string_statement = "let s = \"//\"; pub struct OrphanManager;\n";
+    assert_eq!(
+        scan_manager_types(after_string_statement).structs,
+        vec!["OrphanManager".to_string()]
+    );
+    let dangling = "pub struct\n";
+    assert_eq!(
+        scan_manager_types(dangling).structs,
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn manager_type_scan_split_and_merged_declarations_respect_cfg_test() {
+    let split_test_only = "#[cfg(test)]\npub struct\nTestOnlyManager;\n#[cfg(test)]\nimpl Manager\nfor TestOnlyManager {}\npub struct After;\nimpl Manager for After {}\n";
+    let scan = scan_manager_types(split_test_only);
+    assert_eq!(scan.structs, vec!["After".to_string()]);
+    assert_eq!(scan.impls, vec!["After".to_string()]);
+    let merged_gated_first = "#[cfg(test)] pub struct TestOnlyManager; pub struct ShippedManager;\n#[cfg(test)] impl Manager for TestOnlyManager {} impl Manager for ShippedManager {}\n";
+    let scan = scan_manager_types(merged_gated_first);
+    assert_eq!(scan.structs, vec!["ShippedManager".to_string()]);
+    assert_eq!(scan.impls, vec!["ShippedManager".to_string()]);
+    let split_test_block = "#[cfg(test)]\nmod tests\n{\n pub struct Hidden;\n}\npub struct After;\n";
+    assert_eq!(
+        scan_manager_types(split_test_block).structs,
+        vec!["After".to_string()]
+    );
+}
+
+#[test]
+fn manager_type_scan_reviewer_regression_shapes() {
+    let after_gated_brace = "#[cfg(test)]\nimpl Manager\nfor T {} pub struct ShippedManager;\n";
+    assert_eq!(
+        scan_manager_types(after_gated_brace).structs,
+        vec!["ShippedManager".to_string()]
+    );
+    let after_gated_brace_one_line = "#[cfg(test)] impl Manager for T {} pub struct ShippedManager;\n";
+    assert_eq!(
+        scan_manager_types(after_gated_brace_one_line).structs,
+        vec!["ShippedManager".to_string()]
+    );
+    let split_visibility_parens = "pub(\ncrate) struct OrphanManager;\n";
+    assert_eq!(
+        scan_manager_types(split_visibility_parens).structs,
+        vec!["OrphanManager".to_string()]
+    );
+    let split_test_only_semicolon_line = "#[cfg(test)]\npub struct\nTestOnlyManager\n;\npub struct After;\n";
+    assert_eq!(
+        scan_manager_types(split_test_only_semicolon_line).structs,
+        vec!["After".to_string()]
+    );
+}
+
+#[test]
+fn shipped_module_scan_reviewer_regression_shapes() {
+    let merged_after_braces = "pub mod a {}\npub mod b {} pub mod c;\n";
+    assert_eq!(
+        declared_shipped_modules_from(merged_after_braces),
+        vec!["a".to_string(), "b".to_string(), "c".to_string()]
+    );
+    let split_after_sibling = "pub mod a; pub\nmod b;\n";
+    assert_eq!(
+        declared_shipped_modules_from(split_after_sibling),
+        vec!["a".to_string(), "b".to_string()]
+    );
+}
+
+#[test]
+fn shipped_module_scan_catches_split_and_merged_declarations() {
+    let split = "pub mod\nnpm;\n";
+    assert_eq!(
+        declared_shipped_modules_from(split),
+        vec!["npm".to_string()]
+    );
+    let split_keyword = "pub\nmod npm;\n";
+    assert_eq!(
+        declared_shipped_modules_from(split_keyword),
+        vec!["npm".to_string()]
+    );
+    let split_visibility = "pub(crate)\nmod npm;\n";
+    assert_eq!(
+        declared_shipped_modules_from(split_visibility),
+        vec!["npm".to_string()]
+    );
+    let merged = "pub mod bun; pub mod npm;\n";
+    assert_eq!(
+        declared_shipped_modules_from(merged),
+        vec!["bun".to_string(), "npm".to_string()]
+    );
+    let merged_braced = "pub mod bun {} pub mod npm {}\n";
+    assert_eq!(
+        declared_shipped_modules_from(merged_braced),
+        vec!["bun".to_string(), "npm".to_string()]
+    );
+    let gated_first = "#[cfg(test)] pub mod template; pub mod npm;\n";
+    assert_eq!(
+        declared_shipped_modules_from(gated_first),
+        vec!["npm".to_string()]
+    );
+    let split_test_only = "#[cfg(test)]\npub mod\ntemplate;\npub mod npm;\n";
+    assert_eq!(
+        declared_shipped_modules_from(split_test_only),
+        vec!["npm".to_string()]
+    );
 }
 
 #[test]
@@ -1359,3 +1615,5 @@ fn manager_type_scan_catches_generic_manager_shapes() {
         assert_eq!(scan.impls, vec!["OrphanManager".to_string()], "impls missed: {label}");
     }
 }
+
+
