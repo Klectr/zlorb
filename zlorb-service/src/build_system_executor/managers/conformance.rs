@@ -956,7 +956,13 @@ fn declared_shipped_modules_from(source: &str) -> Vec<String> {
 }
 
 fn declared_file_submodules_from(source: &str) -> Vec<String> {
-    declared_modules_inner(source)
+    let mut skeleton_state = SkeletonState::default();
+    let skeleton = source
+        .lines()
+        .map(|line| code_skeleton(line, &mut skeleton_state))
+        .collect::<Vec<String>>()
+        .join("\n");
+    declared_modules_inner(&skeleton)
         .into_iter()
         .filter(|(_, file_backed)| *file_backed)
         .map(|(name, _)| name)
@@ -1109,6 +1115,39 @@ fn file_submodule_scan_catches_file_backed_declarations() {
             declared_shipped_modules_from(source),
             vec!["orphan".to_string()],
             "module scan lost a file-backed submodule: {source:?}"
+        );
+    }
+}
+
+#[test]
+fn file_submodule_scan_ignores_comment_contents_and_gaps() {
+    let caught = [
+        "pub mod orphan /* ; */ ;\n",
+        "pub mod orphan /* { */ ;\n",
+        "pub mod orphan /* outer /* ; */ inner */ ;\n",
+        "pub mod orphan /* comment\nmore */ ;\n",
+        "pub mod orphan\n/* comment\nmore */\n;\n",
+        "pub mod /* ; */ orphan;\n",
+        "pub /* comment\nmore */ mod orphan;\n",
+        "pub mod orphan // ;\n;\n",
+    ];
+    for source in caught {
+        assert_eq!(
+            declared_file_submodules_from(source),
+            vec!["orphan".to_string()],
+            "scan missed a file-backed submodule: {source:?}"
+        );
+    }
+    let skipped = [
+        "pub mod orphan /* ; */\n{ }\n",
+        "pub mod orphan {\n /* ; } */\n}\n",
+        "#[cfg(test)] pub mod orphan /* ; */ ;\n",
+    ];
+    for source in skipped {
+        assert_eq!(
+            declared_file_submodules_from(source),
+            Vec::<String>::new(),
+            "scan counted an inline or test-only module as file-backed: {source:?}"
         );
     }
 }
