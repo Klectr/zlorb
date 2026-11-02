@@ -1185,6 +1185,7 @@ impl RepoProcessor {
         fetch_commit: AnnotatedCommit,
         changed_paths: Option<&[PathBuf]>,
     ) -> Result<Reference<'_>, ZlorbError> {
+        self._refuse_if_update_would_overwrite(&fetch_commit, changed_paths)?;
         self._setup_repo_for_checkout(fetch_commit)?;
         self._checkout_and_get_ref(changed_paths)
     }
@@ -1254,16 +1255,32 @@ impl RepoProcessor {
                 None
             }
         };
+        let (restore_paths, preserved_paths) = match &changed_paths {
+            Some(paths) => {
+                let (safe, preserved) =
+                    self._rollback_restore_paths(local_oid, fetch_oid, paths);
+                for path in &preserved {
+                    Logger::error(format!(
+                        "Preserving local changes to {} in {} during rollback: the file changed after the update was checked and matches neither the rolled-back commit nor the fetched commit, so it is not being restored and the working tree is left diverged from {}",
+                        path.display(),
+                        self.config.name,
+                        local_oid
+                    ));
+                }
+                (Some(safe), preserved)
+            }
+            None => (None, Vec::new()),
+        };
         let mut tree_restored = false;
         let restore_result = match self.repo.find_commit(local_oid) {
             Ok(commit) => {
-                if matches!(&changed_paths, Some(paths) if paths.is_empty()) {
+                if matches!(&restore_paths, Some(paths) if paths.is_empty()) {
                     Ok(())
                 } else {
                     let mut checkout = git2::build::CheckoutBuilder::default();
                     checkout.force();
                     checkout.disable_pathspec_match(true);
-                    if let Some(paths) = &changed_paths {
+                    if let Some(paths) = &restore_paths {
                         for path in paths {
                             checkout.path(path);
                         }
@@ -1275,7 +1292,7 @@ impl RepoProcessor {
             Err(e) => Err(e),
         };
         match restore_result {
-            Ok(_) => tree_restored = true,
+            Ok(_) => tree_restored = preserved_paths.is_empty(),
             Err(e) => {
                 Logger::error(format!(
                     "Failed to restore the working tree after a failed fast-forward: {}",
@@ -1304,6 +1321,69 @@ impl RepoProcessor {
             return false;
         }
         verified
+    }
+
+    fn _rollback_restore_paths(
+        &self,
+        local_oid: Oid,
+        fetch_oid: Oid,
+        changed_paths: &[PathBuf],
+    ) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let (Ok(local_commit), Ok(fetch_commit)) = (
+            self.repo.find_commit(local_oid),
+            self.repo.find_commit(fetch_oid),
+        ) else {
+            return (changed_paths.to_vec(), Vec::new());
+        };
+        let (Ok(local_tree), Ok(fetch_tree)) = (local_commit.tree(), fetch_commit.tree())
+        else {
+            return (changed_paths.to_vec(), Vec::new());
+        };
+        let Some(workdir) = self.repo.workdir().map(|path| path.to_path_buf()) else {
+            return (changed_paths.to_vec(), Vec::new());
+        };
+        let mut safe = Vec::new();
+        let mut preserved = Vec::new();
+        for path in changed_paths {
+            let local_id = local_tree.get_path(path).ok().map(|entry| entry.id());
+            let fetch_id = fetch_tree.get_path(path).ok().map(|entry| entry.id());
+            if local_id == fetch_id {
+                safe.push(path.clone());
+                continue;
+            }
+            let full_path = workdir.join(path);
+            let Ok(metadata) = std::fs::symlink_metadata(&full_path) else {
+                safe.push(path.clone());
+                continue;
+            };
+            let file_type = metadata.file_type();
+            let contents = if file_type.is_symlink() {
+                let Ok(target) = std::fs::read_link(&full_path) else {
+                    preserved.push(path.clone());
+                    continue;
+                };
+                {
+                    use std::os::unix::ffi::OsStrExt;
+                    target.as_os_str().as_bytes().to_vec()
+                }
+            } else if file_type.is_file() {
+                let Ok(contents) = std::fs::read(&full_path) else {
+                    preserved.push(path.clone());
+                    continue;
+                };
+                contents
+            } else {
+                preserved.push(path.clone());
+                continue;
+            };
+            let disk_id = Oid::hash_object(git2::ObjectType::Blob, &contents).ok();
+            if disk_id == local_id || disk_id == fetch_id {
+                safe.push(path.clone());
+            } else {
+                preserved.push(path.clone());
+            }
+        }
+        (safe, preserved)
     }
 
     fn _verify_rollback(&self, local_oid: Oid, fetch_oid: Oid) -> bool {
@@ -2780,6 +2860,82 @@ mod tests {
         );
         assert!(!watched_path.join("new.txt").exists());
         drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn apply_fast_forward_rechecks_guard_and_preserves_edit_made_after_first_check() {
+        let (root, watched_path, v1, v2) =
+            repo_reset_to_v1_with_upstream_v2("apply-recheck");
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        {
+            let first_ref = processor
+                .repo
+                .find_reference("refs/remotes/origin/master")
+                .unwrap();
+            let first_commit = processor
+                .repo
+                .reference_to_annotated_commit(&first_ref)
+                .unwrap();
+            assert!(
+                processor
+                    ._refuse_if_update_would_overwrite(&first_commit, Some(&changed))
+                    .is_ok()
+            );
+        }
+        std::fs::write(watched_path.join("src/main.rs"), "race edit\n").unwrap();
+        {
+            let second_ref = processor
+                .repo
+                .find_reference("refs/remotes/origin/master")
+                .unwrap();
+            let second_commit = processor
+                .repo
+                .reference_to_annotated_commit(&second_ref)
+                .unwrap();
+            match processor._apply_fast_forward(second_commit, Some(&changed)) {
+                Ok(_) => {
+                    panic!("apply must refuse an edit made after the first guard check")
+                }
+                Err(e) => assert!(
+                    format!("{:?}", e).contains("local changes to tracked files"),
+                    "unexpected error: {:?}",
+                    e
+                ),
+            }
+        }
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("src/main.rs")).unwrap(),
+            "race edit\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_edit_made_during_the_update_on_a_touched_file() {
+        let root = temp_dir("rollback-race-edit-touched");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        let v1 = commit_all(&watched, "v1");
+        write_fixture_crate(&watched_path, "fixture-version-two");
+        let v2 = commit_all(&watched, "v2");
+        drop(watched);
+        std::fs::write(watched_path.join("src/main.rs"), "race edit\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("src/main.rs")).unwrap(),
+            "race edit\n"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
