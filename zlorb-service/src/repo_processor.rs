@@ -1345,45 +1345,103 @@ impl RepoProcessor {
         let mut safe = Vec::new();
         let mut preserved = Vec::new();
         for path in changed_paths {
-            let local_id = local_tree.get_path(path).ok().map(|entry| entry.id());
-            let fetch_id = fetch_tree.get_path(path).ok().map(|entry| entry.id());
-            if local_id == fetch_id {
+            let local_entry = local_tree.get_path(path).ok();
+            let fetch_entry = fetch_tree.get_path(path).ok();
+            let local_id = local_entry.as_ref().map(|entry| entry.id());
+            let fetch_id = fetch_entry.as_ref().map(|entry| entry.id());
+            let local_mode = local_entry.as_ref().map(|entry| entry.filemode());
+            let fetch_mode = fetch_entry.as_ref().map(|entry| entry.filemode());
+            if local_id == fetch_id && local_mode == fetch_mode {
                 safe.push(path.clone());
                 continue;
             }
-            let full_path = workdir.join(path);
-            let Ok(metadata) = std::fs::symlink_metadata(&full_path) else {
-                safe.push(path.clone());
-                continue;
-            };
-            let file_type = metadata.file_type();
-            let contents = if file_type.is_symlink() {
-                let Ok(target) = std::fs::read_link(&full_path) else {
+            if std::fs::symlink_metadata(workdir.join(path)).is_err() {
+                if local_id.is_some() && fetch_id.is_some() {
                     preserved.push(path.clone());
-                    continue;
-                };
-                {
-                    use std::os::unix::ffi::OsStrExt;
-                    target.as_os_str().as_bytes().to_vec()
+                } else {
+                    safe.push(path.clone());
                 }
-            } else if file_type.is_file() {
-                let Ok(contents) = std::fs::read(&full_path) else {
-                    preserved.push(path.clone());
-                    continue;
-                };
-                contents
-            } else {
-                preserved.push(path.clone());
                 continue;
-            };
-            let disk_id = Oid::hash_object(git2::ObjectType::Blob, &contents).ok();
-            if disk_id == local_id || disk_id == fetch_id {
+            }
+            if self._rollback_disk_matches(&workdir, path, local_id, local_mode)
+                || self._rollback_disk_matches(&workdir, path, fetch_id, fetch_mode)
+            {
                 safe.push(path.clone());
             } else {
                 preserved.push(path.clone());
             }
         }
         (safe, preserved)
+    }
+
+    fn _rollback_disk_matches(
+        &self,
+        workdir: &Path,
+        path: &Path,
+        entry_id: Option<Oid>,
+        entry_mode: Option<i32>,
+    ) -> bool {
+        let Some(expected) = entry_id else {
+            return false;
+        };
+        let full_path = workdir.join(path);
+        let Ok(metadata) = std::fs::symlink_metadata(&full_path) else {
+            return false;
+        };
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            if entry_mode != Some(0o120000) {
+                return false;
+            }
+            let Ok(target) = std::fs::read_link(&full_path) else {
+                return false;
+            };
+            let target_bytes = {
+                use std::os::unix::ffi::OsStrExt;
+                target.as_os_str().as_bytes().to_vec()
+            };
+            return Oid::hash_object(git2::ObjectType::Blob, &target_bytes).ok()
+                == Some(expected);
+        }
+        if !file_type.is_file() {
+            return false;
+        }
+        if !matches!(entry_mode, Some(0o100644) | Some(0o100755)) {
+            return false;
+        }
+        let file_mode = self
+            .repo
+            .config()
+            .and_then(|config| config.get_bool("core.fileMode"))
+            .unwrap_or(true);
+        if file_mode {
+            use std::os::unix::fs::PermissionsExt;
+            let disk_mode = if metadata.permissions().mode() & 0o111 != 0 {
+                0o100755
+            } else {
+                0o100644
+            };
+            if Some(disk_mode) != entry_mode {
+                return false;
+            }
+        }
+        if let Ok(contents) = std::fs::read(&full_path) {
+            if Oid::hash_object(git2::ObjectType::Blob, &contents).ok() == Some(expected)
+            {
+                return true;
+            }
+        }
+        if self._rollback_filtered_disk_id(path, &full_path) == Some(expected) {
+            return true;
+        }
+        self._matches_after_external_clean_filter(workdir, path, &full_path, expected)
+    }
+
+    fn _rollback_filtered_disk_id(&self, path: &Path, full_path: &Path) -> Option<Oid> {
+        let mut writer = self.repo.blob_writer(Some(path)).ok()?;
+        let mut file = std::fs::File::open(full_path).ok()?;
+        std::io::copy(&mut file, &mut writer).ok()?;
+        writer.commit().ok()
     }
 
     fn _verify_rollback(&self, local_oid: Oid, fetch_oid: Oid) -> bool {
@@ -2935,6 +2993,97 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(watched_path.join("src/main.rs")).unwrap(),
             "race edit\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_restores_crlf_file_holding_the_fetched_content() {
+        let root = temp_dir("rollback-crlf-fetched");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        std::fs::write(watched_path.join(".gitattributes"), "*.txt text eol=crlf\n")
+            .unwrap();
+        std::fs::write(watched_path.join("data.txt"), "line one\n").unwrap();
+        let v1 = commit_all(&watched, "v1");
+        std::fs::write(watched_path.join("data.txt"), "line two\n").unwrap();
+        let v2 = commit_all(&watched, "v2");
+        drop(watched);
+        std::fs::write(watched_path.join("data.txt"), "line two\r\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"line one\r\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_deletion_made_during_the_update_on_a_touched_file() {
+        let root = temp_dir("rollback-race-delete-touched");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        let v1 = commit_all(&watched, "v1");
+        write_fixture_crate(&watched_path, "fixture-version-two");
+        let v2 = commit_all(&watched, "v2");
+        drop(watched);
+        std::fs::remove_file(watched_path.join("src/main.rs")).unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert!(!watched_path.join("src/main.rs").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_mode_only_edit_made_during_the_update() {
+        let root = temp_dir("rollback-race-mode-touched");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        let v1 = commit_all(&watched, "v1");
+        write_fixture_crate(&watched_path, "fixture-version-two");
+        let v2 = commit_all(&watched, "v2");
+        drop(watched);
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                watched_path.join("src/main.rs"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(watched_path.join("src/main.rs"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o111, 0o111);
+        }
+        assert!(
+            std::fs::read_to_string(watched_path.join("src/main.rs"))
+                .unwrap()
+                .contains("fixture-version-two")
         );
         let _ = std::fs::remove_dir_all(&root);
     }
