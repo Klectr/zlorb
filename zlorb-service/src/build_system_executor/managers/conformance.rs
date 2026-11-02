@@ -584,8 +584,12 @@ fn declared_shipped_modules_from(source: &str) -> Vec<String> {
     for line in source.lines() {
         let mut rest_owned: String;
         let mut rest: &str;
+        let mut line_end_state = SkeletonState::default();
+        let mut end_state_set = false;
         if let Some(mut buf) = attr_buf.take() {
             let skel_line = code_skeleton(line, &mut attr_skel);
+            line_end_state = attr_skel;
+            end_state_set = true;
             let Some(end) = find_attr_close(&skel_line) else {
                 buf.push_str(&skel_line);
                 buf.push(' ');
@@ -606,8 +610,12 @@ fn declared_shipped_modules_from(source: &str) -> Vec<String> {
         while let Some(inner) = rest.strip_prefix("#[") {
             let mut frag_state = SkeletonState::default();
             let skel_inner = code_skeleton(inner, &mut frag_state);
+            if !end_state_set {
+                line_end_state = frag_state;
+                end_state_set = true;
+            }
             let Some(end) = find_attr_close(&skel_inner) else {
-                attr_skel = frag_state;
+                attr_skel = line_end_state;
                 attr_buf = Some(skel_inner);
                 incomplete = true;
                 break;
@@ -1110,6 +1118,7 @@ fn shipped_module_scan_handles_multiline_cfg_attributes() {
         "#[cfg( // gate\n test\n)]\npub mod template;\n",
         "#[cfg( // gate ]\n test\n)]\npub mod template;\n",
         "#[cfg(/* gate ] */\n test\n)]\npub mod template;\n",
+        "#[derive(Debug)] #[cfg(/* gate\n still gate */ test)]\npub mod template;\n",
     ];
     for source in skipped {
         assert_eq!(
