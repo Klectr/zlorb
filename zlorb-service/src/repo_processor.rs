@@ -1532,18 +1532,26 @@ impl RepoProcessor {
             }
             let child_path = path.join(name);
             let child_full = workdir.join(&child_path);
+            let child_is_real_dir = std::fs::symlink_metadata(&child_full)
+                .map(|metadata| metadata.file_type().is_dir())
+                .unwrap_or(false);
             let matches = match entry.kind() {
-                Some(git2::ObjectType::Tree) => match entry.to_object(&self.repo) {
-                    Ok(object) => match object.as_tree() {
-                        Some(child_tree) => {
-                            self._rollback_dir_matches_tree(workdir, &child_path, child_tree)
+                Some(git2::ObjectType::Tree) => {
+                    child_is_real_dir
+                        && match entry.to_object(&self.repo) {
+                            Ok(object) => match object.as_tree() {
+                                Some(child_tree) => self._rollback_dir_matches_tree(
+                                    workdir,
+                                    &child_path,
+                                    child_tree,
+                                ),
+                                None => false,
+                            },
+                            Err(_) => false,
                         }
-                        None => false,
-                    },
-                    Err(_) => false,
-                },
+                }
                 Some(git2::ObjectType::Commit) => {
-                    self._rollback_gitlink_matches(&child_full, entry.id())
+                    child_is_real_dir && self._rollback_gitlink_matches(&child_full, entry.id())
                 }
                 _ => self._rollback_disk_matches(
                     workdir,
@@ -3422,6 +3430,178 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(watched_path.join("thing")).unwrap(),
             "file version\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_typechange_directory_with_a_symlinked_child_directory() {
+        let root = temp_dir("rollback-typechange-dir-symlink-child");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        std::fs::write(watched_path.join("thing"), "file version\n").unwrap();
+        let v1 = commit_all(&watched, "v1");
+        std::fs::remove_file(watched_path.join("thing")).unwrap();
+        std::fs::create_dir_all(watched_path.join("thing/inner")).unwrap();
+        std::fs::write(watched_path.join("thing/f.txt"), "f\n").unwrap();
+        std::fs::write(watched_path.join("thing/inner/b.txt"), "b\n").unwrap();
+        let v2 = commit_all(&watched, "v2");
+        drop(watched);
+        let outside_path = root.join("outside");
+        std::fs::create_dir_all(&outside_path).unwrap();
+        std::fs::write(outside_path.join("b.txt"), "b\n").unwrap();
+        std::fs::remove_dir_all(watched_path.join("thing/inner")).unwrap();
+        std::os::unix::fs::symlink(&outside_path, watched_path.join("thing/inner")).unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert!(
+            std::fs::symlink_metadata(watched_path.join("thing/inner"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside_path.join("b.txt")).unwrap(),
+            "b\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_restores_typechange_directory_matching_the_local_tree() {
+        let root = temp_dir("rollback-typechange-dir-local");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        std::fs::create_dir_all(watched_path.join("thing")).unwrap();
+        std::fs::write(watched_path.join("thing/a.txt"), "a\n").unwrap();
+        let v1 = commit_all(&watched, "v1");
+        std::fs::remove_dir_all(watched_path.join("thing")).unwrap();
+        std::fs::write(watched_path.join("thing"), "file version\n").unwrap();
+        let v2 = commit_all(&watched, "v2");
+        drop(watched);
+        std::fs::remove_file(watched_path.join("thing")).unwrap();
+        std::fs::create_dir_all(watched_path.join("thing")).unwrap();
+        std::fs::write(watched_path.join("thing/a.txt"), "a\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("thing/a.txt")).unwrap(),
+            "a\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_commitless_repo_at_a_gitlink_path() {
+        let (root, watched_path, v1, v2, _sub_a, _sub_b) =
+            gitlink_fixture("rollback-gitlink-commitless");
+        std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let fresh = git2::Repository::init_opts(watched_path.join("sub"), &init_opts).unwrap();
+        drop(fresh);
+        std::fs::write(watched_path.join("sub/draft.txt"), "draft\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/draft.txt")).unwrap(),
+            "draft\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn nested_gitlink_fixture(label: &str) -> (PathBuf, PathBuf, Oid, Oid) {
+        let root = temp_dir(label);
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        std::fs::write(watched_path.join("thing"), "file version\n").unwrap();
+        let v1 = commit_all(&watched, "v1");
+        let sub_src_path = root.join("sub-src");
+        let sub_src = git2::Repository::init_opts(&sub_src_path, &init_opts).unwrap();
+        std::fs::write(sub_src_path.join("s.txt"), "sub one\n").unwrap();
+        commit_all(&sub_src, "sub a");
+        std::fs::write(sub_src_path.join("s.txt"), "sub two\n").unwrap();
+        let sub_b = commit_all(&sub_src, "sub b");
+        drop(sub_src);
+        let v2 = {
+            let a_blob = watched.blob(b"a\n").unwrap();
+            let mut thing_builder = watched.treebuilder(None).unwrap();
+            thing_builder.insert("a.txt", a_blob, 0o100644).unwrap();
+            thing_builder.insert("sub", sub_b, 0o160000).unwrap();
+            let thing_tree = thing_builder.write().unwrap();
+            let v1_commit = watched.find_commit(v1).unwrap();
+            let v1_tree = v1_commit.tree().unwrap();
+            let mut root_builder = watched.treebuilder(Some(&v1_tree)).unwrap();
+            root_builder.insert("thing", thing_tree, 0o40000).unwrap();
+            let v2_tree_oid = root_builder.write().unwrap();
+            let v2_tree = watched.find_tree(v2_tree_oid).unwrap();
+            let sig = Signature::now("zlorb-test", "zlorb-test@example.com").unwrap();
+            let v2 = watched
+                .commit(Some("HEAD"), &sig, &sig, "v2", &v2_tree, &[&v1_commit])
+                .unwrap();
+            let mut index = watched.index().unwrap();
+            index.read_tree(&v2_tree).unwrap();
+            index.write().unwrap();
+            v2
+        };
+        drop(watched);
+        std::fs::remove_file(watched_path.join("thing")).unwrap();
+        std::fs::create_dir_all(watched_path.join("thing")).unwrap();
+        std::fs::write(watched_path.join("thing/a.txt"), "a\n").unwrap();
+        git2::Repository::clone(
+            sub_src_path.to_string_lossy().as_ref(),
+            watched_path.join("thing/sub"),
+        )
+        .unwrap();
+        (root, watched_path, v1, v2)
+    }
+
+    #[test]
+    fn rollback_restores_typechange_directory_holding_a_clean_nested_gitlink() {
+        let (root, watched_path, v1, v2) =
+            nested_gitlink_fixture("rollback-nested-gitlink-clean");
+        let processor = processor_for(&watched_path);
+        assert!(processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("thing")).unwrap(),
+            "file version\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_typechange_directory_holding_a_dirty_nested_gitlink() {
+        let (root, watched_path, v1, v2) =
+            nested_gitlink_fixture("rollback-nested-gitlink-dirty");
+        std::fs::write(watched_path.join("thing/sub/precious.txt"), "precious\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("thing/sub/precious.txt")).unwrap(),
+            "precious\n"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
