@@ -44,6 +44,13 @@ macro_rules! build_strategies {
             }
 
             #[cfg(test)]
+            pub(crate) fn manager_name(&self) -> &'static str {
+                match self {
+                    $(Self::$variant(_) => stringify!($manager)),+
+                }
+            }
+
+            #[cfg(test)]
             pub(crate) fn kind(&self) -> BuildStrategyKind {
                 match self {
                     $(Self::$variant(_) => BuildStrategyKind::$variant),+

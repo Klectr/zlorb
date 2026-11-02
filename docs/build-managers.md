@@ -160,7 +160,8 @@ copy them. Fixing them is separate work from adding a manager.
    - Wire the manager into the shared conformance suite in
      `zlorb-service/src/build_system_executor/managers/conformance.rs`:
      add a case for it (a stand-in runtime name, its step scripts in
-     order, and a `run` function that drives its
+     order, the module's own source via `include_str!`, and a `run`
+     function that drives its
      `exec_with_runtime_path` against a stand-in binary, the seam the
      shipped managers and the template all carry), and add its
      arms to the exhaustive matches over `BuildStrategyKind` and
@@ -249,8 +250,21 @@ assumption:
       the mechanical half: it reads the module declarations in
       `managers/mod.rs` and fails when a shipped (non-`#[cfg(test)]`)
       module matches no registered `BuildStrategyKind`, or a registered
-      kind has no shipped module. The real-project justification stays a
-      human judgment.
+      kind has no shipped module. It also scans the shipped manager
+      modules' own source (each conformance case carries its module
+      file, plus `managers/mod.rs` and `managers/manager.rs`) and fails
+      when a shipped (non-`#[cfg(test)]`) `pub` struct or
+      `impl Manager for` in those files names a manager the
+      `build_strategies!` list does not register, or a registered
+      manager is missing from them, so a second manager struct in
+      canonical form placed inside an existing manager's file cannot
+      pass as dead code either. The equality is exact for structs as
+      well as impls: those files may not declare any other `pub`
+      struct, so a helper type in one of them stays private. The scan
+      is line-based: it skips `#[cfg(test)]` items and
+      blocks, comment lines, block comments, and string contents, and
+      it covers only those named files, not submodules declared inside
+      them. The real-project justification stays a human judgment.
 
 ## The template
 
