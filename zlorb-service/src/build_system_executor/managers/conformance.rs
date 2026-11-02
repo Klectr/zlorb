@@ -604,17 +604,19 @@ fn declared_shipped_modules_from(source: &str) -> Vec<String> {
         }
         let mut incomplete = false;
         while let Some(inner) = rest.strip_prefix("#[") {
-            let Some(end) = find_attr_close(inner) else {
-                attr_skel = SkeletonState::default();
-                attr_buf = Some(code_skeleton(inner, &mut attr_skel));
+            let mut frag_state = SkeletonState::default();
+            let skel_inner = code_skeleton(inner, &mut frag_state);
+            let Some(end) = find_attr_close(&skel_inner) else {
+                attr_skel = frag_state;
+                attr_buf = Some(skel_inner);
                 incomplete = true;
                 break;
             };
-            let attr = normalize_attr(&inner[..end]);
+            let attr = normalize_attr(&skel_inner[..end]);
             if cfg_attr_is_test_only(&attr) {
                 cfg_test = true;
             }
-            rest_owned = inner[end + 1..].trim_start().to_string();
+            rest_owned = skel_inner[end + 1..].trim_start().to_string();
             rest = &rest_owned;
         }
         if incomplete {
@@ -1106,6 +1108,8 @@ fn shipped_module_scan_handles_multiline_cfg_attributes() {
         "#[cfg(\n test // gate\n)]\npub mod template;\n",
         "#[cfg(\n /* gate */\n test\n)]\npub mod template;\n",
         "#[cfg( // gate\n test\n)]\npub mod template;\n",
+        "#[cfg( // gate ]\n test\n)]\npub mod template;\n",
+        "#[cfg(/* gate ] */\n test\n)]\npub mod template;\n",
     ];
     for source in skipped {
         assert_eq!(
@@ -1118,6 +1122,8 @@ fn shipped_module_scan_handles_multiline_cfg_attributes() {
         "#[cfg(any(\n test,\n feature = \"x\"\n))] pub mod npm;\n",
         "#[cfg(\n not(test)\n)]\npub mod npm;\n",
         "#[cfg(any(\n test,\n feature = \"a]b\"\n))] pub mod npm;\n",
+        "#[cfg( // gate ]\n not(test)\n)] pub mod npm;\n",
+        "#[cfg(/* ] */ not(test))] pub mod npm;\n",
     ];
     for source in counted {
         assert_eq!(
