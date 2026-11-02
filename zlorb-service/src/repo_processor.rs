@@ -31,16 +31,28 @@ fn kill_process_group(pgid: libc::pid_t) {
     }
 }
 
+fn pipe_drain_deadline() -> std::time::Instant {
+    std::time::Instant::now() + std::time::Duration::from_secs(10)
+}
+
 fn collect_pipe_output(
     rx: &std::sync::mpsc::Receiver<Vec<u8>>,
     pgid: libc::pid_t,
+    deadline: std::time::Instant,
 ) -> Option<Vec<u8>> {
     let drain = std::time::Duration::from_secs(5);
-    match rx.recv_timeout(drain) {
+    let grace = std::time::Duration::from_millis(250);
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        kill_process_group(pgid);
+        return rx.recv_timeout(grace).ok();
+    }
+    match rx.recv_timeout(remaining.min(drain)) {
         Ok(buf) => Some(buf),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             kill_process_group(pgid);
-            rx.recv_timeout(drain).ok()
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            rx.recv_timeout(remaining.max(grace)).ok()
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
     }
@@ -972,11 +984,12 @@ impl RepoProcessor {
                             timeout.as_secs(),
                             filter_name
                         ));
+                        let drain_deadline = pipe_drain_deadline();
                         if let Some(rx) = &stdout_rx {
-                            let _ = collect_pipe_output(rx, pgid);
+                            let _ = collect_pipe_output(rx, pgid, drain_deadline);
                         }
                         if let Some(rx) = &stderr_rx {
-                            let _ = collect_pipe_output(rx, pgid);
+                            let _ = collect_pipe_output(rx, pgid, drain_deadline);
                         }
                         return false;
                     }
@@ -993,24 +1006,26 @@ impl RepoProcessor {
                         filter_name,
                         e
                     ));
+                    let drain_deadline = pipe_drain_deadline();
                     if let Some(rx) = &stdout_rx {
-                        let _ = collect_pipe_output(rx, pgid);
+                        let _ = collect_pipe_output(rx, pgid, drain_deadline);
                     }
                     if let Some(rx) = &stderr_rx {
-                        let _ = collect_pipe_output(rx, pgid);
+                        let _ = collect_pipe_output(rx, pgid, drain_deadline);
                     }
                     return false;
                 }
             }
         };
+        let drain_deadline = pipe_drain_deadline();
         let mut stderr_rx = stderr_rx;
         let stdout = match stdout_rx {
-            Some(rx) => match collect_pipe_output(&rx, pgid) {
+            Some(rx) => match collect_pipe_output(&rx, pgid, drain_deadline) {
                 Some(buf) => buf,
                 None => {
                     kill_process_group(pgid);
                     if let Some(rx) = stderr_rx.take() {
-                        let _ = collect_pipe_output(&rx, pgid);
+                        let _ = collect_pipe_output(&rx, pgid, drain_deadline);
                     }
                     Logger::error(format!(
                         "git hash-object for {} in {} left its output pipes open after exiting while applying the external clean filter {}; treating it as changed so the update is refused rather than risk discarding it",
@@ -1024,7 +1039,7 @@ impl RepoProcessor {
             None => Vec::new(),
         };
         let stderr = match stderr_rx {
-            Some(rx) => collect_pipe_output(&rx, pgid).unwrap_or_default(),
+            Some(rx) => collect_pipe_output(&rx, pgid, drain_deadline).unwrap_or_default(),
             None => Vec::new(),
         };
         if !status.success() {
@@ -2161,6 +2176,69 @@ mod tests {
             b"Xgoodbye\n"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn two_pipe_drains_sharing_one_deadline_finish_within_the_shared_budget() {
+        use std::os::unix::process::CommandExt;
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = child.id() as libc::pid_t;
+        let (_tx1, rx1) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (_tx2, rx2) = std::sync::mpsc::channel::<Vec<u8>>();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(600);
+        let started = std::time::Instant::now();
+        assert!(collect_pipe_output(&rx1, pgid, deadline).is_none());
+        assert!(collect_pipe_output(&rx2, pgid, deadline).is_none());
+        assert!(started.elapsed() < std::time::Duration::from_millis(1500));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn pipe_drain_captures_output_delivered_just_after_the_kill() {
+        use std::os::unix::process::CommandExt;
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = child.id() as libc::pid_t;
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            let _ = tx.send(b"late\n".to_vec());
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(600);
+        assert_eq!(
+            collect_pipe_output(&rx, pgid, deadline),
+            Some(b"late\n".to_vec())
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn pipe_drain_before_the_shared_deadline_returns_the_buffered_output() {
+        use std::os::unix::process::CommandExt;
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = child.id() as libc::pid_t;
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        tx.send(b"hello\n".to_vec()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        assert_eq!(
+            collect_pipe_output(&rx, pgid, deadline),
+            Some(b"hello\n".to_vec())
+        );
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
