@@ -391,6 +391,33 @@ fn cfg_expr_is_test_only(expr: &str) -> bool {
     false
 }
 
+fn find_attr_close(text: &str) -> Option<usize> {
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, c) in text.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            ']' => return Some(index),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn normalize_attr(attr: &str) -> String {
+    attr.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
 fn cfg_attr_is_test_only(attr: &str) -> bool {
     let Some(inner) = attr
         .strip_prefix("cfg(")
@@ -413,17 +440,50 @@ fn scan_manager_types(source: &str) -> ManagerTypeScan {
     let mut test_block_at: Option<i32> = None;
     let mut pending_test = false;
     let mut skeleton_state = SkeletonState::default();
+    let mut attr_buf: Option<String> = None;
+    let mut attr_saved_test = false;
     for raw_line in source.lines() {
         let line = code_skeleton(raw_line, &mut skeleton_state);
-        let mut rest = line.trim();
         let mut line_cfg_test = false;
+        let mut rest_owned: String;
+        let mut rest: &str;
+        if let Some(mut buf) = attr_buf.take() {
+            let Some(end) = find_attr_close(&line) else {
+                buf.push_str(&line);
+                buf.push(' ');
+                attr_buf = Some(buf);
+                continue;
+            };
+            buf.push_str(&line[..end]);
+            if cfg_attr_is_test_only(&normalize_attr(&buf)) {
+                line_cfg_test = true;
+            }
+            if attr_saved_test {
+                line_cfg_test = true;
+                attr_saved_test = false;
+            }
+            rest_owned = line[end + 1..].trim_start().to_string();
+            rest = &rest_owned;
+        } else {
+            rest = line.trim();
+        }
+        let mut incomplete = false;
         while let Some(inner) = rest.strip_prefix("#[") {
-            let Some(end) = inner.find(']') else { break };
-            let attr = inner[..end].replace(' ', "");
+            let Some(end) = find_attr_close(inner) else {
+                attr_buf = Some(inner.to_string());
+                attr_saved_test = line_cfg_test;
+                incomplete = true;
+                break;
+            };
+            let attr = normalize_attr(&inner[..end]);
             if cfg_attr_is_test_only(&attr) {
                 line_cfg_test = true;
             }
-            rest = inner[end + 1..].trim_start();
+            rest_owned = inner[end + 1..].trim_start().to_string();
+            rest = &rest_owned;
+        }
+        if incomplete {
+            continue;
         }
         if rest.is_empty() {
             if line_cfg_test {
@@ -518,15 +578,42 @@ fn mod_declaration_name(declaration: &str) -> Option<String> {
 fn declared_shipped_modules_from(source: &str) -> Vec<String> {
     let mut modules = Vec::new();
     let mut cfg_test = false;
+    let mut attr_buf: Option<String> = None;
     for line in source.lines() {
-        let mut rest = line.trim();
+        let mut rest_owned: String;
+        let mut rest: &str;
+        if let Some(mut buf) = attr_buf.take() {
+            let Some(end) = find_attr_close(line) else {
+                buf.push_str(line);
+                buf.push(' ');
+                attr_buf = Some(buf);
+                continue;
+            };
+            buf.push_str(&line[..end]);
+            if cfg_attr_is_test_only(&normalize_attr(&buf)) {
+                cfg_test = true;
+            }
+            rest_owned = line[end + 1..].trim_start().to_string();
+            rest = &rest_owned;
+        } else {
+            rest = line.trim();
+        }
+        let mut incomplete = false;
         while let Some(inner) = rest.strip_prefix("#[") {
-            let Some(end) = inner.find(']') else { break };
-            let attr = inner[..end].replace(' ', "");
+            let Some(end) = find_attr_close(inner) else {
+                attr_buf = Some(inner.to_string());
+                incomplete = true;
+                break;
+            };
+            let attr = normalize_attr(&inner[..end]);
             if cfg_attr_is_test_only(&attr) {
                 cfg_test = true;
             }
-            rest = inner[end + 1..].trim_start();
+            rest_owned = inner[end + 1..].trim_start().to_string();
+            rest = &rest_owned;
+        }
+        if incomplete {
+            continue;
         }
         if rest.is_empty() || rest.starts_with("//") {
             continue;
@@ -816,6 +903,43 @@ fn manager_type_scan_cfg_predicate_matches_test_only_semantics() {
 }
 
 #[test]
+fn manager_type_scan_handles_multiline_cfg_attributes() {
+    let skipped = [
+        "#[cfg(\n test\n)]\npub struct TestOnlyManager;\n",
+        "#[cfg(\n test\n)] pub struct TestOnlyManager;\n",
+        "#[cfg(all(\n feature = \"x\",\n test\n))] pub struct TestOnlyManager;\n",
+        "#[cfg(\n any(test, test)\n)]\nimpl Manager for TestOnlyManager {}\n",
+        "#[derive(Debug)]\n#[cfg(\n test\n)]\npub struct TestOnlyManager;\n",
+        "#[cfg(\n test\n)]\nmod tests {\n pub struct Hidden;\n}\npub struct After;\n",
+    ];
+    for source in skipped {
+        let scan = scan_manager_types(source);
+        assert_eq!(
+            scan.structs.iter().filter(|name| name.as_str() != "After").count(),
+            0,
+            "scan counted a test-only struct: {source:?}"
+        );
+        assert_eq!(scan.impls, Vec::<String>::new(), "scan counted a test-only impl: {source:?}");
+        if source.contains("After") {
+            assert_eq!(scan.structs, vec!["After".to_string()]);
+        }
+    }
+    let counted = [
+        "#[cfg(any(\n test,\n feature = \"x\"\n))] pub struct ShippedManager;\n",
+        "#[cfg(\n not(test)\n)] pub struct ShippedManager;\n",
+        "#[cfg(any(\n test,\n feature = \"x\"\n))]\nimpl Manager for ShippedManager {}\n",
+    ];
+    for source in counted {
+        let scan = scan_manager_types(source);
+        assert_eq!(
+            scan.structs.len() + scan.impls.len(),
+            1,
+            "scan skipped a shipped declaration: {source:?}"
+        );
+    }
+}
+
+#[test]
 fn manager_type_scan_ignores_comments_and_strings() {
     let commented = "// pub struct Commented;\n// impl Manager for Commented {}\n/* pub struct Blocked; */\npub struct Real;\n";
     let scan = scan_manager_types(commented);
@@ -956,6 +1080,40 @@ fn shipped_module_scan_cfg_predicate_matches_test_only_semantics() {
             "scan skipped a shipped module: {source:?}"
         );
     }
+}
+
+#[test]
+fn shipped_module_scan_handles_multiline_cfg_attributes() {
+    let skipped = [
+        "#[cfg(\n test\n)]\npub mod template;\n",
+        "#[cfg(\n test\n)] pub mod template;\n",
+        "#[cfg(all(\n feature = \"x\",\n test\n))] pub mod template;\n",
+        "#[cfg(any(\n test,\n test\n))]\npub mod template;\n",
+    ];
+    for source in skipped {
+        assert_eq!(
+            declared_shipped_modules_from(source),
+            Vec::<String>::new(),
+            "scan counted a test-only module: {source:?}"
+        );
+    }
+    let counted = [
+        "#[cfg(any(\n test,\n feature = \"x\"\n))] pub mod npm;\n",
+        "#[cfg(\n not(test)\n)]\npub mod npm;\n",
+        "#[cfg(any(\n test,\n feature = \"a]b\"\n))] pub mod npm;\n",
+    ];
+    for source in counted {
+        assert_eq!(
+            declared_shipped_modules_from(source),
+            vec!["npm".to_string()],
+            "scan skipped a shipped module: {source:?}"
+        );
+    }
+    let mixed = "pub mod bun;\n#[cfg(\n test\n)]\npub mod template;\npub mod rust;\n";
+    assert_eq!(
+        declared_shipped_modules_from(mixed),
+        vec!["bun".to_string(), "rust".to_string()]
+    );
 }
 
 #[test]
