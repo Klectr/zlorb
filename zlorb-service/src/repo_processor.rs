@@ -35,26 +35,132 @@ fn pipe_drain_deadline() -> std::time::Instant {
     std::time::Instant::now() + std::time::Duration::from_secs(10)
 }
 
-fn collect_pipe_output(
-    rx: &std::sync::mpsc::Receiver<Vec<u8>>,
-    pgid: libc::pid_t,
-    deadline: std::time::Instant,
-) -> Option<Vec<u8>> {
-    let drain = std::time::Duration::from_secs(5);
-    let grace = std::time::Duration::from_millis(250);
-    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    if remaining.is_zero() {
-        kill_process_group(pgid);
-        return rx.recv_timeout(grace).ok();
-    }
-    match rx.recv_timeout(remaining.min(drain)) {
-        Ok(buf) => Some(buf),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            kill_process_group(pgid);
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            rx.recv_timeout(remaining.max(grace)).ok()
+fn set_nonblocking(fd: libc::c_int) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+    }
+}
+
+struct PipeDrain {
+    reader: Box<dyn std::io::Read>,
+    fd: libc::c_int,
+    buf: Vec<u8>,
+    eof: bool,
+}
+
+impl PipeDrain {
+    fn new<R: std::io::Read + std::os::unix::io::AsRawFd + 'static>(reader: R) -> Self {
+        let fd = reader.as_raw_fd();
+        set_nonblocking(fd);
+        Self {
+            reader: Box::new(reader),
+            fd,
+            buf: Vec::new(),
+            eof: false,
+        }
+    }
+
+    fn read_available(&mut self) {
+        let mut chunk = [0u8; 8192];
+        for _ in 0..128 {
+            match self.reader.read(&mut chunk) {
+                Ok(0) => {
+                    self.eof = true;
+                    return;
+                }
+                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
+                Err(_) => {
+                    self.eof = true;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+struct PipeDrains {
+    stdout: PipeDrain,
+    stderr: PipeDrain,
+}
+
+impl PipeDrains {
+    fn new<O, E>(stdout: O, stderr: E) -> Self
+    where
+        O: std::io::Read + std::os::unix::io::AsRawFd + 'static,
+        E: std::io::Read + std::os::unix::io::AsRawFd + 'static,
+    {
+        Self {
+            stdout: PipeDrain::new(stdout),
+            stderr: PipeDrain::new(stderr),
+        }
+    }
+
+    fn all_eof(&self) -> bool {
+        self.stdout.eof && self.stderr.eof
+    }
+
+    fn poll_ready(&mut self, wait: std::time::Duration) {
+        if self.all_eof() {
+            std::thread::sleep(wait);
+            return;
+        }
+        let mut fds = Vec::new();
+        let mut is_stdout = Vec::new();
+        for (drain, flag) in [(&self.stdout, true), (&self.stderr, false)] {
+            if !drain.eof {
+                fds.push(libc::pollfd {
+                    fd: drain.fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+                is_stdout.push(flag);
+            }
+        }
+        let timeout = wait.as_millis().min(1000) as libc::c_int;
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
+        if ready <= 0 {
+            return;
+        }
+        for (index, fd) in fds.iter().enumerate() {
+            if fd.revents == 0 {
+                continue;
+            }
+            let drain = if is_stdout[index] {
+                &mut self.stdout
+            } else {
+                &mut self.stderr
+            };
+            if fd.revents & libc::POLLNVAL != 0 {
+                drain.eof = true;
+            } else if fd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                drain.read_available();
+            }
+        }
+    }
+
+    fn drain_until(&mut self, end: std::time::Instant) {
+        while !self.all_eof() {
+            let remaining = end.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            self.poll_ready(remaining.min(std::time::Duration::from_millis(100)));
+        }
+    }
+
+    fn finish(&mut self, deadline: std::time::Instant, pgid: libc::pid_t) -> bool {
+        let first_end = deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        self.drain_until(first_end);
+        if !self.all_eof() {
+            kill_process_group(pgid);
+            let grace_end = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            self.drain_until(deadline.max(grace_end));
+        }
+        self.stdout.eof
     }
 }
 
@@ -915,7 +1021,6 @@ impl RepoProcessor {
         expected: Oid,
         timeout: std::time::Duration,
     ) -> bool {
-        use std::io::Read;
         let Some(filter_name) = self._external_clean_filter_name(path) else {
             return false;
         };
@@ -951,24 +1056,21 @@ impl RepoProcessor {
             }
         };
         let pgid = child.id() as libc::pid_t;
-        let stdout_rx = child.stdout.take().map(|mut pipe| {
-            let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                let _ = pipe.read_to_end(&mut buf);
-                let _ = tx.send(buf);
-            });
-            rx
-        });
-        let stderr_rx = child.stderr.take().map(|mut pipe| {
-            let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                let _ = pipe.read_to_end(&mut buf);
-                let _ = tx.send(buf);
-            });
-            rx
-        });
+        let mut drains = match (child.stdout.take(), child.stderr.take()) {
+            (Some(stdout), Some(stderr)) => PipeDrains::new(stdout, stderr),
+            _ => {
+                kill_process_group(pgid);
+                let _ = child.kill();
+                let _ = child.wait();
+                Logger::error(format!(
+                    "git hash-object for {} in {} did not provide output pipes while applying the external clean filter {}; treating it as changed so the update is refused rather than risk discarding it",
+                    path.display(),
+                    self.config.name,
+                    filter_name
+                ));
+                return false;
+            }
+        };
         let deadline = std::time::Instant::now() + timeout;
         let status = loop {
             match child.try_wait() {
@@ -985,15 +1087,10 @@ impl RepoProcessor {
                             filter_name
                         ));
                         let drain_deadline = pipe_drain_deadline();
-                        if let Some(rx) = &stdout_rx {
-                            let _ = collect_pipe_output(rx, pgid, drain_deadline);
-                        }
-                        if let Some(rx) = &stderr_rx {
-                            let _ = collect_pipe_output(rx, pgid, drain_deadline);
-                        }
+                        let _ = drains.finish(drain_deadline, pgid);
                         return false;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    drains.poll_ready(std::time::Duration::from_millis(10));
                 }
                 Err(e) => {
                     kill_process_group(pgid);
@@ -1007,41 +1104,23 @@ impl RepoProcessor {
                         e
                     ));
                     let drain_deadline = pipe_drain_deadline();
-                    if let Some(rx) = &stdout_rx {
-                        let _ = collect_pipe_output(rx, pgid, drain_deadline);
-                    }
-                    if let Some(rx) = &stderr_rx {
-                        let _ = collect_pipe_output(rx, pgid, drain_deadline);
-                    }
+                    let _ = drains.finish(drain_deadline, pgid);
                     return false;
                 }
             }
         };
         let drain_deadline = pipe_drain_deadline();
-        let mut stderr_rx = stderr_rx;
-        let stdout = match stdout_rx {
-            Some(rx) => match collect_pipe_output(&rx, pgid, drain_deadline) {
-                Some(buf) => buf,
-                None => {
-                    kill_process_group(pgid);
-                    if let Some(rx) = stderr_rx.take() {
-                        let _ = collect_pipe_output(&rx, pgid, drain_deadline);
-                    }
-                    Logger::error(format!(
-                        "git hash-object for {} in {} left its output pipes open after exiting while applying the external clean filter {}; treating it as changed so the update is refused rather than risk discarding it",
-                        path.display(),
-                        self.config.name,
-                        filter_name
-                    ));
-                    return false;
-                }
-            },
-            None => Vec::new(),
-        };
-        let stderr = match stderr_rx {
-            Some(rx) => collect_pipe_output(&rx, pgid, drain_deadline).unwrap_or_default(),
-            None => Vec::new(),
-        };
+        if !drains.finish(drain_deadline, pgid) {
+            Logger::error(format!(
+                "git hash-object for {} in {} left its output pipes open after exiting while applying the external clean filter {}; treating it as changed so the update is refused rather than risk discarding it",
+                path.display(),
+                self.config.name,
+                filter_name
+            ));
+            return false;
+        }
+        let stdout = std::mem::take(&mut drains.stdout.buf);
+        let stderr = std::mem::take(&mut drains.stderr.buf);
         if !status.success() {
             Logger::error(format!(
                 "git hash-object for {} in {} failed ({}) while applying the external clean filter {}; treating it as changed so the update is refused rather than risk discarding it: {}",
@@ -2178,64 +2257,99 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn two_pipe_drains_sharing_one_deadline_finish_within_the_shared_budget() {
+    fn pipe_pair() -> (std::fs::File, std::fs::File) {
+        use std::os::unix::io::FromRawFd;
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let read = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let write = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        (read, write)
+    }
+
+    fn closed_pipe_pair() -> std::fs::File {
+        let (read, write) = pipe_pair();
+        drop(write);
+        read
+    }
+
+    fn spawn_sleep_group() -> (std::process::Child, libc::pid_t) {
         use std::os::unix::process::CommandExt;
-        let mut child = Command::new("sleep")
+        let child = Command::new("sleep")
             .arg("30")
             .process_group(0)
             .spawn()
             .unwrap();
         let pgid = child.id() as libc::pid_t;
-        let (_tx1, rx1) = std::sync::mpsc::channel::<Vec<u8>>();
-        let (_tx2, rx2) = std::sync::mpsc::channel::<Vec<u8>>();
+        (child, pgid)
+    }
+
+    #[test]
+    fn two_pipe_drains_sharing_one_deadline_finish_within_the_shared_budget() {
+        let (mut child, pgid) = spawn_sleep_group();
+        let (out_read, _out_write) = pipe_pair();
+        let (err_read, _err_write) = pipe_pair();
+        let mut drains = PipeDrains::new(out_read, err_read);
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(600);
         let started = std::time::Instant::now();
-        assert!(collect_pipe_output(&rx1, pgid, deadline).is_none());
-        assert!(collect_pipe_output(&rx2, pgid, deadline).is_none());
+        assert!(!drains.finish(deadline, pgid));
         assert!(started.elapsed() < std::time::Duration::from_millis(1500));
         let _ = child.kill();
         let _ = child.wait();
     }
 
     #[test]
-    fn pipe_drain_captures_output_delivered_just_after_the_kill() {
+    fn pipe_drain_captures_buffered_output_when_the_kill_closes_the_pipe() {
         use std::os::unix::process::CommandExt;
-        let mut child = Command::new("sleep")
-            .arg("30")
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("printf 'late\\n'; sleep 30")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .process_group(0)
             .spawn()
             .unwrap();
         let pgid = child.id() as libc::pid_t;
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(700));
-            let _ = tx.send(b"late\n".to_vec());
-        });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(600);
-        assert_eq!(
-            collect_pipe_output(&rx, pgid, deadline),
-            Some(b"late\n".to_vec())
+        let mut drains = PipeDrains::new(
+            child.stdout.take().unwrap(),
+            child.stderr.take().unwrap(),
         );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(600);
+        assert!(drains.finish(deadline, pgid));
+        assert_eq!(drains.stdout.buf, b"late\n".to_vec());
         let _ = child.kill();
         let _ = child.wait();
     }
 
     #[test]
     fn pipe_drain_before_the_shared_deadline_returns_the_buffered_output() {
-        use std::os::unix::process::CommandExt;
-        let mut child = Command::new("sleep")
-            .arg("30")
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        let pgid = child.id() as libc::pid_t;
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-        tx.send(b"hello\n".to_vec()).unwrap();
+        use std::io::Write;
+        let (mut child, pgid) = spawn_sleep_group();
+        let (out_read, mut out_write) = pipe_pair();
+        out_write.write_all(b"hello\n").unwrap();
+        drop(out_write);
+        let mut drains = PipeDrains::new(out_read, closed_pipe_pair());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        assert_eq!(
-            collect_pipe_output(&rx, pgid, deadline),
-            Some(b"hello\n".to_vec())
+        assert!(drains.finish(deadline, pgid));
+        assert_eq!(drains.stdout.buf, b"hello\n".to_vec());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn pipe_drain_deadline_closes_the_read_end_held_open_by_an_escapee() {
+        let (mut child, pgid) = spawn_sleep_group();
+        let (out_read, _out_write) = pipe_pair();
+        let mut drains = PipeDrains::new(out_read, closed_pipe_pair());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        assert!(!drains.finish(deadline, pgid));
+        let fd = drains.stdout.fd;
+        let target_before = std::fs::read_link(format!("/proc/self/fd/{fd}")).unwrap();
+        assert!(target_before.to_string_lossy().starts_with("pipe:"));
+        drop(drains);
+        let target_after = std::fs::read_link(format!("/proc/self/fd/{fd}"));
+        assert!(
+            target_after.map(|target| target != target_before).unwrap_or(true),
+            "read end fd {fd} still points at the drained pipe after the drains were dropped"
         );
         let _ = child.kill();
         let _ = child.wait();
@@ -2371,6 +2485,110 @@ mod tests {
             &root,
             "strip-filter.sh",
             "#!/bin/sh\nsed 's/^X//'\nsleep 30 >/dev/null &\n",
+        );
+        set_repo_config(
+            &watched_path,
+            "filter.strip.clean",
+            script.to_string_lossy().as_ref(),
+        );
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        set_index_flag(&watched_path, "--skip-worktree", "data.txt");
+
+        let processor = processor_for(&watched_path);
+        let entry_id = processor
+            .repo
+            .index()
+            .unwrap()
+            .get_path(Path::new("data.txt"), 0)
+            .unwrap()
+            .id;
+        let started = std::time::Instant::now();
+        let matched = processor._matches_after_external_clean_filter_with_timeout(
+            &watched_path,
+            Path::new("data.txt"),
+            &watched_path.join("data.txt"),
+            entry_id,
+            std::time::Duration::from_secs(30),
+        );
+        assert!(matched);
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn external_clean_filter_flooding_stderr_still_completes_the_recheck() {
+        let root = temp_dir("skip-worktree-external-filter-stderr-flood");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        std::fs::write(upstream_path.join(".gitattributes"), "*.txt filter=strip\n").unwrap();
+        std::fs::write(upstream_path.join("data.txt"), "hello\n").unwrap();
+        let v1 = commit_all(&upstream, "v1");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        let script = write_filter_script(
+            &root,
+            "strip-filter-flood.sh",
+            "#!/bin/sh\ntr '\\0' 'e' < /dev/zero | head -c 200000 >&2\nsed 's/^X//'\n",
+        );
+        set_repo_config(
+            &watched_path,
+            "filter.strip.clean",
+            script.to_string_lossy().as_ref(),
+        );
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        set_index_flag(&watched_path, "--skip-worktree", "data.txt");
+
+        let processor = processor_for(&watched_path);
+        let entry_id = processor
+            .repo
+            .index()
+            .unwrap()
+            .get_path(Path::new("data.txt"), 0)
+            .unwrap()
+            .id;
+        let started = std::time::Instant::now();
+        let matched = processor._matches_after_external_clean_filter_with_timeout(
+            &watched_path,
+            Path::new("data.txt"),
+            &watched_path.join("data.txt"),
+            entry_id,
+            std::time::Duration::from_secs(15),
+        );
+        assert!(matched);
+        assert!(started.elapsed() < std::time::Duration::from_secs(12));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn external_clean_filter_setsid_descendant_holding_stderr_still_completes_the_recheck() {
+        let root = temp_dir("skip-worktree-external-filter-setsid-holder");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        std::fs::write(upstream_path.join(".gitattributes"), "*.txt filter=strip\n").unwrap();
+        std::fs::write(upstream_path.join("data.txt"), "hello\n").unwrap();
+        let v1 = commit_all(&upstream, "v1");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        let script = write_filter_script(
+            &root,
+            "strip-filter-setsid.sh",
+            "#!/bin/sh\nsed 's/^X//'\nsetsid sleep 30 >/dev/null &\n",
         );
         set_repo_config(
             &watched_path,
