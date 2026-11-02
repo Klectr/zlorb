@@ -102,17 +102,24 @@ copy them. Fixing them is separate work from adding a manager.
    declared. Rename the `template-runtime` literal in the tests to match
    the new runtime name.
 2. Register the strategy string in `zlorb-lib`:
-   - Add the variant name to the `build_strategy_kinds!` list in
-     `zlorb-lib/src/config.rs`. That one list is the definition site:
-     it generates both the `BuildStrategyKind` enum and
-     `BuildStrategyKind::ALL`, so a variant cannot exist without also
-     being enumerated. Extend the `all_kinds_contains_each_variant_once`
-     test in that file to name the new variant and update its expected
-     count to match.
-   - Map the strategy string to it in `resolved_build_strategy()`. Decide
-     any alias up front (the way `"cargo"` aliases `"rust"`) and name the
-     full accepted set, aliases included, in the error messages for that
-     module.
+   - Add the variant and its strategy string to the
+     `build_strategy_kinds!` list in `zlorb-lib/src/config.rs` as one
+     `Variant => "string"` entry. That one list is the definition site:
+     it generates the `BuildStrategyKind` enum,
+     `BuildStrategyKind::ALL`, and `BuildStrategyKind::name()`, so a
+     variant cannot exist without also being enumerated and named.
+     Extend the `all_kinds_contains_each_variant_once` test in that
+     file to name the new variant and update its expected count to
+     match. The string in the list must equal the variant's lowercase
+     serde name: a unit test in that file asserts `name()` and the
+     serde name agree for every kind, and that each `name()` resolves
+     back to its own kind.
+   - Explicit parsing in `resolved_build_strategy()` matches the
+     string against each kind's `name()`; no per-kind mapping is
+     written there. Decide any alias up front (the way `"cargo"`
+     aliases `"rust"`), add the alias as its own match arm there, and
+     name the full accepted set, aliases included, in the error
+     messages for that module.
    - Add unit tests there: the new string selects the new kind, the alias
      (if any) does too, and the string still errors when it appears only
      as a substring of a longer command.

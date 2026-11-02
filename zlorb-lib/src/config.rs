@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::ZlorbError;
 
 macro_rules! build_strategy_kinds {
-    ($($kind:ident),+ $(,)?) => {
+    ($($kind:ident => $name:literal),+ $(,)?) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
         #[serde(rename_all = "lowercase")]
         pub enum BuildStrategyKind {
@@ -12,11 +12,17 @@ macro_rules! build_strategy_kinds {
 
         impl BuildStrategyKind {
             pub const ALL: &'static [Self] = &[$(Self::$kind),+];
+
+            pub fn name(&self) -> &'static str {
+                match self {
+                    $(Self::$kind => $name),+
+                }
+            }
         }
     };
 }
 
-build_strategy_kinds!(Bun, Rust);
+build_strategy_kinds!(Bun => "bun", Rust => "rust");
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RepositoryConfiguration {
@@ -42,13 +48,27 @@ impl RepositoryConfiguration {
     }
 
     pub fn resolved_build_strategy(&self) -> Result<BuildStrategyKind, ZlorbError> {
-        let accepted = "\"bun\", \"rust\", or \"cargo\" (alias for \"rust\")";
+        let names: Vec<String> = BuildStrategyKind::ALL
+            .iter()
+            .map(|kind| format!("\"{}\"", kind.name()))
+            .collect();
+        let accepted_owned = format!(
+            "{}, or \"cargo\" (alias for \"{}\")",
+            names.join(", "),
+            BuildStrategyKind::Rust.name()
+        );
+        let accepted = accepted_owned.as_str();
         if let Some(raw) = &self.build_strategy {
             let value = raw.trim().to_lowercase();
             if !value.is_empty() {
+                if let Some(kind) = BuildStrategyKind::ALL
+                    .iter()
+                    .find(|kind| kind.name() == value.as_str())
+                {
+                    return Ok(*kind);
+                }
                 return match value.as_str() {
-                    "bun" => Ok(BuildStrategyKind::Bun),
-                    "rust" | "cargo" => Ok(BuildStrategyKind::Rust),
+                    "cargo" => Ok(BuildStrategyKind::Rust),
                     _ => Err(ZlorbError::InvalidConfig(format!(
                         "repo '{}' has unknown build_strategy '{}'; expected {}",
                         self.name, raw, accepted
@@ -110,6 +130,29 @@ mod tests {
     }
 
     #[test]
+    fn kind_names_match_their_serde_names() {
+        for kind in BuildStrategyKind::ALL {
+            let serialized = serde_json::to_string(kind).unwrap();
+            assert_eq!(
+                serialized.trim_matches('"'),
+                kind.name(),
+                "serde name and name() must agree for {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn kind_names_resolve_back_to_their_kind() {
+        for kind in BuildStrategyKind::ALL {
+            assert_eq!(
+                config(Some(kind.name()), "").resolved_build_strategy().unwrap(),
+                *kind,
+                "name() for {kind:?} must resolve back to it"
+            );
+        }
+    }
+
+    #[test]
     fn explicit_bun_selects_bun() {
         assert_eq!(
             config(Some("bun"), "").resolved_build_strategy().unwrap(),
@@ -162,11 +205,25 @@ mod tests {
             let ZlorbError::InvalidConfig(message) = err else {
                 panic!("expected InvalidConfig, got {:?}", err);
             };
-            assert!(message.contains("\"bun\""), "missing bun in: {}", message);
-            assert!(message.contains("\"rust\""), "missing rust in: {}", message);
+            for kind in BuildStrategyKind::ALL {
+                assert!(
+                    message.contains(&format!("\"{}\"", kind.name())),
+                    "missing {} in: {}",
+                    kind.name(),
+                    message
+                );
+            }
+            assert!(
+                message.contains("\"bun\", \"rust\", or \"cargo\" (alias for \"rust\")"),
+                "accepted set wording changed in: {}",
+                message
+            );
             assert!(message.contains("\"cargo\""), "missing cargo in: {}", message);
             assert!(
-                message.contains("alias for \"rust\""),
+                message.contains(&format!(
+                    "alias for \"{}\"",
+                    BuildStrategyKind::Rust.name()
+                )),
                 "cargo is not named as the rust alias in: {}",
                 message
             );
