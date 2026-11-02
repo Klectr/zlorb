@@ -153,7 +153,7 @@ fn declared_shipped_modules_from(source: &str) -> Vec<String> {
             }
             rest = inner[end + 1..].trim_start();
         }
-        if rest.is_empty() {
+        if rest.is_empty() || rest.starts_with("//") {
             continue;
         }
         match mod_declaration_name(rest) {
@@ -314,6 +314,8 @@ fn shipped_module_scan_catches_every_declaration_shape() {
         "mod npm;\n",
         "#[cfg(feature = \"npm\")] pub mod npm;\n",
         "#[cfg(feature = \"npm\")]\npub mod npm;\n",
+        "pub mod npm; // npm manager\n",
+        "#[allow(dead_code)] pub mod npm;\n",
     ];
     for source in shapes {
         assert_eq!(
@@ -330,6 +332,9 @@ fn shipped_module_scan_skips_test_only_modules_in_every_shape() {
         "#[cfg(test)]\npub mod template;\n",
         "#[cfg(test)] pub mod template;\n",
         "#[cfg(all(test, feature = \"x\"))] pub mod template;\n",
+        "#[cfg(test)] // tests only\npub mod template;\n",
+        "#[cfg(test)]\n// comment\npub mod template;\n",
+        "#[cfg(test)]\n/// doc\npub mod template;\n",
     ];
     for source in shapes {
         assert_eq!(
