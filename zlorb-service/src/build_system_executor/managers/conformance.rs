@@ -486,7 +486,7 @@ fn scan_manager_types(source: &str) -> ManagerTypeScan {
             continue;
         }
         if rest.is_empty() {
-            if line_cfg_test {
+            if line_cfg_test && test_block_at.is_none() {
                 pending_test = true;
             }
             continue;
@@ -497,6 +497,7 @@ fn scan_manager_types(source: &str) -> ManagerTypeScan {
             depth += opens - closes;
             if depth <= target {
                 test_block_at = None;
+                pending_test = false;
             }
             continue;
         }
@@ -579,21 +580,24 @@ fn declared_shipped_modules_from(source: &str) -> Vec<String> {
     let mut modules = Vec::new();
     let mut cfg_test = false;
     let mut attr_buf: Option<String> = None;
+    let mut attr_skel = SkeletonState::default();
     for line in source.lines() {
         let mut rest_owned: String;
         let mut rest: &str;
         if let Some(mut buf) = attr_buf.take() {
-            let Some(end) = find_attr_close(line) else {
-                buf.push_str(line);
+            let skel_line = code_skeleton(line, &mut attr_skel);
+            let Some(end) = find_attr_close(&skel_line) else {
+                buf.push_str(&skel_line);
                 buf.push(' ');
                 attr_buf = Some(buf);
                 continue;
             };
-            buf.push_str(&line[..end]);
+            buf.push_str(&skel_line[..end]);
             if cfg_attr_is_test_only(&normalize_attr(&buf)) {
                 cfg_test = true;
             }
-            rest_owned = line[end + 1..].trim_start().to_string();
+            attr_skel = SkeletonState::default();
+            rest_owned = skel_line[end + 1..].trim_start().to_string();
             rest = &rest_owned;
         } else {
             rest = line.trim();
@@ -601,7 +605,8 @@ fn declared_shipped_modules_from(source: &str) -> Vec<String> {
         let mut incomplete = false;
         while let Some(inner) = rest.strip_prefix("#[") {
             let Some(end) = find_attr_close(inner) else {
-                attr_buf = Some(inner.to_string());
+                attr_skel = SkeletonState::default();
+                attr_buf = Some(code_skeleton(inner, &mut attr_skel));
                 incomplete = true;
                 break;
             };
@@ -924,6 +929,14 @@ fn manager_type_scan_handles_multiline_cfg_attributes() {
             assert_eq!(scan.structs, vec!["After".to_string()]);
         }
     }
+    let in_block = "#[cfg(test)]\nmod tests {\n #[cfg(\n test\n)]\n pub struct Hidden;\n}\npub struct After;\nimpl Manager for After {}\n";
+    let scan = scan_manager_types(in_block);
+    assert_eq!(scan.structs, vec!["After".to_string()]);
+    assert_eq!(scan.impls, vec!["After".to_string()]);
+    let in_block_single_line = "#[cfg(test)]\nmod tests {\n #[cfg(test)]\n pub struct Hidden;\n}\npub struct After;\nimpl Manager for After {}\n";
+    let scan = scan_manager_types(in_block_single_line);
+    assert_eq!(scan.structs, vec!["After".to_string()]);
+    assert_eq!(scan.impls, vec!["After".to_string()]);
     let counted = [
         "#[cfg(any(\n test,\n feature = \"x\"\n))] pub struct ShippedManager;\n",
         "#[cfg(\n not(test)\n)] pub struct ShippedManager;\n",
@@ -1089,6 +1102,10 @@ fn shipped_module_scan_handles_multiline_cfg_attributes() {
         "#[cfg(\n test\n)] pub mod template;\n",
         "#[cfg(all(\n feature = \"x\",\n test\n))] pub mod template;\n",
         "#[cfg(any(\n test,\n test\n))]\npub mod template;\n",
+        "#[cfg(\n // gate\n test\n)]\npub mod template;\n",
+        "#[cfg(\n test // gate\n)]\npub mod template;\n",
+        "#[cfg(\n /* gate */\n test\n)]\npub mod template;\n",
+        "#[cfg( // gate\n test\n)]\npub mod template;\n",
     ];
     for source in skipped {
         assert_eq!(
