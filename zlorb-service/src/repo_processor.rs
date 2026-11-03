@@ -570,7 +570,11 @@ impl RepoProcessor {
         Logger::info(format!("Should run build: {}", should_run_build));
 
         if should_run_build && !has_updates {
-            let tracked_changes = self._tracked_local_changes()?;
+            let tracked_changes: Vec<PathBuf> = self
+                ._tracked_local_changes()?
+                .into_iter()
+                .filter(|change| !self._path_is_skip_worktree_absent(change))
+                .collect();
             if !tracked_changes.is_empty() {
                 return Err(ZlorbError::Other(format!(
                     "Refusing to build {}: local changes to tracked files ({}) are not part of the commit being built. Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch",
@@ -646,7 +650,11 @@ impl RepoProcessor {
             return Ok(());
         }
         if !build_ran_this_cycle {
-            let tracked_changes = self._tracked_local_changes()?;
+            let tracked_changes: Vec<PathBuf> = self
+                ._tracked_local_changes()?
+                .into_iter()
+                .filter(|change| !self._path_is_skip_worktree_absent(change))
+                .collect();
             if !tracked_changes.is_empty() {
                 return Err(ZlorbError::Other(format!(
                     "Refusing to run the restart command for {}: local changes to tracked files ({}) are not part of the commit being restarted on. Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch",
@@ -7655,6 +7663,155 @@ mod tests {
     }
 
     #[test]
+    fn failed_build_retry_is_not_blocked_by_a_skip_worktree_absent_file() {
+        let root = temp_dir("failed-build-retry-skip-worktree-absent");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        std::fs::write(upstream_path.join("keep.txt"), "keep\n").unwrap();
+        let v1 = commit_all(&upstream, "v1");
+        write_sentinel_fixture_crate(&upstream_path, "fixture-version-two");
+        let v2 = commit_all(&upstream, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v1).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        set_index_flag(&watched_path, "--skip-worktree", "keep.txt");
+        std::fs::remove_file(watched_path.join("keep.txt")).unwrap();
+
+        let failed_builds = new_failed_builds();
+        std::fs::write(watched_path.join("fail-build"), "").unwrap();
+
+        let err = processor_with_tracker(&watched_path, failed_builds.clone())
+            .update_from_remote()
+            .unwrap_err();
+        assert!(format!("{:?}", err).contains("Failed to build"));
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert!(!fixture_artifact(&watched_path).exists());
+
+        let processor = processor_with_tracker(&watched_path, failed_builds.clone());
+        assert_eq!(
+            processor._tracked_local_changes().unwrap(),
+            vec![PathBuf::from("keep.txt")]
+        );
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(format!("{:?}", err).contains("Failed to build"));
+        assert!(!fixture_artifact(&watched_path).exists());
+
+        std::fs::remove_file(watched_path.join("fail-build")).unwrap();
+        processor_with_tracker(&watched_path, failed_builds.clone())
+            .update_from_remote()
+            .unwrap();
+        let artifact = fixture_artifact(&watched_path);
+        assert!(artifact.exists());
+        let output = std::process::Command::new(&artifact).output().unwrap();
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("fixture-version-two")
+        );
+        assert!(!watched_path.join("keep.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_build_retry_is_refused_by_a_plain_deletion() {
+        let root = temp_dir("failed-build-retry-plain-deletion");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        std::fs::write(upstream_path.join("keep.txt"), "keep\n").unwrap();
+        let v1 = commit_all(&upstream, "v1");
+        write_sentinel_fixture_crate(&upstream_path, "fixture-version-two");
+        let v2 = commit_all(&upstream, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v1).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+
+        let failed_builds = new_failed_builds();
+        std::fs::write(watched_path.join("fail-build"), "").unwrap();
+
+        let err = processor_with_tracker(&watched_path, failed_builds.clone())
+            .update_from_remote()
+            .unwrap_err();
+        assert!(format!("{:?}", err).contains("Failed to build"));
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert!(!fixture_artifact(&watched_path).exists());
+
+        std::fs::remove_file(watched_path.join("keep.txt")).unwrap();
+        let err = processor_with_tracker(&watched_path, failed_builds.clone())
+            .update_from_remote()
+            .unwrap_err();
+        assert!(format!("{:?}", err).contains("local changes to tracked files"));
+        assert!(format!("{:?}", err).contains("keep.txt"));
+        assert!(!fixture_artifact(&watched_path).exists());
+
+        std::fs::write(watched_path.join("keep.txt"), "keep\n").unwrap();
+        std::fs::remove_file(watched_path.join("fail-build")).unwrap();
+        processor_with_tracker(&watched_path, failed_builds.clone())
+            .update_from_remote()
+            .unwrap();
+        assert!(fixture_artifact(&watched_path).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn out_dir_missing_build_is_not_blocked_by_a_skip_worktree_absent_file() {
+        let root = temp_dir("out-dir-build-skip-worktree-absent");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        std::fs::write(upstream_path.join("keep.txt"), "keep\n").unwrap();
+        commit_all(&upstream, "v1");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        set_index_flag(&watched_path, "--skip-worktree", "keep.txt");
+        std::fs::remove_file(watched_path.join("keep.txt")).unwrap();
+
+        let mut processor = processor_for(&watched_path);
+        assert_eq!(
+            processor._tracked_local_changes().unwrap(),
+            vec![PathBuf::from("keep.txt")]
+        );
+        processor.config.out_dir = Some("dist-out".to_string());
+        processor.update_from_remote().unwrap();
+        assert!(fixture_artifact(&watched_path).exists());
+        assert!(!watched_path.join("keep.txt").exists());
+
+        let mut processor = processor_for(&watched_path);
+        processor.config.out_dir = Some("dist-out".to_string());
+        processor.update_from_remote().unwrap();
+        assert!(!watched_path.join("keep.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn seeded_failure_for_a_bun_repo_is_retried_and_kept_when_bun_is_missing() {
         let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
         let bun_path = if user == "root" {
@@ -8153,6 +8310,157 @@ mod tests {
                 .lock()
                 .unwrap()
                 .contains_key(&tracker_key(&watched_path.to_string_lossy()))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_restart_retry_is_not_blocked_by_a_skip_worktree_absent_file() {
+        let root = temp_dir("restart-retry-skip-worktree-absent");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        std::fs::write(upstream_path.join("keep.txt"), "keep\n").unwrap();
+        commit_all(&upstream, "v1");
+        write_fixture_crate(&upstream_path, "fixture-version-two");
+        std::fs::write(upstream_path.join("keep.txt"), "keep\n").unwrap();
+        let v2 = commit_all(&upstream, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched
+            .find_commit(watched.revparse_single("HEAD~1").unwrap().id())
+            .unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        set_index_flag(&watched_path, "--skip-worktree", "keep.txt");
+        std::fs::remove_file(watched_path.join("keep.txt")).unwrap();
+
+        let failed_restarts = new_failed_restarts();
+        let err = processor_with_restart(
+            &watched_path,
+            Some("false".to_string()),
+            failed_restarts.clone(),
+        )
+        .update_from_remote()
+        .unwrap_err();
+        assert!(format!("{:?}", err).contains("Restart command"));
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert_eq!(
+            failed_restarts
+                .lock()
+                .unwrap()
+                .get(&tracker_key(&watched_path.to_string_lossy())),
+            Some(&v2)
+        );
+
+        let processor = processor_with_restart(
+            &watched_path,
+            Some("false".to_string()),
+            failed_restarts.clone(),
+        );
+        assert_eq!(
+            processor._tracked_local_changes().unwrap(),
+            vec![PathBuf::from("keep.txt")]
+        );
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(format!("{:?}", err).contains("Restart command"));
+
+        processor_with_restart(
+            &watched_path,
+            Some(serve_command(&watched_path)),
+            failed_restarts.clone(),
+        )
+        .update_from_remote()
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("served.txt")).unwrap(),
+            "fixture-version-two\n"
+        );
+        assert!(
+            !failed_restarts
+                .lock()
+                .unwrap()
+                .contains_key(&tracker_key(&watched_path.to_string_lossy()))
+        );
+        assert!(!watched_path.join("keep.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_restart_retry_is_refused_by_a_plain_deletion() {
+        let root = temp_dir("restart-retry-plain-deletion");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        std::fs::write(upstream_path.join("keep.txt"), "keep\n").unwrap();
+        commit_all(&upstream, "v1");
+        write_fixture_crate(&upstream_path, "fixture-version-two");
+        std::fs::write(upstream_path.join("keep.txt"), "keep\n").unwrap();
+        let v2 = commit_all(&upstream, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched
+            .find_commit(watched.revparse_single("HEAD~1").unwrap().id())
+            .unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+
+        let failed_restarts = new_failed_restarts();
+        let err = processor_with_restart(
+            &watched_path,
+            Some("false".to_string()),
+            failed_restarts.clone(),
+        )
+        .update_from_remote()
+        .unwrap_err();
+        assert!(format!("{:?}", err).contains("Restart command"));
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+
+        std::fs::remove_file(watched_path.join("keep.txt")).unwrap();
+        let err = processor_with_restart(
+            &watched_path,
+            Some(serve_command(&watched_path)),
+            failed_restarts.clone(),
+        )
+        .update_from_remote()
+        .unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("Refusing to run the restart command")
+        );
+        assert!(format!("{:?}", err).contains("keep.txt"));
+        assert!(!watched_path.join("served.txt").exists());
+
+        std::fs::write(watched_path.join("keep.txt"), "keep\n").unwrap();
+        processor_with_restart(
+            &watched_path,
+            Some(serve_command(&watched_path)),
+            failed_restarts.clone(),
+        )
+        .update_from_remote()
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("served.txt")).unwrap(),
+            "fixture-version-two\n"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
