@@ -1563,11 +1563,88 @@ impl RepoProcessor {
         for name in &disk_names {
             if !tree_names.contains(name)
                 && !Self::_rollback_dir_holds_no_files(&full_path.join(name))
+                && !self._checkout_extra_entry_holds_only_ignored(&path.join(name))
             {
                 return false;
             }
         }
         true
+    }
+
+    fn _checkout_extra_entry_holds_only_ignored(&self, rel_path: &Path) -> bool {
+        let Ok(mut index) = self.repo.index() else {
+            return false;
+        };
+        if index.read(true).is_err() {
+            return false;
+        }
+        if index
+            .iter()
+            .any(|entry| path_from_bytes(&entry.path).starts_with(rel_path))
+        {
+            return false;
+        }
+        self._checkout_extra_entry_holds_only_ignored_indexed(rel_path, &index)
+    }
+
+    fn _checkout_extra_entry_holds_only_ignored_indexed(
+        &self,
+        rel_path: &Path,
+        index: &git2::Index,
+    ) -> bool {
+        if rel_path.file_name() == Some(std::ffi::OsStr::new(".git")) {
+            return false;
+        }
+        if (0..=3).any(|stage| {
+            matches!(index.get_path(rel_path, stage), Some(entry) if entry.mode == 0o160000)
+        }) {
+            return false;
+        }
+        let Some(workdir) = self.repo.workdir().map(|workdir| workdir.to_path_buf()) else {
+            return false;
+        };
+        let full_path = workdir.join(rel_path);
+        let Ok(metadata) = std::fs::symlink_metadata(&full_path) else {
+            return false;
+        };
+        let file_type = metadata.file_type();
+        if file_type.is_dir() {
+            if git2::Repository::open_ext(
+                &full_path,
+                git2::RepositoryOpenFlags::NO_SEARCH,
+                Vec::<&Path>::new(),
+            )
+            .is_ok()
+            {
+                return false;
+            }
+            if full_path.join("HEAD").is_file()
+                && full_path.join("objects").is_dir()
+                && full_path.join("refs").is_dir()
+            {
+                return false;
+            }
+            let Ok(entries) = std::fs::read_dir(&full_path) else {
+                return false;
+            };
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    return false;
+                };
+                if !self._checkout_extra_entry_holds_only_ignored_indexed(
+                    &rel_path.join(entry.file_name()),
+                    index,
+                ) {
+                    return false;
+                }
+            }
+            true
+        } else if file_type.is_file() {
+            let in_index = (0..=3).any(|stage| index.get_path(rel_path, stage).is_some());
+            !in_index && self.repo.is_path_ignored(rel_path).unwrap_or(false)
+        } else {
+            false
+        }
     }
 
     fn _rollback_restore_paths(
@@ -4025,6 +4102,440 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(watched_path.join("thing/inner.txt")).unwrap(),
             "inner\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn dir_to_file_repo_with_gitignore(
+        label: &str,
+        gitignore: &str,
+    ) -> (PathBuf, PathBuf, Oid, Oid) {
+        let root = temp_dir(label);
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        std::fs::write(watched_path.join(".gitignore"), gitignore).unwrap();
+        std::fs::create_dir_all(watched_path.join("thing")).unwrap();
+        std::fs::write(watched_path.join("thing/inner.txt"), "inner\n").unwrap();
+        let v1 = commit_all(&watched, "v1");
+        std::fs::remove_dir_all(watched_path.join("thing")).unwrap();
+        std::fs::write(watched_path.join("thing"), "now a file\n").unwrap();
+        let v2 = commit_all(&watched, "v2");
+        let v1_commit = watched.find_commit(v1).unwrap();
+        watched
+            .reset(v1_commit.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(v1_commit);
+        drop(watched);
+        (root, watched_path, v1, v2)
+    }
+
+    #[test]
+    fn checkout_step_accepts_dir_to_file_when_the_directory_holds_an_ignored_file() {
+        let (root, watched_path, v1, v2) =
+            dir_to_file_repo_with_gitignore("checkout-dir-ignored-file", "*.log\n");
+        std::fs::write(watched_path.join("thing/debug.log"), "ignored\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        let remote_ref = processor
+            ._checkout_and_get_ref(Some(v1), v2, Some(&changed))
+            .unwrap();
+        assert_eq!(remote_ref.target(), Some(v2));
+        drop(remote_ref);
+        drop(processor);
+        assert!(watched_path.join("thing").is_file());
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("thing")).unwrap(),
+            "now a file\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_accepts_dir_to_file_when_an_extra_directory_holds_only_ignored_files() {
+        let (root, watched_path, v1, v2) =
+            dir_to_file_repo_with_gitignore("checkout-dir-extra-ignored-only", "*.log\n");
+        std::fs::create_dir_all(watched_path.join("thing/cache/nested")).unwrap();
+        std::fs::write(watched_path.join("thing/cache/debug.log"), "ignored\n").unwrap();
+        std::fs::write(
+            watched_path.join("thing/cache/nested/trace.log"),
+            "ignored\n",
+        )
+        .unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(processor._checkout_dir_is_safe(v1, v2, Path::new("thing")));
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        let remote_ref = processor
+            ._checkout_and_get_ref(Some(v1), v2, Some(&changed))
+            .unwrap();
+        assert_eq!(remote_ref.target(), Some(v2));
+        drop(remote_ref);
+        drop(processor);
+        assert!(watched_path.join("thing").is_file());
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("thing")).unwrap(),
+            "now a file\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_accepts_dir_to_file_when_an_extra_directory_is_itself_ignored() {
+        let (root, watched_path, v1, v2) =
+            dir_to_file_repo_with_gitignore("checkout-dir-extra-ignored-dir", "cache/\n");
+        std::fs::create_dir_all(watched_path.join("thing/cache")).unwrap();
+        std::fs::write(watched_path.join("thing/cache/data.bin"), "ignored\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        let remote_ref = processor
+            ._checkout_and_get_ref(Some(v1), v2, Some(&changed))
+            .unwrap();
+        assert_eq!(remote_ref.target(), Some(v2));
+        drop(remote_ref);
+        drop(processor);
+        assert!(watched_path.join("thing").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_refuses_dir_to_file_when_an_extra_directory_mixes_ignored_and_plain_files() {
+        let (root, watched_path, v1, v2) =
+            dir_to_file_repo_with_gitignore("checkout-dir-extra-mixed", "*.log\n");
+        std::fs::create_dir_all(watched_path.join("thing/cache")).unwrap();
+        std::fs::write(watched_path.join("thing/cache/debug.log"), "ignored\n").unwrap();
+        std::fs::write(watched_path.join("thing/cache/keep.txt"), "plain\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._checkout_dir_is_safe(v1, v2, Path::new("thing")));
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        match processor._checkout_and_get_ref(Some(v1), v2, Some(&changed)) {
+            Ok(_) => panic!(
+                "checkout must refuse when an extra directory mixes ignored and plain files"
+            ),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("thing"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("thing/cache/keep.txt")).unwrap(),
+            "plain\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("thing/cache/debug.log")).unwrap(),
+            "ignored\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("thing/inner.txt")).unwrap(),
+            "inner\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_refuses_dir_to_file_when_an_extra_directory_holds_a_staged_ignored_file() {
+        let (root, watched_path, v1, v2) =
+            dir_to_file_repo_with_gitignore("checkout-dir-extra-staged-ignored", "*.log\n");
+        std::fs::create_dir_all(watched_path.join("thing/cache")).unwrap();
+        std::fs::write(watched_path.join("thing/cache/debug.log"), "staged\n").unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let mut index = watched.index().unwrap();
+        index
+            .add_path(Path::new("thing/cache/debug.log"))
+            .unwrap();
+        index.write().unwrap();
+        drop(index);
+        drop(watched);
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._checkout_dir_is_safe(v1, v2, Path::new("thing")));
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        match processor._checkout_and_get_ref(Some(v1), v2, Some(&changed)) {
+            Ok(_) => panic!(
+                "checkout must refuse when an extra directory holds a staged ignored file"
+            ),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("thing"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("thing/cache/debug.log")).unwrap(),
+            "staged\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn add_index_entry_at_stage(
+        repo: &git2::Repository,
+        path: &Path,
+        id: Oid,
+        mode: u32,
+        stage: i32,
+    ) {
+        let mut index = repo.index().unwrap();
+        let path_bytes = {
+            use std::os::unix::ffi::OsStrExt;
+            path.as_os_str().as_bytes().to_vec()
+        };
+        let flags =
+            ((stage as u16) << 12) | (path_bytes.len().min(0xfff) as u16);
+        index
+            .add(&git2::IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode,
+                uid: 0,
+                gid: 0,
+                file_size: 0,
+                id,
+                flags,
+                flags_extended: 0,
+                path: path_bytes,
+            })
+            .unwrap();
+        index.write().unwrap();
+    }
+
+    #[test]
+    fn checkout_step_refuses_dir_to_file_when_an_extra_ignored_directory_holds_a_nested_repo() {
+        let (root, watched_path, v1, v2) =
+            dir_to_file_repo_with_gitignore("checkout-dir-extra-nested-repo", "cache/\n");
+        let cache_path = watched_path.join("thing/cache");
+        std::fs::create_dir_all(&cache_path).unwrap();
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let nested = git2::Repository::init_opts(&cache_path, &init_opts).unwrap();
+        std::fs::write(cache_path.join("tracked.txt"), "nested\n").unwrap();
+        commit_all(&nested, "nested v1");
+        drop(nested);
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._checkout_dir_is_safe(v1, v2, Path::new("thing")));
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        match processor._checkout_and_get_ref(Some(v1), v2, Some(&changed)) {
+            Ok(_) => panic!(
+                "checkout must refuse when an extra ignored directory holds a nested repo"
+            ),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("thing"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("thing/cache/tracked.txt")).unwrap(),
+            "nested\n"
+        );
+        assert!(watched_path.join("thing/cache/.git/HEAD").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_refuses_dir_to_file_when_an_extra_directory_is_a_gitlink_in_the_index() {
+        let (root, watched_path, v1, v2) =
+            dir_to_file_repo_with_gitignore("checkout-dir-extra-gitlink-index", "cache/\n");
+        std::fs::create_dir_all(watched_path.join("thing/cache")).unwrap();
+        std::fs::write(watched_path.join("thing/cache/data.bin"), "ignored\n").unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        add_index_entry_at_stage(&watched, Path::new("thing/cache"), v1, 0o160000, 0);
+        drop(watched);
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._checkout_dir_is_safe(v1, v2, Path::new("thing")));
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("thing/cache/data.bin")).unwrap(),
+            "ignored\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_refuses_dir_to_file_when_a_ignored_file_is_staged_after_the_index_was_read() {
+        let (root, watched_path, v1, v2) =
+            dir_to_file_repo_with_gitignore("checkout-dir-extra-staged-late", "*.log\n");
+        std::fs::create_dir_all(watched_path.join("thing/cache")).unwrap();
+        std::fs::write(watched_path.join("thing/cache/debug.log"), "staged\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        let _ = processor.repo.index().unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let mut index = watched.index().unwrap();
+        index
+            .add_path(Path::new("thing/cache/debug.log"))
+            .unwrap();
+        index.write().unwrap();
+        drop(index);
+        drop(watched);
+
+        assert!(!processor._checkout_dir_is_safe(v1, v2, Path::new("thing")));
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        match processor._checkout_and_get_ref(Some(v1), v2, Some(&changed)) {
+            Ok(_) => panic!(
+                "checkout must refuse when an ignored file was staged after the index was first read"
+            ),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("thing"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("thing/cache/debug.log")).unwrap(),
+            "staged\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_refuses_dir_to_file_when_an_extra_directory_holds_a_conflicted_ignored_file() {
+        let (root, watched_path, v1, v2) =
+            dir_to_file_repo_with_gitignore("checkout-dir-extra-conflicted", "*.log\n");
+        std::fs::create_dir_all(watched_path.join("thing/cache")).unwrap();
+        std::fs::write(watched_path.join("thing/cache/debug.log"), "conflicted\n").unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let blob = watched.blob(b"conflicted\n").unwrap();
+        add_index_entry_at_stage(
+            &watched,
+            Path::new("thing/cache/debug.log"),
+            blob,
+            0o100644,
+            2,
+        );
+        drop(watched);
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._checkout_dir_is_safe(v1, v2, Path::new("thing")));
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("thing/cache/debug.log")).unwrap(),
+            "conflicted\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_refuses_dir_to_file_when_an_extra_ignored_directory_is_a_bare_repo() {
+        let (root, watched_path, v1, v2) =
+            dir_to_file_repo_with_gitignore("checkout-dir-extra-bare-repo", "cache/\n");
+        let cache_path = watched_path.join("thing/cache");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        init_opts.bare(true);
+        let bare = git2::Repository::init_opts(&cache_path, &init_opts).unwrap();
+        drop(bare);
+        assert!(cache_path.join("HEAD").exists());
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._checkout_dir_is_safe(v1, v2, Path::new("thing")));
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        match processor._checkout_and_get_ref(Some(v1), v2, Some(&changed)) {
+            Ok(_) => panic!(
+                "checkout must refuse when an extra ignored directory is a bare repo"
+            ),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("thing"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        drop(processor);
+        assert!(watched_path.join("thing/cache/HEAD").exists());
+        assert!(watched_path.join("thing/cache/objects").is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_refuses_dir_to_file_when_a_staged_file_under_an_extra_directory_is_deleted_from_disk() {
+        let (root, watched_path, v1, v2) =
+            dir_to_file_repo_with_gitignore("checkout-dir-extra-staged-deleted", "*.log\n");
+        std::fs::create_dir_all(watched_path.join("thing/cache")).unwrap();
+        std::fs::write(watched_path.join("thing/cache/debug.log"), "ignored\n").unwrap();
+        std::fs::write(watched_path.join("thing/cache/staged.log"), "staged\n").unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let mut index = watched.index().unwrap();
+        index
+            .add_path(Path::new("thing/cache/staged.log"))
+            .unwrap();
+        index.write().unwrap();
+        drop(index);
+        drop(watched);
+        std::fs::remove_file(watched_path.join("thing/cache/staged.log")).unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._checkout_dir_is_safe(v1, v2, Path::new("thing")));
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("thing/cache/debug.log")).unwrap(),
+            "ignored\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_refuses_dir_to_file_when_a_gitlink_under_an_extra_directory_is_missing_on_disk() {
+        let (root, watched_path, v1, v2) =
+            dir_to_file_repo_with_gitignore("checkout-dir-extra-gitlink-missing", "*.log\n");
+        std::fs::create_dir_all(watched_path.join("thing/cache")).unwrap();
+        std::fs::write(watched_path.join("thing/cache/debug.log"), "ignored\n").unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        add_index_entry_at_stage(
+            &watched,
+            Path::new("thing/cache/sub"),
+            v1,
+            0o160000,
+            0,
+        );
+        drop(watched);
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._checkout_dir_is_safe(v1, v2, Path::new("thing")));
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("thing/cache/debug.log")).unwrap(),
+            "ignored\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_refuses_dir_to_file_when_the_index_holds_a_file_at_the_extra_directory_path() {
+        let (root, watched_path, v1, v2) =
+            dir_to_file_repo_with_gitignore("checkout-dir-extra-index-file", "cache/\n");
+        std::fs::create_dir_all(watched_path.join("thing/cache")).unwrap();
+        std::fs::write(watched_path.join("thing/cache/data.bin"), "ignored\n").unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let blob = watched.blob(b"tracked\n").unwrap();
+        add_index_entry_at_stage(&watched, Path::new("thing/cache"), blob, 0o100644, 0);
+        drop(watched);
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._checkout_dir_is_safe(v1, v2, Path::new("thing")));
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("thing/cache/data.bin")).unwrap(),
+            "ignored\n"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
