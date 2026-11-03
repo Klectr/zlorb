@@ -9435,6 +9435,95 @@ mod tests {
     }
 
     #[test]
+    fn failed_restart_retry_refusal_names_an_unverifiable_file_without_calling_it_a_local_change()
+    {
+        let (root, watched_path, _v1, v2) =
+            external_filter_repo("external-filter-restart-refusal", "version two\n");
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v2).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        std::fs::write(watched_path.join("data.txt"), "Xversion two\n").unwrap();
+
+        let failed_restarts = new_failed_restarts();
+        failed_restarts
+            .lock()
+            .unwrap()
+            .insert(tracker_key(&watched_path.to_string_lossy()), v2);
+
+        let processor = processor_with_restart(
+            &watched_path,
+            Some("echo ran > restart-ran.txt".to_string()),
+            failed_restarts.clone(),
+        );
+        let tracked = processor._tracked_local_changes().unwrap();
+        assert!(tracked.changes.is_empty());
+        assert_eq!(tracked.unverifiable, vec![PathBuf::from("data.txt")]);
+        let err = processor.update_from_remote().unwrap_err();
+        let message = format!("{:?}", err);
+        assert!(
+            message.contains("Refusing to run the restart command"),
+            "{}",
+            message
+        );
+        assert!(
+            message.contains("could not be checked against their clean conversion"),
+            "{}",
+            message
+        );
+        assert!(message.contains("data.txt"), "{}", message);
+        assert!(
+            message.contains("are not part of the commit being restarted on"),
+            "{}",
+            message
+        );
+        assert!(
+            message.contains("make it runnable by the daemon so these files can be verified"),
+            "{}",
+            message
+        );
+        assert!(
+            !message.contains("local changes to tracked files"),
+            "{}",
+            message
+        );
+        assert!(!message.contains("Stash the work"), "{}", message);
+        assert!(!watched_path.join("restart-ran.txt").exists());
+        assert_eq!(
+            failed_restarts
+                .lock()
+                .unwrap()
+                .get(&tracker_key(&watched_path.to_string_lossy())),
+            Some(&v2)
+        );
+        drop(processor);
+
+        set_repo_config(&watched_path, "filter.strip.clean", "sed 's/^X//'");
+        processor_with_restart(
+            &watched_path,
+            Some("echo ran > restart-ran.txt".to_string()),
+            failed_restarts.clone(),
+        )
+        .update_from_remote()
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("restart-ran.txt")).unwrap(),
+            "ran\n"
+        );
+        assert!(
+            !failed_restarts
+                .lock()
+                .unwrap()
+                .contains_key(&tracker_key(&watched_path.to_string_lossy()))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn restart_does_not_run_for_an_out_dir_triggered_build() {
         let root = temp_dir("restart-skipped-for-out-dir-build");
         let upstream_path = root.join("upstream");
