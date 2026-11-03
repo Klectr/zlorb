@@ -1602,10 +1602,6 @@ impl RepoProcessor {
             let fetch_id = fetch_entry.as_ref().map(|entry| entry.id());
             let local_mode = local_entry.as_ref().map(|entry| entry.filemode());
             let fetch_mode = fetch_entry.as_ref().map(|entry| entry.filemode());
-            if local_id == fetch_id && local_mode == fetch_mode {
-                safe.push(path.clone());
-                continue;
-            }
             if std::fs::symlink_metadata(workdir.join(path)).is_err() {
                 if local_id.is_some() && fetch_id.is_some() {
                     preserved.push(path.clone());
@@ -4755,6 +4751,93 @@ mod tests {
         let (safe, preserved) = processor._rollback_restore_paths(v1, broken, &changed);
         assert!(safe.is_empty());
         assert_eq!(preserved, changed);
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_restore_paths_checks_disk_for_a_path_identical_in_both_trees() {
+        let root = temp_dir("rollback-restore-paths-identical-entry");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        std::fs::write(watched_path.join("stable.txt"), "stable\n").unwrap();
+        let v1 = commit_all(&watched, "v1");
+        write_fixture_crate(&watched_path, "fixture-version-two");
+        let v2 = commit_all(&watched, "v2");
+        drop(watched);
+
+        let paths = vec![PathBuf::from("stable.txt")];
+        let processor = processor_for(&watched_path);
+        let (safe, preserved) = processor._rollback_restore_paths(v1, v2, &paths);
+        assert_eq!(safe, paths);
+        assert!(preserved.is_empty());
+        std::fs::write(watched_path.join("stable.txt"), "edited\n").unwrap();
+        let (safe, preserved) = processor._rollback_restore_paths(v1, v2, &paths);
+        assert!(safe.is_empty());
+        assert_eq!(preserved, paths);
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_restore_paths_checks_disk_for_a_directory_identical_in_both_trees() {
+        let root = temp_dir("rollback-restore-paths-identical-dir");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        std::fs::create_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::write(watched_path.join("sub/a.txt"), "a\n").unwrap();
+        std::fs::write(watched_path.join("sub/b.txt"), "b\n").unwrap();
+        let v1 = commit_all(&watched, "v1");
+        write_fixture_crate(&watched_path, "fixture-version-two");
+        let v2 = commit_all(&watched, "v2");
+        drop(watched);
+
+        let paths = vec![PathBuf::from("sub")];
+        let processor = processor_for(&watched_path);
+        let (safe, preserved) = processor._rollback_restore_paths(v1, v2, &paths);
+        assert_eq!(safe, paths);
+        assert!(preserved.is_empty());
+        std::fs::write(watched_path.join("sub/extra.txt"), "extra\n").unwrap();
+        let (safe, preserved) = processor._rollback_restore_paths(v1, v2, &paths);
+        assert!(safe.is_empty());
+        assert_eq!(preserved, paths);
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_restore_paths_checks_disk_for_a_gitlink_identical_in_both_trees() {
+        let root = temp_dir("rollback-restore-paths-identical-gitlink");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        let sub_path = watched_path.join("sub");
+        let sub = git2::Repository::init_opts(&sub_path, &init_opts).unwrap();
+        std::fs::write(sub_path.join("sub.txt"), "sub one\n").unwrap();
+        let sub_a = commit_all(&sub, "sub a");
+        drop(sub);
+        let v1 = commit_with_gitlink(&watched, sub_a, "v1");
+        write_fixture_crate(&watched_path, "fixture-version-two");
+        let v2 = commit_with_gitlink(&watched, sub_a, "v2");
+        drop(watched);
+
+        let paths = vec![PathBuf::from("sub")];
+        let processor = processor_for(&watched_path);
+        let (safe, preserved) = processor._rollback_restore_paths(v1, v2, &paths);
+        assert_eq!(safe, paths);
+        assert!(preserved.is_empty());
+        std::fs::write(watched_path.join("sub/notes.txt"), "user notes\n").unwrap();
+        let (safe, preserved) = processor._rollback_restore_paths(v1, v2, &paths);
+        assert!(safe.is_empty());
+        assert_eq!(preserved, paths);
         drop(processor);
         let _ = std::fs::remove_dir_all(&root);
     }
