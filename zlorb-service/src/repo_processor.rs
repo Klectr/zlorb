@@ -1566,8 +1566,12 @@ impl RepoProcessor {
             let Some(expected) = entry_id else {
                 continue;
             };
+            let both_gitlinks =
+                local_mode == Some(0o160000) && fetch_mode == Some(0o160000);
             let matches = match entry_mode {
-                Some(0o160000) => self._rollback_gitlink_matches(&full_path, expected),
+                Some(0o160000) => {
+                    self._rollback_gitlink_matches(&full_path, expected, !both_gitlinks)
+                }
                 Some(0o40000) => match self.repo.find_tree(expected) {
                     Ok(tree) => self._rollback_dir_matches_tree(workdir, path, &tree),
                     Err(_) => false,
@@ -1581,17 +1585,27 @@ impl RepoProcessor {
         false
     }
 
-    fn _rollback_gitlink_matches(&self, full_path: &Path, expected: Oid) -> bool {
+    fn _rollback_gitlink_matches(
+        &self,
+        full_path: &Path,
+        expected: Oid,
+        include_ignored: bool,
+    ) -> bool {
         match git2::Repository::open(full_path) {
             Ok(sub_repo) => {
                 let Some(head) = sub_repo.head().ok().and_then(|head| head.target()) else {
-                    return self._rollback_gitlink_is_submodule_placeholder(&sub_repo, full_path);
+                    return self._rollback_gitlink_is_submodule_placeholder(
+                        &sub_repo,
+                        full_path,
+                        include_ignored,
+                    );
                 };
                 if head != expected {
                     return false;
                 }
                 let mut status_options = git2::StatusOptions::new();
                 status_options.include_untracked(true);
+                status_options.include_ignored(include_ignored);
                 matches!(
                     sub_repo.statuses(Some(&mut status_options)),
                     Ok(statuses) if statuses.is_empty()
@@ -1608,6 +1622,7 @@ impl RepoProcessor {
         &self,
         sub_repo: &git2::Repository,
         full_path: &Path,
+        include_ignored: bool,
     ) -> bool {
         if sub_repo.is_bare() {
             return false;
@@ -1648,6 +1663,7 @@ impl RepoProcessor {
         }
         let mut status_options = git2::StatusOptions::new();
         status_options.include_untracked(true);
+        status_options.include_ignored(include_ignored);
         matches!(
             sub_repo.statuses(Some(&mut status_options)),
             Ok(statuses) if statuses.is_empty()
@@ -1702,7 +1718,8 @@ impl RepoProcessor {
                         }
                 }
                 Some(git2::ObjectType::Commit) => {
-                    child_is_real_dir && self._rollback_gitlink_matches(&child_full, entry.id())
+                    child_is_real_dir
+                        && self._rollback_gitlink_matches(&child_full, entry.id(), true)
                 }
                 _ => self._rollback_disk_matches(
                     workdir,
@@ -3501,6 +3518,7 @@ mod tests {
         write_fixture_crate(&watched_path, "fixture-version-one");
         let sub_path = watched_path.join("sub");
         let sub = git2::Repository::init_opts(&sub_path, &init_opts).unwrap();
+        std::fs::write(sub_path.join(".gitignore"), "data.db\n").unwrap();
         std::fs::write(sub_path.join("sub.txt"), "sub one\n").unwrap();
         let sub_a = commit_all(&sub, "sub a");
         std::fs::write(sub_path.join("sub.txt"), "sub two\n").unwrap();
@@ -3594,6 +3612,23 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(watched_path.join("sub/notes.txt")).unwrap(),
             "user notes\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_restores_gitlink_holding_only_an_ignored_file() {
+        let (root, watched_path, v1, v2, _sub_a, _sub_b) =
+            gitlink_fixture("rollback-gitlink-ignored");
+        std::fs::write(watched_path.join("sub/data.db"), "build output\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/data.db")).unwrap(),
+            "build output\n"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4126,6 +4161,7 @@ mod tests {
         let v1 = commit_all(&watched, "v1");
         let sub_src_path = root.join("sub-src");
         let sub_src = git2::Repository::init_opts(&sub_src_path, &init_opts).unwrap();
+        std::fs::write(sub_src_path.join(".gitignore"), "data.db\n").unwrap();
         std::fs::write(sub_src_path.join("s.txt"), "sub one\n").unwrap();
         commit_all(&sub_src, "sub a");
         std::fs::write(sub_src_path.join("s.txt"), "sub two\n").unwrap();
@@ -4191,6 +4227,69 @@ mod tests {
         drop(processor);
         assert_eq!(
             std::fs::read_to_string(watched_path.join("thing/sub/precious.txt")).unwrap(),
+            "precious\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_typechange_directory_holding_a_nested_gitlink_with_an_ignored_file() {
+        let (root, watched_path, v1, v2) =
+            nested_gitlink_fixture("rollback-nested-gitlink-ignored");
+        std::fs::write(watched_path.join("thing/sub/data.db"), "precious\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("thing/sub/data.db")).unwrap(),
+            "precious\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("thing/sub/s.txt")).unwrap(),
+            "sub two\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_gitlink_replaced_by_a_file_holding_an_ignored_file() {
+        let root = temp_dir("rollback-gitlink-to-file-ignored");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        let sub_path = watched_path.join("sub");
+        let sub = git2::Repository::init_opts(&sub_path, &init_opts).unwrap();
+        std::fs::write(sub_path.join(".gitignore"), "data.db\n").unwrap();
+        std::fs::write(sub_path.join("sub.txt"), "sub one\n").unwrap();
+        let sub_a = commit_all(&sub, "sub a");
+        drop(sub);
+        let v1 = commit_with_gitlink(&watched, sub_a, "v1");
+        let v2 = {
+            let blob = watched.blob(b"file version\n").unwrap();
+            let v1_commit = watched.find_commit(v1).unwrap();
+            let v1_tree = v1_commit.tree().unwrap();
+            let mut builder = watched.treebuilder(Some(&v1_tree)).unwrap();
+            builder.insert("sub", blob, 0o100644).unwrap();
+            let v2_tree_oid = builder.write().unwrap();
+            let v2_tree = watched.find_tree(v2_tree_oid).unwrap();
+            let sig = Signature::now("zlorb-test", "zlorb-test@example.com").unwrap();
+            watched
+                .commit(Some("HEAD"), &sig, &sig, "v2", &v2_tree, &[&v1_commit])
+                .unwrap()
+        };
+        drop(watched);
+        std::fs::write(sub_path.join("data.db"), "precious\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(sub_path.join("data.db")).unwrap(),
             "precious\n"
         );
         let _ = std::fs::remove_dir_all(&root);
