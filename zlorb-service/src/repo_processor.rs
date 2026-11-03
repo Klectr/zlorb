@@ -709,7 +709,7 @@ impl RepoProcessor {
         let remote_ref = match self._apply_fast_forward(fetch_commit, changed_paths.as_deref()) {
             Ok(remote_ref) => remote_ref,
             Err(e) => {
-                self._rollback_fast_forward(local_oid, fetch_oid);
+                self._rollback_failed_apply(local_oid, fetch_oid);
                 return Err(e);
             }
         };
@@ -1220,6 +1220,22 @@ impl RepoProcessor {
             }
         }
         Ok(paths)
+    }
+
+    fn _rollback_failed_apply(&self, local_oid: Oid, fetch_oid: Oid) -> bool {
+        let refname = format!("refs/heads/{}", self.config.branch);
+        let branch_at_local = matches!(
+            self.repo.find_reference(&refname),
+            Ok(reference) if reference.target() == Some(local_oid)
+        );
+        if !branch_at_local {
+            return self._rollback_fast_forward(local_oid, fetch_oid);
+        }
+        Logger::info(format!(
+            "The failed update for {} never moved {} to the fetched commit {}, so the daemon wrote nothing to the working tree in this attempt; skipping the rollback cleanup and restore so files the daemon did not write are preserved",
+            self.config.name, refname, fetch_oid
+        ));
+        self._verify_rollback(local_oid, fetch_oid)
     }
 
     fn _rollback_fast_forward(&self, local_oid: Oid, fetch_oid: Oid) -> bool {
@@ -3186,6 +3202,87 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(watched_path.join("src/main.rs")).unwrap(),
             "race edit\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_apply_rollback_preserves_identical_untracked_file_at_a_fetch_added_path() {
+        let root = temp_dir("failed-apply-identical-untracked");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        let v1 = commit_all(&watched, "v1");
+        write_fixture_crate(&watched_path, "fixture-version-two");
+        std::fs::write(watched_path.join("new.txt"), "new file\n").unwrap();
+        let v2 = commit_all(&watched, "v2");
+        let v1_commit = watched.find_commit(v1).unwrap();
+        watched
+            .reset(v1_commit.as_object(), git2::ResetType::Mixed, None)
+            .unwrap();
+        drop(v1_commit);
+        drop(watched);
+        write_fixture_crate(&watched_path, "fixture-version-one");
+
+        let processor = processor_for(&watched_path);
+        processor
+            .repo
+            .reference("refs/remotes/origin/master", v2, true, "test")
+            .unwrap();
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        {
+            let fetch_ref = processor
+                .repo
+                .find_reference("refs/remotes/origin/master")
+                .unwrap();
+            let fetch_commit = processor
+                .repo
+                .reference_to_annotated_commit(&fetch_ref)
+                .unwrap();
+            match processor._apply_fast_forward(fetch_commit, Some(&changed)) {
+                Ok(_) => panic!("apply must refuse the untracked collision"),
+                Err(e) => assert!(
+                    format!("{:?}", e).contains("untracked files in the way"),
+                    "unexpected error: {:?}",
+                    e
+                ),
+            }
+        }
+        assert!(processor._rollback_failed_apply(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("new.txt")).unwrap(),
+            "new file\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_apply_rollback_still_cleans_up_when_the_update_was_applied() {
+        let root = temp_dir("failed-apply-applied-cleanup");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        let v1 = commit_all(&watched, "v1");
+        write_fixture_crate(&watched_path, "fixture-version-two");
+        std::fs::write(watched_path.join("new.txt"), "new file\n").unwrap();
+        let v2 = commit_all(&watched, "v2");
+        drop(watched);
+
+        let processor = processor_for(&watched_path);
+        assert!(processor._rollback_failed_apply(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert!(!watched_path.join("new.txt").exists());
+        assert!(
+            std::fs::read_to_string(watched_path.join("src/main.rs"))
+                .unwrap()
+                .contains("fixture-version-one")
         );
         let _ = std::fs::remove_dir_all(&root);
     }
