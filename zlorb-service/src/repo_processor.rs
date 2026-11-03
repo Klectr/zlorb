@@ -3659,6 +3659,38 @@ mod tests {
     }
 
     #[test]
+    fn rollback_restore_paths_preserves_everything_when_a_tree_cannot_be_loaded() {
+        let root = temp_dir("rollback-restore-paths-unloadable-tree");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        let v1 = commit_all(&watched, "v1");
+        let odb = watched.odb().unwrap();
+        let broken = odb
+            .write(
+                git2::ObjectType::Commit,
+                b"tree 1111111111111111111111111111111111111111\nauthor A <a@a.invalid> 0 +0000\ncommitter A <a@a.invalid> 0 +0000\n\nbroken\n",
+            )
+            .unwrap();
+        drop(odb);
+        drop(watched);
+
+        let processor = processor_for(&watched_path);
+        assert!(processor.repo.find_commit(broken).is_ok());
+        let changed = vec![PathBuf::from("src/main.rs")];
+        let (safe, preserved) = processor._rollback_restore_paths(broken, v1, &changed);
+        assert!(safe.is_empty());
+        assert_eq!(preserved, changed);
+        let (safe, preserved) = processor._rollback_restore_paths(v1, broken, &changed);
+        assert!(safe.is_empty());
+        assert_eq!(preserved, changed);
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn rollback_whole_tree_fallback_does_not_write_through_a_symlinked_ancestor() {
         let root = temp_dir("rollback-whole-tree-fallback-symlink");
         let watched_path = root.join("watched");
@@ -4547,6 +4579,47 @@ mod tests {
             "new file\n"
         );
         assert!(!watched_path.join("top.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_cleanup_skips_files_under_a_symlinked_ancestor_that_is_a_local_symlink_blob() {
+        let root = temp_dir("rollback-cleanup-symlink-blob-dir");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        let outside_path = root.join("outside");
+        std::fs::create_dir_all(&outside_path).unwrap();
+        std::fs::write(outside_path.join("a.txt"), "a\n").unwrap();
+        std::fs::write(outside_path.join("b.txt"), "other\n").unwrap();
+        std::os::unix::fs::symlink(&outside_path, watched_path.join("thing")).unwrap();
+        let v1 = commit_all(&watched, "v1");
+        std::fs::remove_file(watched_path.join("thing")).unwrap();
+        std::fs::create_dir_all(watched_path.join("thing")).unwrap();
+        std::fs::write(watched_path.join("thing/a.txt"), "a\n").unwrap();
+        std::fs::write(watched_path.join("thing/b.txt"), "b\n").unwrap();
+        let v2 = commit_all(&watched, "v2");
+        let v1_commit = watched.find_commit(v1).unwrap();
+        watched
+            .reset(v1_commit.as_object(), git2::ResetType::Mixed, None)
+            .unwrap();
+        drop(v1_commit);
+        drop(watched);
+        std::fs::remove_dir_all(watched_path.join("thing")).unwrap();
+        std::os::unix::fs::symlink(&outside_path, watched_path.join("thing")).unwrap();
+
+        processor_for(&watched_path)._remove_partial_update_files(v1, v2);
+
+        assert_eq!(
+            std::fs::read_to_string(outside_path.join("a.txt")).unwrap(),
+            "a\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside_path.join("b.txt")).unwrap(),
+            "other\n"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
