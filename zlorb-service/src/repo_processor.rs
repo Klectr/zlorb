@@ -3241,9 +3241,14 @@ mod tests {
                 .repo
                 .reference_to_annotated_commit(&fetch_ref)
                 .unwrap();
-            assert!(processor
-                ._apply_fast_forward(fetch_commit, Some(&changed))
-                .is_err());
+            match processor._apply_fast_forward(fetch_commit, Some(&changed)) {
+                Ok(_) => panic!("apply must refuse the untracked collision"),
+                Err(e) => assert!(
+                    format!("{:?}", e).contains("untracked files in the way"),
+                    "unexpected error: {:?}",
+                    e
+                ),
+            }
         }
         assert!(processor._rollback_failed_apply(v1, v2));
         assert_eq!(head_oid(&processor.repo), v1);
