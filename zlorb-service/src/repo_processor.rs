@@ -947,12 +947,79 @@ impl RepoProcessor {
             .repo
             .statuses(Some(&mut opts))
             .map_err(ZlorbError::Git)?;
-        let mut changes: Vec<PathBuf> = statuses
-            .iter()
-            .map(|entry| path_from_bytes(entry.path_bytes()))
-            .collect();
+        let mut changes: Vec<PathBuf> = Vec::new();
+        for entry in statuses.iter() {
+            let path = path_from_bytes(entry.path_bytes());
+            if self._status_is_only_a_filter_difference(entry.status(), &path) {
+                continue;
+            }
+            changes.push(path);
+        }
         changes.extend(self._hidden_local_changes(&changes));
         Ok(changes)
+    }
+
+    fn _status_is_only_a_filter_difference(
+        &self,
+        status: git2::Status,
+        path: &Path,
+    ) -> bool {
+        let other_flags = git2::Status::INDEX_NEW
+            | git2::Status::INDEX_MODIFIED
+            | git2::Status::INDEX_DELETED
+            | git2::Status::INDEX_RENAMED
+            | git2::Status::INDEX_TYPECHANGE
+            | git2::Status::WT_NEW
+            | git2::Status::WT_DELETED
+            | git2::Status::WT_TYPECHANGE
+            | git2::Status::WT_RENAMED
+            | git2::Status::WT_UNREADABLE
+            | git2::Status::IGNORED
+            | git2::Status::CONFLICTED;
+        if !status.contains(git2::Status::WT_MODIFIED) || status.intersects(other_flags) {
+            return false;
+        }
+        let Some(workdir) = self.repo.workdir().map(|path| path.to_path_buf()) else {
+            return false;
+        };
+        let Ok(mut index) = self.repo.index() else {
+            return false;
+        };
+        if index.read(true).is_err() {
+            return false;
+        }
+        let Some(entry) = index.get_path(path, 0) else {
+            return false;
+        };
+        if !matches!(entry.mode, 0o100644 | 0o100755) {
+            return false;
+        }
+        let entry_id = entry.id;
+        let entry_mode = entry.mode;
+        let full_path = workdir.join(path);
+        let Ok(metadata) = std::fs::symlink_metadata(&full_path) else {
+            return false;
+        };
+        if !metadata.file_type().is_file() {
+            return false;
+        }
+        let file_mode = self
+            .repo
+            .config()
+            .and_then(|config| config.get_bool("core.fileMode"))
+            .unwrap_or(true);
+        if file_mode {
+            use std::os::unix::fs::PermissionsExt;
+            let disk_mode = if metadata.permissions().mode() & 0o111 != 0 {
+                0o100755
+            } else {
+                0o100644
+            };
+            if disk_mode != entry_mode {
+                return false;
+            }
+        }
+        self._matches_after_external_clean_filter(&workdir, path, &full_path, entry_id)
     }
 
     fn _hidden_local_changes(&self, known: &[PathBuf]) -> Vec<PathBuf> {
@@ -3429,6 +3496,133 @@ mod tests {
         std::fs::write(watched_path.join("data.txt"), "Xgoodbye\n").unwrap();
         set_index_flag(&watched_path, "--skip-worktree", "data.txt");
 
+        let processor = processor_for(&watched_path);
+        assert_eq!(
+            processor._tracked_local_changes().unwrap(),
+            vec![PathBuf::from("data.txt")]
+        );
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(format!("{:?}", err).contains("local changes to tracked files"));
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"Xgoodbye\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+
+
+    fn external_filter_repo(label: &str, v2_data: &str) -> (PathBuf, PathBuf, Oid, Oid) {
+        let root = temp_dir(label);
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        std::fs::write(upstream_path.join(".gitattributes"), "*.txt filter=strip\n").unwrap();
+        std::fs::write(upstream_path.join("data.txt"), "hello\n").unwrap();
+        let v1 = commit_all(&upstream, "v1");
+        write_fixture_crate(&upstream_path, "fixture-version-two");
+        std::fs::write(upstream_path.join("data.txt"), v2_data).unwrap();
+        let v2 = commit_all(&upstream, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v1).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        set_repo_config(&watched_path, "filter.strip.clean", "sed 's/^X//'");
+        (root, watched_path, v1, v2)
+    }
+
+    #[test]
+    fn file_matching_its_blob_after_an_external_clean_filter_does_not_block_fast_forward() {
+        let (root, watched_path, _v1, v2) =
+            external_filter_repo("external-filter-clean", "version two\n");
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert!(processor._tracked_local_changes().unwrap().is_empty());
+        processor.update_from_remote().unwrap();
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"version two\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn file_changed_after_an_external_clean_filter_still_refuses_fast_forward() {
+        let (root, watched_path, v1, _v2) =
+            external_filter_repo("external-filter-changed", "version two\n");
+        std::fs::write(watched_path.join("data.txt"), "Xgoodbye\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert_eq!(
+            processor._tracked_local_changes().unwrap(),
+            vec![PathBuf::from("data.txt")]
+        );
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(format!("{:?}", err).contains("local changes to tracked files"));
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"Xgoodbye\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn file_with_a_mode_change_after_an_external_clean_filter_still_refuses_fast_forward() {
+        let (root, watched_path, v1, _v2) =
+            external_filter_repo("external-filter-mode", "version two\n");
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            watched_path.join("data.txt"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let processor = processor_for(&watched_path);
+        assert_eq!(
+            processor._tracked_local_changes().unwrap(),
+            vec![PathBuf::from("data.txt")]
+        );
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(format!("{:?}", err).contains("local changes to tracked files"));
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn staged_change_to_a_filtered_file_still_refuses_fast_forward() {
+        let (root, watched_path, v1, _v2) =
+            external_filter_repo("external-filter-staged", "version two\n");
+        std::fs::write(watched_path.join("data.txt"), "Xgoodbye\n").unwrap();
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&watched_path)
+            .args(["add", "data.txt"])
+            .status()
+            .unwrap();
+        assert!(status.success());
         let processor = processor_for(&watched_path);
         assert_eq!(
             processor._tracked_local_changes().unwrap(),
