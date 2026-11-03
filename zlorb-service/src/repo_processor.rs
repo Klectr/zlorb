@@ -1019,7 +1019,11 @@ impl RepoProcessor {
                 return false;
             }
         }
-        self._matches_after_external_clean_filter(&workdir, path, &full_path, entry_id)
+        if self._external_clean_filter_name(path).is_some() {
+            self._matches_after_external_clean_filter(&workdir, path, &full_path, entry_id)
+        } else {
+            self._matches_after_builtin_conversion(&workdir, path, &full_path, entry_id)
+        }
     }
 
     fn _hidden_local_changes(&self, known: &[PathBuf]) -> Vec<PathBuf> {
@@ -1197,11 +1201,83 @@ impl RepoProcessor {
         let Some(filter_name) = self._external_clean_filter_name(path) else {
             return false;
         };
+        self._matches_after_clean_conversion_with_timeout(
+            workdir,
+            path,
+            full_path,
+            expected,
+            timeout,
+            &format!("the external clean filter {}", filter_name),
+        )
+    }
+
+    fn _matches_after_builtin_conversion(
+        &self,
+        workdir: &Path,
+        path: &Path,
+        full_path: &Path,
+        expected: Oid,
+    ) -> bool {
+        if !self._builtin_conversion_may_apply(path) {
+            return false;
+        }
+        self._matches_after_clean_conversion_with_timeout(
+            workdir,
+            path,
+            full_path,
+            expected,
+            std::time::Duration::from_secs(30),
+            "the built-in conversion (text/eol/ident/autocrlf)",
+        )
+    }
+
+    fn _builtin_conversion_may_apply(&self, path: &Path) -> bool {
+        for attr in ["text", "eol", "ident"] {
+            let Ok(value) = self
+                .repo
+                .get_attr(path, attr, git2::AttrCheckFlags::FILE_THEN_INDEX)
+            else {
+                continue;
+            };
+            if matches!(
+                git2::AttrValue::from_string(value),
+                git2::AttrValue::True | git2::AttrValue::String(_) | git2::AttrValue::Bytes(_)
+            ) {
+                return true;
+            }
+        }
+        if let Ok(config) = self.repo.config() {
+            if let Ok(autocrlf) = config.get_string("core.autocrlf") {
+                if matches!(
+                    autocrlf.trim().to_ascii_lowercase().as_str(),
+                    "true" | "yes" | "on" | "1" | "input" | ""
+                ) {
+                    return true;
+                }
+            }
+            if let Ok(autocrlf) = config.get_bool("core.autocrlf") {
+                if autocrlf {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn _matches_after_clean_conversion_with_timeout(
+        &self,
+        workdir: &Path,
+        path: &Path,
+        full_path: &Path,
+        expected: Oid,
+        timeout: std::time::Duration,
+        conversion: &str,
+    ) -> bool {
         Logger::info(format!(
-            "Re-checking {} in {} through git hash-object so the external clean filter {} is applied",
+            "Re-checking {} in {} through git hash-object so {} is applied",
             path.display(),
             self.config.name,
-            filter_name
+            conversion
         ));
         use std::os::unix::process::CommandExt;
         let mut command = Command::new("git");
@@ -1219,10 +1295,10 @@ impl RepoProcessor {
             Ok(child) => child,
             Err(e) => {
                 Logger::error(format!(
-                    "Could not run git hash-object for {} in {} to apply the external clean filter {} ({}); treating it as changed so the update is refused rather than risk discarding it",
+                    "Could not run git hash-object for {} in {} to apply {} ({}); treating it as changed so the update is refused rather than risk discarding it",
                     path.display(),
                     self.config.name,
-                    filter_name,
+                    conversion,
                     e
                 ));
                 return false;
@@ -1236,10 +1312,10 @@ impl RepoProcessor {
                 let _ = child.kill();
                 let _ = child.wait();
                 Logger::error(format!(
-                    "git hash-object for {} in {} did not provide output pipes while applying the external clean filter {}; treating it as changed so the update is refused rather than risk discarding it",
+                    "git hash-object for {} in {} did not provide output pipes while applying {}; treating it as changed so the update is refused rather than risk discarding it",
                     path.display(),
                     self.config.name,
-                    filter_name
+                    conversion
                 ));
                 return false;
             }
@@ -1253,11 +1329,11 @@ impl RepoProcessor {
                         kill_process_group(pgid);
                         let _ = child.wait();
                         Logger::error(format!(
-                            "git hash-object for {} in {} did not finish within {} seconds while applying the external clean filter {}; treating it as changed so the update is refused rather than risk discarding it",
+                            "git hash-object for {} in {} did not finish within {} seconds while applying {}; treating it as changed so the update is refused rather than risk discarding it",
                             path.display(),
                             self.config.name,
                             timeout.as_secs(),
-                            filter_name
+                            conversion
                         ));
                         let drain_deadline = pipe_drain_deadline();
                         let _ = drains.finish(drain_deadline, pgid);
@@ -1270,10 +1346,10 @@ impl RepoProcessor {
                     let _ = child.kill();
                     let _ = child.wait();
                     Logger::error(format!(
-                        "Could not wait for git hash-object for {} in {} to apply the external clean filter {} ({}); treating it as changed so the update is refused rather than risk discarding it",
+                        "Could not wait for git hash-object for {} in {} to apply {} ({}); treating it as changed so the update is refused rather than risk discarding it",
                         path.display(),
                         self.config.name,
-                        filter_name,
+                        conversion,
                         e
                     ));
                     let drain_deadline = pipe_drain_deadline();
@@ -1285,10 +1361,10 @@ impl RepoProcessor {
         let drain_deadline = pipe_drain_deadline();
         if !drains.finish(drain_deadline, pgid) {
             Logger::error(format!(
-                "git hash-object for {} in {} left its output pipes open after exiting while applying the external clean filter {}; treating it as changed so the update is refused rather than risk discarding it",
+                "git hash-object for {} in {} left its output pipes open after exiting while applying {}; treating it as changed so the update is refused rather than risk discarding it",
                 path.display(),
                 self.config.name,
-                filter_name
+                conversion
             ));
             return false;
         }
@@ -1296,11 +1372,11 @@ impl RepoProcessor {
         let stderr = std::mem::take(&mut drains.stderr.buf);
         if !status.success() {
             Logger::error(format!(
-                "git hash-object for {} in {} failed ({}) while applying the external clean filter {}; treating it as changed so the update is refused rather than risk discarding it: {}",
+                "git hash-object for {} in {} failed ({}) while applying {}; treating it as changed so the update is refused rather than risk discarding it: {}",
                 path.display(),
                 self.config.name,
                 status,
-                filter_name,
+                conversion,
                 String::from_utf8_lossy(&stderr).trim()
             ));
             return false;
@@ -1310,19 +1386,20 @@ impl RepoProcessor {
             Ok(external_id) => {
                 if external_id != expected {
                     Logger::warn(format!(
-                        "Re-checking {} in {} through the external clean filter {} still produced a different hash than the index; treating it as changed",
+                        "Re-checking {} in {} through {} still produced a different hash than the index; treating it as changed",
                         path.display(),
                         self.config.name,
-                        filter_name
+                        conversion
                     ));
                 }
                 external_id == expected
             }
             Err(e) => {
                 Logger::error(format!(
-                    "Could not parse the git hash-object result for {} in {} ({}); treating it as changed so the update is refused rather than risk discarding it",
+                    "Could not parse the git hash-object result for {} in {} while applying {} ({}); treating it as changed so the update is refused rather than risk discarding it",
                     path.display(),
                     self.config.name,
+                    conversion,
                     e
                 ));
                 false
@@ -3640,6 +3717,257 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
     }
+
+
+    fn conversion_repo(label: &str, attrs: &str, v1_data: &[u8], v2_data: &[u8]) -> (PathBuf, PathBuf, Oid, Oid) {
+        let root = temp_dir(label);
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        if !attrs.is_empty() {
+            std::fs::write(upstream_path.join(".gitattributes"), attrs).unwrap();
+        }
+        std::fs::write(upstream_path.join("data.txt"), v1_data).unwrap();
+        let v1 = commit_all(&upstream, "v1");
+        write_fixture_crate(&upstream_path, "fixture-version-two");
+        std::fs::write(upstream_path.join("data.txt"), v2_data).unwrap();
+        let v2 = commit_all(&upstream, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v1).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        (root, watched_path, v1, v2)
+    }
+
+    #[test]
+    fn crlf_only_difference_with_autocrlf_does_not_block_fast_forward() {
+        let (root, watched_path, _v1, v2) =
+            conversion_repo("autocrlf-clean", "", b"hello\n", b"version two\n");
+        set_repo_config(&watched_path, "core.autocrlf", "true");
+        std::fs::write(watched_path.join("data.txt"), b"hello\r\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert!(processor._tracked_local_changes().unwrap().is_empty());
+        processor.update_from_remote().unwrap();
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"version two\r\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn crlf_only_difference_with_bare_text_attribute_does_not_block_fast_forward() {
+        let (root, watched_path, _v1, v2) = conversion_repo(
+            "bare-text-clean",
+            "*.txt text\n",
+            b"hello\n",
+            b"version two\n",
+        );
+        std::fs::write(watched_path.join("data.txt"), b"hello\r\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert!(processor._tracked_local_changes().unwrap().is_empty());
+        processor.update_from_remote().unwrap();
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"version two\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn crlf_only_difference_with_autocrlf_input_does_not_block_fast_forward() {
+        let (root, watched_path, _v1, v2) =
+            conversion_repo("autocrlf-input-clean", "", b"hello\n", b"version two\n");
+        set_repo_config(&watched_path, "core.autocrlf", "input");
+        std::fs::write(watched_path.join("data.txt"), b"hello\r\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert!(processor._tracked_local_changes().unwrap().is_empty());
+        processor.update_from_remote().unwrap();
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"version two\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn crlf_only_difference_with_eol_lf_does_not_block_fast_forward() {
+        let (root, watched_path, _v1, v2) = conversion_repo(
+            "eol-lf-clean",
+            "*.txt text eol=lf\n",
+            b"hello\n",
+            b"version two\n",
+        );
+        std::fs::write(watched_path.join("data.txt"), b"hello\r\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert!(processor._tracked_local_changes().unwrap().is_empty());
+        processor.update_from_remote().unwrap();
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"version two\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn changed_content_with_autocrlf_still_refuses_fast_forward() {
+        let (root, watched_path, v1, _v2) =
+            conversion_repo("autocrlf-changed", "", b"hello\n", b"version two\n");
+        set_repo_config(&watched_path, "core.autocrlf", "true");
+        std::fs::write(watched_path.join("data.txt"), b"goodbye\r\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert_eq!(
+            processor._tracked_local_changes().unwrap(),
+            vec![PathBuf::from("data.txt")]
+        );
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(format!("{:?}", err).contains("local changes to tracked files"));
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"goodbye\r\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lf_only_difference_with_eol_crlf_does_not_block_fast_forward() {
+        let (root, watched_path, _v1, v2) = conversion_repo(
+            "eol-crlf-clean",
+            "*.txt text eol=crlf\n",
+            b"hello\n",
+            b"version two\n",
+        );
+        std::fs::write(watched_path.join("data.txt"), b"hello\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert!(processor._tracked_local_changes().unwrap().is_empty());
+        processor.update_from_remote().unwrap();
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"version two\r\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn builtin_recheck_matches_an_ident_only_difference_and_rejects_a_real_one() {
+        let (root, watched_path, _v1, _v2) = conversion_repo(
+            "ident-recheck",
+            "*.txt ident\n",
+            b"rev $Id$\n",
+            b"version two\n",
+        );
+        std::fs::write(
+            watched_path.join("data.txt"),
+            b"rev $Id: 0123456789abcdef0123456789abcdef01234567 $\n",
+        )
+        .unwrap();
+        let repo = git2::Repository::open(&watched_path).unwrap();
+        let mut index = repo.index().unwrap();
+        index.read(true).unwrap();
+        let entry_id = index.get_path(Path::new("data.txt"), 0).unwrap().id;
+        drop(index);
+        drop(repo);
+        let processor = processor_for(&watched_path);
+        assert!(processor._builtin_conversion_may_apply(Path::new("data.txt")));
+        assert!(processor._matches_after_builtin_conversion(
+            &watched_path,
+            Path::new("data.txt"),
+            &watched_path.join("data.txt"),
+            entry_id
+        ));
+        std::fs::write(watched_path.join("data.txt"), b"rev changed\n").unwrap();
+        assert!(!processor._matches_after_builtin_conversion(
+            &watched_path,
+            Path::new("data.txt"),
+            &watched_path.join("data.txt"),
+            entry_id
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn intent_to_add_file_that_cleans_to_the_empty_blob_is_a_change() {
+        let root = temp_dir("intent-to-add-empty");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        std::fs::write(upstream_path.join(".gitattributes"), "*.txt filter=strip\n").unwrap();
+        std::fs::write(upstream_path.join("data.txt"), "hello\n").unwrap();
+        let v1 = commit_all(&upstream, "v1");
+        write_fixture_crate(&upstream_path, "fixture-version-two");
+        let _v2 = commit_all(&upstream, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v1).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        set_repo_config(&watched_path, "filter.strip.clean", "head -c 0");
+        std::fs::write(watched_path.join("new.txt"), "anything\n").unwrap();
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&watched_path)
+            .args(["add", "-N", "new.txt"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let processor = processor_for(&watched_path);
+        assert_eq!(
+            processor._tracked_local_changes().unwrap(),
+            vec![PathBuf::from("new.txt")]
+        );
+        processor.update_from_remote().unwrap();
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), _v2);
+        drop(watched);
+        assert_eq!(
+            std::fs::read(watched_path.join("new.txt")).unwrap(),
+            b"anything\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
 
     fn pipe_pair() -> (std::fs::File, std::fs::File) {
         use std::os::unix::io::FromRawFd;
