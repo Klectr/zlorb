@@ -47,16 +47,17 @@ fn process_start_time(pid: libc::pid_t) -> Option<u64> {
     stat[close + 1..].split_whitespace().nth(19)?.parse().ok()
 }
 
-fn process_holds_pipe_write_ends(pid: libc::pid_t, targets: &[String]) -> bool {
+fn process_pipe_write_targets(pid: libc::pid_t, targets: &[String]) -> Vec<String> {
+    let mut held = Vec::new();
     let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
-        return false;
+        return held;
     };
     for entry in entries.flatten() {
         let Ok(target) = std::fs::read_link(entry.path()) else {
             continue;
         };
-        let target = target.to_string_lossy();
-        if !targets.iter().any(|held| held == target.as_ref()) {
+        let target = target.to_string_lossy().into_owned();
+        if !targets.iter().any(|candidate| candidate == &target) || held.contains(&target) {
             continue;
         }
         let Ok(info) =
@@ -71,10 +72,14 @@ fn process_holds_pipe_write_ends(pid: libc::pid_t, targets: &[String]) -> bool {
             .map(|flags| flags & 0o3 != 0)
             .unwrap_or(false);
         if writable {
-            return true;
+            held.push(target);
         }
     }
-    false
+    held
+}
+
+fn process_holds_pipe_write_ends(pid: libc::pid_t, targets: &[String]) -> bool {
+    !process_pipe_write_targets(pid, targets).is_empty()
 }
 
 fn kill_pipe_holders(targets: &[String]) {
@@ -89,7 +94,11 @@ fn kill_pipe_holders(targets: &[String]) {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<libc::pid_t>() else {
             continue;
         };
-        if pid == own || !process_holds_pipe_write_ends(pid, targets) {
+        if pid == own {
+            continue;
+        }
+        let held = process_pipe_write_targets(pid, targets);
+        if held.is_empty() {
             continue;
         }
         let Some(started) = process_start_time(pid) else {
@@ -100,8 +109,19 @@ fn kill_pipe_holders(targets: &[String]) {
         {
             continue;
         }
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
+        if unsafe { libc::kill(pid, libc::SIGKILL) } == 0 {
+            Logger::warn(format!(
+                "Killed process {} holding the output pipe {} open after the drain deadline",
+                pid,
+                held.join(", ")
+            ));
+        } else {
+            Logger::error(format!(
+                "Could not kill process {} holding the output pipe {} open after the drain deadline: {}",
+                pid,
+                held.join(", "),
+                std::io::Error::last_os_error()
+            ));
         }
     }
 }
@@ -226,7 +246,8 @@ impl PipeDrains {
     fn finish(&mut self, deadline: std::time::Instant, pgid: libc::pid_t) -> bool {
         let first_end = deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(5));
         self.drain_until(first_end);
-        if !self.all_eof() {
+        let mut sweeps = 0;
+        while !self.all_eof() {
             let targets: Vec<String> = [&self.stdout, &self.stderr]
                 .iter()
                 .filter(|drain| !drain.eof)
@@ -234,8 +255,13 @@ impl PipeDrains {
                 .collect();
             kill_process_group(pgid);
             kill_pipe_holders(&targets);
+            sweeps += 1;
             let grace_end = std::time::Instant::now() + std::time::Duration::from_millis(250);
-            self.drain_until(deadline.max(grace_end));
+            if sweeps >= 2 {
+                self.drain_until(deadline.max(grace_end));
+                break;
+            }
+            self.drain_until(grace_end);
         }
         self.stdout.eof
     }
@@ -2978,6 +3004,119 @@ mod tests {
         assert_eq!(status.signal(), Some(libc::SIGKILL));
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn kill_pipe_holders_leaves_read_end_and_other_pipe_holders_alive() {
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::process::ExitStatusExt;
+        let (target_read, target_write) = pipe_pair();
+        let target = pipe_target(target_read.as_raw_fd()).unwrap();
+        let mut victim = Command::new("setsid")
+            .arg("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(target_write))
+            .spawn()
+            .unwrap();
+        let mut read_holder = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::from(target_read))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let (_other_read, other_write) = pipe_pair();
+        let mut other_pipe_holder = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(other_write))
+            .spawn()
+            .unwrap();
+        kill_pipe_holders(&[target]);
+        assert!(
+            process_is_running(read_holder.id() as i32),
+            "a process holding only the read end of the pipe was killed"
+        );
+        assert!(
+            process_is_running(other_pipe_holder.id() as i32),
+            "a process holding the write end of a different pipe was killed"
+        );
+        let mut victim_status = None;
+        for _ in 0..60 {
+            if let Ok(Some(found)) = victim.try_wait() {
+                victim_status = Some(found);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        match victim_status {
+            Some(found) => assert_eq!(found.signal(), Some(libc::SIGKILL)),
+            None => {
+                let _ = victim.kill();
+                let _ = victim.wait();
+                panic!("write-end holder of the target pipe survived the same sweep");
+            }
+        }
+        let _ = read_holder.kill();
+        let _ = read_holder.wait();
+        let _ = other_pipe_holder.kill();
+        let _ = other_pipe_holder.wait();
+    }
+
+    #[test]
+    fn pipe_drain_second_sweep_kills_a_holder_that_grabs_the_pipe_after_the_first_sweep() {
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::process::ExitStatusExt;
+        let root = temp_dir("pipe-drain-second-sweep");
+        std::fs::create_dir_all(&root).unwrap();
+        let script = write_filter_script(
+            &root,
+            "late-holder.sh",
+            "#!/bin/sh\n( sleep 0.68; exec sleep 30 2>/proc/$1/fd/$2 ) 2>/dev/null &\nexec sleep 30\n",
+        );
+        let (out_read, out_write) = pipe_pair();
+        let donor = out_write.try_clone().unwrap();
+        let donor_fd = donor.as_raw_fd();
+        let donor_dropper = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(900));
+            drop(donor);
+        });
+        let mut escapee = Command::new("setsid")
+            .arg(&script)
+            .arg(std::process::id().to_string())
+            .arg(donor_fd.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(out_write))
+            .spawn()
+            .unwrap();
+        let (mut child, pgid) = spawn_sleep_group();
+        let mut drains = PipeDrains::new(out_read, closed_pipe_pair());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(600);
+        assert!(drains.finish(deadline, pgid));
+        let mut status = None;
+        for _ in 0..60 {
+            if let Ok(Some(found)) = escapee.try_wait() {
+                status = Some(found);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        match status {
+            Some(found) => assert_eq!(found.signal(), Some(libc::SIGKILL)),
+            None => {
+                let _ = escapee.kill();
+                let _ = escapee.wait();
+                panic!("setsid process holding the pipe was not killed at the drain deadline");
+            }
+        }
+        let _ = donor_dropper.join();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
