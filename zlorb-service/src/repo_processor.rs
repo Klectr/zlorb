@@ -78,10 +78,6 @@ fn process_pipe_write_targets(pid: libc::pid_t, targets: &[String]) -> Vec<Strin
     held
 }
 
-fn process_holds_pipe_write_ends(pid: libc::pid_t, targets: &[String]) -> bool {
-    !process_pipe_write_targets(pid, targets).is_empty()
-}
-
 fn kill_pipe_holders(targets: &[String]) {
     if targets.is_empty() {
         return;
@@ -97,16 +93,14 @@ fn kill_pipe_holders(targets: &[String]) {
         if pid == own {
             continue;
         }
-        let held = process_pipe_write_targets(pid, targets);
-        if held.is_empty() {
+        if process_pipe_write_targets(pid, targets).is_empty() {
             continue;
         }
         let Some(started) = process_start_time(pid) else {
             continue;
         };
-        if process_start_time(pid) != Some(started)
-            || !process_holds_pipe_write_ends(pid, targets)
-        {
+        let held = process_pipe_write_targets(pid, targets);
+        if process_start_time(pid) != Some(started) || held.is_empty() {
             continue;
         }
         if unsafe { libc::kill(pid, libc::SIGKILL) } == 0 {
@@ -3036,12 +3030,13 @@ mod tests {
             .spawn()
             .unwrap();
         kill_pipe_holders(&[target]);
+        std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(
-            process_is_running(read_holder.id() as i32),
+            matches!(read_holder.try_wait(), Ok(None)),
             "a process holding only the read end of the pipe was killed"
         );
         assert!(
-            process_is_running(other_pipe_holder.id() as i32),
+            matches!(other_pipe_holder.try_wait(), Ok(None)),
             "a process holding the write end of a different pipe was killed"
         );
         let mut victim_status = None;
@@ -3072,12 +3067,13 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
         let root = temp_dir("pipe-drain-second-sweep");
         std::fs::create_dir_all(&root).unwrap();
-        let script = write_filter_script(
-            &root,
-            "late-holder.sh",
-            "#!/bin/sh\n( sleep 0.68; exec sleep 30 2>/proc/$1/fd/$2 ) 2>/dev/null &\nexec sleep 30\n",
+        let body = format!(
+            "#!/bin/sh\n( sleep 0.68; exec sleep 30 2>/proc/$1/fd/$2 ) 2>/dev/null &\necho $! > {}/late.pid\nexec sleep 30\n",
+            root.display()
         );
+        let script = write_filter_script(&root, "late-holder.sh", &body);
         let (out_read, out_write) = pipe_pair();
+        let target = pipe_target(out_read.as_raw_fd()).unwrap();
         let donor = out_write.try_clone().unwrap();
         let donor_fd = donor.as_raw_fd();
         let donor_dropper = std::thread::spawn(move || {
@@ -3093,6 +3089,32 @@ mod tests {
             .stderr(Stdio::from(out_write))
             .spawn()
             .unwrap();
+        let pid_path = root.join("late.pid");
+        let observer = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let mut late_pid = None;
+            let mut holding_since = None;
+            while started.elapsed() < std::time::Duration::from_millis(2500) {
+                if late_pid.is_none() {
+                    if let Ok(text) = std::fs::read_to_string(&pid_path) {
+                        late_pid = text.trim().parse::<libc::pid_t>().ok();
+                    }
+                }
+                if let Some(pid) = late_pid {
+                    if holding_since.is_none()
+                        && !process_pipe_write_targets(pid, std::slice::from_ref(&target))
+                            .is_empty()
+                    {
+                        holding_since = Some(started.elapsed());
+                    }
+                    if holding_since.is_some() && !process_is_running(pid as i32) {
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            (late_pid, holding_since)
+        });
         let (mut child, pgid) = spawn_sleep_group();
         let mut drains = PipeDrains::new(out_read, closed_pipe_pair());
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(600);
@@ -3113,6 +3135,23 @@ mod tests {
                 panic!("setsid process holding the pipe was not killed at the drain deadline");
             }
         }
+        let (late_pid, holding_since) = observer.join().unwrap();
+        let late_pid = late_pid.expect("the late holder script never recorded its pid");
+        let holding_since =
+            holding_since.expect("the late holder was never observed holding the target pipe");
+        assert!(
+            holding_since >= std::time::Duration::from_millis(500),
+            "the late holder grabbed the pipe too early: {holding_since:?}"
+        );
+        let mut late_dead = false;
+        for _ in 0..60 {
+            if !process_is_running(late_pid as i32) {
+                late_dead = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(late_dead, "late holder {late_pid} is still running after finish");
         let _ = donor_dropper.join();
         let _ = child.kill();
         let _ = child.wait();
