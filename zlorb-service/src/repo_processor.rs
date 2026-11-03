@@ -1249,7 +1249,7 @@ impl RepoProcessor {
             Ok(paths) => Some(paths),
             Err(e) => {
                 Logger::error(format!(
-                    "Could not compute the paths changed by the update for {}; rolling back with a whole-tree restore, which may discard local changes outside the update: {}",
+                    "Could not compute the paths changed by the update for {}; rolling back with a scoped fallback restore, which may discard local changes outside the update: {}",
                     self.config.name, e
                 ));
                 None
@@ -1270,7 +1270,7 @@ impl RepoProcessor {
                 }
                 (Some(safe), preserved)
             }
-            None => match self._rollback_scoped_fallback_paths(local_oid) {
+            None => match self._rollback_scoped_fallback_paths(local_oid, fetch_oid) {
                 Some((safe, preserved)) => {
                     for path in &preserved {
                         Logger::error(format!(
@@ -1285,7 +1285,7 @@ impl RepoProcessor {
                 None => {
                     whole_tree_refused = true;
                     Logger::error(format!(
-                        "Refusing the fallback restore for {}: the paths changed by the update could not be computed and the rolled-back tree could not be enumerated, so no working-tree restore is being attempted and the working tree is left diverged from {}",
+                        "Refusing the fallback restore for {}: the paths changed by the update could not be computed and the rolled-back and fetched trees could not be enumerated completely, so no working-tree restore is being attempted and the working tree is left diverged from {}",
                         self.config.name, local_oid
                     ));
                     (Some(Vec::new()), Vec::new())
@@ -1408,19 +1408,35 @@ impl RepoProcessor {
     fn _rollback_scoped_fallback_paths(
         &self,
         local_oid: Oid,
+        fetch_oid: Oid,
     ) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
         let workdir = self.repo.workdir()?.to_path_buf();
-        let tree = self.repo.find_commit(local_oid).ok()?.tree().ok()?;
+        let local_tree = self.repo.find_commit(local_oid).ok()?.tree().ok()?;
+        let fetch_tree = self.repo.find_commit(fetch_oid).ok()?.tree().ok()?;
+        let mut seen = std::collections::HashSet::new();
         let mut paths: Vec<PathBuf> = Vec::new();
-        let _ = tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
-            if matches!(
-                entry.kind(),
-                Some(git2::ObjectType::Blob) | Some(git2::ObjectType::Commit)
-            ) {
-                paths.push(PathBuf::from(root).join(entry.name().unwrap_or_default()));
+        for tree in [&local_tree, &fetch_tree] {
+            let mut tree_paths: Vec<PathBuf> = Vec::new();
+            tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+                if matches!(
+                    entry.kind(),
+                    Some(git2::ObjectType::Blob) | Some(git2::ObjectType::Commit)
+                ) {
+                    if let Some(name) = entry.name() {
+                        if !name.is_empty() {
+                            tree_paths.push(PathBuf::from(root).join(name));
+                        }
+                    }
+                }
+                git2::TreeWalkResult::Ok
+            })
+            .ok()?;
+            for path in tree_paths {
+                if seen.insert(path.clone()) {
+                    paths.push(path);
+                }
             }
-            git2::TreeWalkResult::Ok
-        });
+        }
         if paths.is_empty() {
             return None;
         }
@@ -3719,7 +3735,7 @@ mod tests {
         assert!(
             std::fs::read_to_string(watched_path.join("src/main.rs"))
                 .unwrap()
-                .contains("fixture-version-one")
+                .contains("fixture-version-two")
         );
         assert!(
             std::fs::symlink_metadata(watched_path.join("parent/mid"))
@@ -4619,6 +4635,93 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(outside_path.join("b.txt")).unwrap(),
             "other\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_scoped_fallback_refuses_a_tree_whose_walk_fails() {
+        let root = temp_dir("rollback-fallback-walk-fails");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        let odb = watched.odb().unwrap();
+        let blob = odb.write(git2::ObjectType::Blob, b"x\n").unwrap();
+        drop(odb);
+        let bogus_tree = Oid::from_str("1111111111111111111111111111111111111111").unwrap();
+        let mut raw: Vec<u8> = Vec::new();
+        raw.extend_from_slice(b"100644 aaa.txt\0");
+        raw.extend_from_slice(blob.as_bytes());
+        raw.extend_from_slice(b"40000 dir\0");
+        raw.extend_from_slice(bogus_tree.as_bytes());
+        raw.extend_from_slice(b"100644 file.txt\0");
+        raw.extend_from_slice(blob.as_bytes());
+        let odb = watched.odb().unwrap();
+        let tree_oid = odb.write(git2::ObjectType::Tree, &raw).unwrap();
+        drop(odb);
+        let tree = watched.find_tree(tree_oid).unwrap();
+        let sig = git2::Signature::now("zlorb-test", "zlorb-test@example.com").unwrap();
+        let v1 = watched
+            .commit(Some("HEAD"), &sig, &sig, "v1", &tree, &[])
+            .unwrap();
+        drop(tree);
+        write_fixture_crate(&watched_path, "fixture-version-two");
+        let v2 = commit_all(&watched, "v2");
+        drop(watched);
+
+        let processor = processor_for(&watched_path);
+        assert!(processor._rollback_scoped_fallback_paths(v1, v2).is_none());
+        assert!(processor._rollback_scoped_fallback_paths(v2, v1).is_none());
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_scoped_fallback_includes_fetch_only_paths() {
+        let root = temp_dir("rollback-fallback-fetch-only");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        let v1 = commit_all(&watched, "v1");
+        write_fixture_crate(&watched_path, "fixture-version-two");
+        std::fs::write(watched_path.join("new.txt"), "new in v2\n").unwrap();
+        let v2 = commit_all(&watched, "v2");
+        drop(watched);
+
+        let processor = processor_for(&watched_path);
+        let (safe, preserved) = processor
+            ._rollback_scoped_fallback_paths(v1, v2)
+            .unwrap();
+        assert!(safe.contains(&PathBuf::from("new.txt")));
+        assert!(safe.contains(&PathBuf::from("src/main.rs")));
+        assert!(preserved.is_empty());
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_fallback_refuses_when_the_rolled_back_tree_is_empty() {
+        let root = temp_dir("rollback-fallback-empty-tree");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        let v1 = commit_all(&watched, "v1");
+        std::fs::write(watched_path.join("file.txt"), "file\n").unwrap();
+        let _v2 = commit_all(&watched, "v2");
+        drop(watched);
+        let bogus = Oid::from_str("1111111111111111111111111111111111111111").unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, bogus));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("file.txt")).unwrap(),
+            "file\n"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
