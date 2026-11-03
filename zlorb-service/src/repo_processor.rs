@@ -803,7 +803,7 @@ impl RepoProcessor {
         };
         self._refuse_if_update_would_overwrite(&fetch_commit, changed_paths.as_deref())?;
         let fetch_oid = fetch_commit.id();
-        let remote_ref = match self._apply_fast_forward(fetch_commit, changed_paths.as_deref()) {
+        let remote_ref = match self._apply_fast_forward(fetch_commit, local_oid, changed_paths.as_deref()) {
             Ok(remote_ref) => remote_ref,
             Err(e) => {
                 self._rollback_failed_apply(local_oid, fetch_oid);
@@ -1280,13 +1280,13 @@ impl RepoProcessor {
     fn _apply_fast_forward(
         &self,
         fetch_commit: AnnotatedCommit,
+        local_oid: Oid,
         changed_paths: Option<&[PathBuf]>,
     ) -> Result<Reference<'_>, ZlorbError> {
         self._refuse_if_update_would_overwrite(&fetch_commit, changed_paths)?;
         let fetch_oid = fetch_commit.id();
-        let local_oid = self.repo.head().ok().and_then(|head| head.target());
         self._setup_repo_for_checkout(fetch_commit)?;
-        self._checkout_and_get_ref(local_oid, fetch_oid, changed_paths)
+        self._checkout_and_get_ref(Some(local_oid), fetch_oid, changed_paths)
     }
 
     fn _changed_paths(&self, from: Oid, to: Oid) -> Result<Vec<PathBuf>, ZlorbError> {
@@ -1466,6 +1466,9 @@ impl RepoProcessor {
         let Some(workdir) = self.repo.workdir().map(|workdir| workdir.to_path_buf()) else {
             return false;
         };
+        if self._rollback_has_symlinked_ancestor(&workdir, path) {
+            return false;
+        }
         let full_path = workdir.join(path);
         let is_real_dir = std::fs::symlink_metadata(&full_path)
             .map(|metadata| metadata.file_type().is_dir())
@@ -3840,7 +3843,7 @@ mod tests {
                 .repo
                 .reference_to_annotated_commit(&second_ref)
                 .unwrap();
-            match processor._apply_fast_forward(second_commit, Some(&changed)) {
+            match processor._apply_fast_forward(second_commit, v1, Some(&changed)) {
                 Ok(_) => {
                     panic!("apply must refuse an edit made after the first guard check")
                 }
@@ -4057,6 +4060,91 @@ mod tests {
     }
 
     #[test]
+    fn checkout_step_refuses_dir_only_typechange_under_a_symlinked_ancestor() {
+        let root = temp_dir("checkout-symlink-ancestor-dir-only");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        let sig = Signature::now("zlorb-test", "zlorb-test@example.com").unwrap();
+        let keep = watched.blob(b"keep\n").unwrap();
+        let empty_tree = watched.treebuilder(None).unwrap().write().unwrap();
+        let thing_v1 = {
+            let mut builder = watched.treebuilder(None).unwrap();
+            builder.insert("empty", empty_tree, 0o40000).unwrap();
+            builder.write().unwrap()
+        };
+        let link_v1 = {
+            let mut builder = watched.treebuilder(None).unwrap();
+            builder.insert("thing", thing_v1, 0o40000).unwrap();
+            builder.write().unwrap()
+        };
+        let v1_tree = {
+            let mut builder = watched.treebuilder(None).unwrap();
+            builder.insert("keep.txt", keep, 0o100644).unwrap();
+            builder.insert("link", link_v1, 0o40000).unwrap();
+            builder.write().unwrap()
+        };
+        let v1_tree = watched.find_tree(v1_tree).unwrap();
+        let v1 = watched
+            .commit(Some("HEAD"), &sig, &sig, "v1", &v1_tree, &[])
+            .unwrap();
+        drop(v1_tree);
+        let thing_blob = watched.blob(b"now a file\n").unwrap();
+        let link_v2 = {
+            let mut builder = watched.treebuilder(None).unwrap();
+            builder.insert("thing", thing_blob, 0o100644).unwrap();
+            builder.write().unwrap()
+        };
+        let v2_tree = {
+            let mut builder = watched.treebuilder(None).unwrap();
+            builder.insert("keep.txt", keep, 0o100644).unwrap();
+            builder.insert("link", link_v2, 0o40000).unwrap();
+            builder.write().unwrap()
+        };
+        let v2_tree = watched.find_tree(v2_tree).unwrap();
+        let v1_commit = watched.find_commit(v1).unwrap();
+        let v2 = watched
+            .commit(Some("HEAD"), &sig, &sig, "v2", &v2_tree, &[&v1_commit])
+            .unwrap();
+        drop(v2_tree);
+        watched
+            .reset(v1_commit.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(v1_commit);
+        drop(watched);
+        let outside_path = root.join("outside");
+        std::fs::create_dir_all(outside_path.join("thing/empty")).unwrap();
+        let _ = std::fs::remove_dir_all(watched_path.join("link"));
+        let _ = std::fs::remove_file(watched_path.join("link"));
+        std::os::unix::fs::symlink(&outside_path, watched_path.join("link")).unwrap();
+
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        assert_eq!(changed, vec![PathBuf::from("link/thing")]);
+        move_ref_to_v2(&processor, v2);
+        assert!(!processor._checkout_dir_is_safe(v1, v2, Path::new("link/thing")));
+        match processor._checkout_and_get_ref(Some(v1), v2, Some(&changed)) {
+            Ok(_) => panic!(
+                "checkout must refuse a dir-only typechange under a symlinked ancestor"
+            ),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("would be overwritten by the checkout"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        drop(processor);
+        assert!(outside_path.join("thing").is_dir());
+        assert!(outside_path.join("thing/empty").is_dir());
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("keep.txt")).unwrap(),
+            "keep\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn failed_apply_rollback_preserves_identical_untracked_file_at_a_fetch_added_path() {
         let root = temp_dir("failed-apply-identical-untracked");
         let watched_path = root.join("watched");
@@ -4091,7 +4179,7 @@ mod tests {
                 .repo
                 .reference_to_annotated_commit(&fetch_ref)
                 .unwrap();
-            match processor._apply_fast_forward(fetch_commit, Some(&changed)) {
+            match processor._apply_fast_forward(fetch_commit, v1, Some(&changed)) {
                 Ok(_) => panic!("apply must refuse the untracked collision"),
                 Err(e) => assert!(
                     format!("{:?}", e).contains("untracked files in the way"),
