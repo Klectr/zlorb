@@ -422,6 +422,33 @@ fn directory_is_tracked_typechange(
     true
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CleanRecheck {
+    Match,
+    Mismatch,
+    Unverifiable,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GuardRecheck {
+    NotCandidate,
+    Match,
+    Mismatch,
+    Unverifiable,
+}
+
+struct TrackedLocalChanges {
+    changes: Vec<PathBuf>,
+    unverifiable: Vec<PathBuf>,
+}
+
+fn unverifiable_clause(paths: &[PathBuf]) -> String {
+    format!(
+        "tracked files ({}) could not be checked against their clean conversion in the daemon environment, so they are treated as changed",
+        display_paths(paths)
+    )
+}
+
 pub struct RepoProcessor {
     pub(crate) repo_path: PathBuf,
     pub repo: git2::Repository,
@@ -570,16 +597,41 @@ impl RepoProcessor {
         Logger::info(format!("Should run build: {}", should_run_build));
 
         if should_run_build && !has_updates {
-            let tracked_changes: Vec<PathBuf> = self
-                ._tracked_local_changes()?
+            let tracked = self._tracked_local_changes()?;
+            let tracked_changes: Vec<PathBuf> = tracked
+                .changes
                 .into_iter()
                 .filter(|change| !self._path_is_skip_worktree_absent(change))
                 .collect();
-            if !tracked_changes.is_empty() {
+            let unverifiable: Vec<PathBuf> = tracked
+                .unverifiable
+                .into_iter()
+                .filter(|change| !self._path_is_skip_worktree_absent(change))
+                .collect();
+            if !tracked_changes.is_empty() || !unverifiable.is_empty() {
+                let mut clauses = Vec::new();
+                if !tracked_changes.is_empty() {
+                    clauses.push(format!(
+                        "local changes to tracked files ({}) are not part of the commit being built",
+                        display_paths(&tracked_changes)
+                    ));
+                }
+                if !unverifiable.is_empty() {
+                    clauses.push(format!(
+                        "{} and are not part of the commit being built",
+                        unverifiable_clause(&unverifiable)
+                    ));
+                }
+                let advice = if tracked_changes.is_empty() {
+                    "The re-check errors above name the conversion that could not be applied; make it runnable by the daemon so these files can be verified"
+                } else {
+                    "Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch"
+                };
                 return Err(ZlorbError::Other(format!(
-                    "Refusing to build {}: local changes to tracked files ({}) are not part of the commit being built. Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch",
+                    "Refusing to build {}: {}. {}",
                     self.config.name,
-                    display_paths(&tracked_changes)
+                    clauses.join("; "),
+                    advice
                 )));
             }
         }
@@ -650,16 +702,41 @@ impl RepoProcessor {
             return Ok(());
         }
         if !build_ran_this_cycle {
-            let tracked_changes: Vec<PathBuf> = self
-                ._tracked_local_changes()?
+            let tracked = self._tracked_local_changes()?;
+            let tracked_changes: Vec<PathBuf> = tracked
+                .changes
                 .into_iter()
                 .filter(|change| !self._path_is_skip_worktree_absent(change))
                 .collect();
-            if !tracked_changes.is_empty() {
+            let unverifiable: Vec<PathBuf> = tracked
+                .unverifiable
+                .into_iter()
+                .filter(|change| !self._path_is_skip_worktree_absent(change))
+                .collect();
+            if !tracked_changes.is_empty() || !unverifiable.is_empty() {
+                let mut clauses = Vec::new();
+                if !tracked_changes.is_empty() {
+                    clauses.push(format!(
+                        "local changes to tracked files ({}) are not part of the commit being restarted on",
+                        display_paths(&tracked_changes)
+                    ));
+                }
+                if !unverifiable.is_empty() {
+                    clauses.push(format!(
+                        "{} and are not part of the commit being restarted on",
+                        unverifiable_clause(&unverifiable)
+                    ));
+                }
+                let advice = if tracked_changes.is_empty() {
+                    "The re-check errors above name the conversion that could not be applied; make it runnable by the daemon so these files can be verified"
+                } else {
+                    "Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch"
+                };
                 return Err(ZlorbError::Other(format!(
-                    "Refusing to run the restart command for {}: local changes to tracked files ({}) are not part of the commit being restarted on. Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch",
+                    "Refusing to run the restart command for {}: {}. {}",
                     self.config.name,
-                    display_paths(&tracked_changes)
+                    clauses.join("; "),
+                    advice
                 )));
             }
         }
@@ -827,36 +904,57 @@ impl RepoProcessor {
         fetch_commit: &AnnotatedCommit,
         changed_paths: Option<&[PathBuf]>,
     ) -> Result<(), ZlorbError> {
-        let tracked_changes = self._tracked_local_changes()?;
-        let tracked_changes: Vec<PathBuf> = match changed_paths {
-            Some(paths) => tracked_changes
-                .into_iter()
-                .filter(|change| paths.contains(change))
-                .filter(|change| !self._path_is_skip_worktree_absent(change))
-                .collect(),
-            None => tracked_changes,
+        let tracked = self._tracked_local_changes()?;
+        let (tracked_changes, unverifiable): (Vec<PathBuf>, Vec<PathBuf>) = match changed_paths {
+            Some(paths) => (
+                tracked
+                    .changes
+                    .into_iter()
+                    .filter(|change| paths.contains(change))
+                    .filter(|change| !self._path_is_skip_worktree_absent(change))
+                    .collect(),
+                tracked
+                    .unverifiable
+                    .into_iter()
+                    .filter(|change| paths.contains(change))
+                    .filter(|change| !self._path_is_skip_worktree_absent(change))
+                    .collect(),
+            ),
+            None => (tracked.changes, tracked.unverifiable),
         };
         let untracked_collisions = self._untracked_collisions(fetch_commit)?;
-        if tracked_changes.is_empty() && untracked_collisions.is_empty() {
+        if tracked_changes.is_empty()
+            && unverifiable.is_empty()
+            && untracked_collisions.is_empty()
+        {
             return Ok(());
         }
         let mut reasons = Vec::new();
         if !tracked_changes.is_empty() {
             reasons.push(format!(
-                "local changes to tracked files ({})",
+                "local changes to tracked files ({}) would be overwritten",
                 display_paths(&tracked_changes)
             ));
         }
+        if !unverifiable.is_empty() {
+            reasons.push(unverifiable_clause(&unverifiable));
+        }
         if !untracked_collisions.is_empty() {
             reasons.push(format!(
-                "untracked files in the way ({})",
+                "untracked files in the way ({}) would be overwritten",
                 untracked_collisions.join(", ")
             ));
         }
+        let advice = if tracked_changes.is_empty() && untracked_collisions.is_empty() {
+            "The re-check errors above name the conversion that could not be applied; make it runnable by the daemon so these files can be verified"
+        } else {
+            "Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch"
+        };
         Err(ZlorbError::Other(format!(
-            "Refusing to fast-forward {}: {} would be overwritten. Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch",
+            "Refusing to fast-forward {}: {}. {}",
             self.config.name,
-            reasons.join(" and ")
+            reasons.join("; "),
+            advice
         )))
     }
 
@@ -939,7 +1037,7 @@ impl RepoProcessor {
         Ok(collisions)
     }
 
-    fn _tracked_local_changes(&self) -> Result<Vec<PathBuf>, ZlorbError> {
+    fn _tracked_local_changes(&self) -> Result<TrackedLocalChanges, ZlorbError> {
         let mut opts = git2::StatusOptions::new();
         opts.include_untracked(false);
         opts.include_ignored(false);
@@ -948,22 +1046,25 @@ impl RepoProcessor {
             .statuses(Some(&mut opts))
             .map_err(ZlorbError::Git)?;
         let mut changes: Vec<PathBuf> = Vec::new();
+        let mut unverifiable: Vec<PathBuf> = Vec::new();
         for entry in statuses.iter() {
             let path = path_from_bytes(entry.path_bytes());
-            if self._status_is_only_a_filter_difference(entry.status(), &path) {
-                continue;
+            match self._guard_recheck(entry.status(), &path) {
+                GuardRecheck::Match => {}
+                GuardRecheck::Unverifiable => unverifiable.push(path),
+                GuardRecheck::Mismatch | GuardRecheck::NotCandidate => changes.push(path),
             }
-            changes.push(path);
         }
-        changes.extend(self._hidden_local_changes(&changes));
-        Ok(changes)
+        let mut known = changes.clone();
+        known.extend(unverifiable.iter().cloned());
+        changes.extend(self._hidden_local_changes(&known));
+        Ok(TrackedLocalChanges {
+            changes,
+            unverifiable,
+        })
     }
 
-    fn _status_is_only_a_filter_difference(
-        &self,
-        status: git2::Status,
-        path: &Path,
-    ) -> bool {
+    fn _guard_recheck(&self, status: git2::Status, path: &Path) -> GuardRecheck {
         let other_flags = git2::Status::INDEX_NEW
             | git2::Status::INDEX_MODIFIED
             | git2::Status::INDEX_DELETED
@@ -977,31 +1078,31 @@ impl RepoProcessor {
             | git2::Status::IGNORED
             | git2::Status::CONFLICTED;
         if !status.contains(git2::Status::WT_MODIFIED) || status.intersects(other_flags) {
-            return false;
+            return GuardRecheck::NotCandidate;
         }
         let Some(workdir) = self.repo.workdir().map(|path| path.to_path_buf()) else {
-            return false;
+            return GuardRecheck::NotCandidate;
         };
         let Ok(mut index) = self.repo.index() else {
-            return false;
+            return GuardRecheck::NotCandidate;
         };
         if index.read(true).is_err() {
-            return false;
+            return GuardRecheck::NotCandidate;
         }
         let Some(entry) = index.get_path(path, 0) else {
-            return false;
+            return GuardRecheck::NotCandidate;
         };
         if !matches!(entry.mode, 0o100644 | 0o100755) {
-            return false;
+            return GuardRecheck::NotCandidate;
         }
         let entry_id = entry.id;
         let entry_mode = entry.mode;
         let full_path = workdir.join(path);
         let Ok(metadata) = std::fs::symlink_metadata(&full_path) else {
-            return false;
+            return GuardRecheck::NotCandidate;
         };
         if !metadata.file_type().is_file() {
-            return false;
+            return GuardRecheck::NotCandidate;
         }
         let file_mode = self
             .repo
@@ -1016,13 +1117,24 @@ impl RepoProcessor {
                 0o100644
             };
             if disk_mode != entry_mode {
-                return false;
+                return GuardRecheck::NotCandidate;
             }
         }
-        if self._external_clean_filter_name(path).is_some() {
-            self._matches_after_external_clean_filter(&workdir, path, &full_path, entry_id)
+        let recheck = if self._external_clean_filter_name(path).is_some() {
+            self._recheck_after_external_clean_filter_with_timeout(
+                &workdir,
+                path,
+                &full_path,
+                entry_id,
+                std::time::Duration::from_secs(30),
+            )
         } else {
-            self._matches_after_builtin_conversion(&workdir, path, &full_path, entry_id)
+            self._recheck_after_builtin_conversion(&workdir, path, &full_path, entry_id)
+        };
+        match recheck {
+            CleanRecheck::Match => GuardRecheck::Match,
+            CleanRecheck::Mismatch => GuardRecheck::Mismatch,
+            CleanRecheck::Unverifiable => GuardRecheck::Unverifiable,
         }
     }
 
@@ -1198,10 +1310,23 @@ impl RepoProcessor {
         expected: Oid,
         timeout: std::time::Duration,
     ) -> bool {
+        self._recheck_after_external_clean_filter_with_timeout(
+            workdir, path, full_path, expected, timeout,
+        ) == CleanRecheck::Match
+    }
+
+    fn _recheck_after_external_clean_filter_with_timeout(
+        &self,
+        workdir: &Path,
+        path: &Path,
+        full_path: &Path,
+        expected: Oid,
+        timeout: std::time::Duration,
+    ) -> CleanRecheck {
         let Some(filter_name) = self._external_clean_filter_name(path) else {
-            return false;
+            return CleanRecheck::Unverifiable;
         };
-        self._matches_after_clean_conversion_with_timeout(
+        self._recheck_after_clean_conversion_with_timeout(
             workdir,
             path,
             full_path,
@@ -1218,10 +1343,21 @@ impl RepoProcessor {
         full_path: &Path,
         expected: Oid,
     ) -> bool {
+        self._recheck_after_builtin_conversion(workdir, path, full_path, expected)
+            == CleanRecheck::Match
+    }
+
+    fn _recheck_after_builtin_conversion(
+        &self,
+        workdir: &Path,
+        path: &Path,
+        full_path: &Path,
+        expected: Oid,
+    ) -> CleanRecheck {
         if !self._builtin_conversion_may_apply(path) {
-            return false;
+            return CleanRecheck::Mismatch;
         }
-        self._matches_after_clean_conversion_with_timeout(
+        self._recheck_after_clean_conversion_with_timeout(
             workdir,
             path,
             full_path,
@@ -1264,7 +1400,7 @@ impl RepoProcessor {
         false
     }
 
-    fn _matches_after_clean_conversion_with_timeout(
+    fn _recheck_after_clean_conversion_with_timeout(
         &self,
         workdir: &Path,
         path: &Path,
@@ -1272,7 +1408,7 @@ impl RepoProcessor {
         expected: Oid,
         timeout: std::time::Duration,
         conversion: &str,
-    ) -> bool {
+    ) -> CleanRecheck {
         Logger::info(format!(
             "Re-checking {} in {} through git hash-object so {} is applied",
             path.display(),
@@ -1301,7 +1437,7 @@ impl RepoProcessor {
                     conversion,
                     e
                 ));
-                return false;
+                return CleanRecheck::Unverifiable;
             }
         };
         let pgid = child.id() as libc::pid_t;
@@ -1317,7 +1453,7 @@ impl RepoProcessor {
                     self.config.name,
                     conversion
                 ));
-                return false;
+                return CleanRecheck::Unverifiable;
             }
         };
         let deadline = std::time::Instant::now() + timeout;
@@ -1337,7 +1473,7 @@ impl RepoProcessor {
                         ));
                         let drain_deadline = pipe_drain_deadline();
                         let _ = drains.finish(drain_deadline, pgid);
-                        return false;
+                        return CleanRecheck::Unverifiable;
                     }
                     drains.poll_ready(std::time::Duration::from_millis(10));
                 }
@@ -1354,7 +1490,7 @@ impl RepoProcessor {
                     ));
                     let drain_deadline = pipe_drain_deadline();
                     let _ = drains.finish(drain_deadline, pgid);
-                    return false;
+                    return CleanRecheck::Unverifiable;
                 }
             }
         };
@@ -1366,7 +1502,7 @@ impl RepoProcessor {
                 self.config.name,
                 conversion
             ));
-            return false;
+            return CleanRecheck::Unverifiable;
         }
         let stdout = std::mem::take(&mut drains.stdout.buf);
         let stderr = std::mem::take(&mut drains.stderr.buf);
@@ -1379,20 +1515,37 @@ impl RepoProcessor {
                 conversion,
                 String::from_utf8_lossy(&stderr).trim()
             ));
-            return false;
+            return CleanRecheck::Unverifiable;
         }
         let text = String::from_utf8_lossy(&stdout);
         match Oid::from_str(text.trim()) {
             Ok(external_id) => {
-                if external_id != expected {
-                    Logger::warn(format!(
-                        "Re-checking {} in {} through {} still produced a different hash than the index; treating it as changed",
-                        path.display(),
-                        self.config.name,
-                        conversion
-                    ));
+                if external_id == expected {
+                    CleanRecheck::Match
+                } else {
+                    let stderr_text = String::from_utf8_lossy(&stderr);
+                    let filter_failed = stderr_text.lines().any(|line| {
+                        line.starts_with("error: external filter '") && line.contains("failed")
+                    });
+                    if filter_failed {
+                        Logger::error(format!(
+                            "git hash-object for {} in {} reported that {} failed, so the hash it returned is of the unfiltered content and cannot be compared with the index; treating it as unverifiable rather than as a change: {}",
+                            path.display(),
+                            self.config.name,
+                            conversion,
+                            stderr_text.trim()
+                        ));
+                        CleanRecheck::Unverifiable
+                    } else {
+                        Logger::warn(format!(
+                            "Re-checking {} in {} through {} still produced a different hash than the index; treating it as changed",
+                            path.display(),
+                            self.config.name,
+                            conversion
+                        ));
+                        CleanRecheck::Mismatch
+                    }
                 }
-                external_id == expected
             }
             Err(e) => {
                 Logger::error(format!(
@@ -1402,7 +1555,7 @@ impl RepoProcessor {
                     conversion,
                     e
                 ));
-                false
+                CleanRecheck::Unverifiable
             }
         }
     }
@@ -3070,7 +3223,7 @@ mod tests {
 
         let processor = processor_for(&watched_path);
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("src/main.rs")]
         );
         let err = processor.update_from_remote().unwrap_err();
@@ -3095,7 +3248,7 @@ mod tests {
 
         let processor = processor_for(&watched_path);
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("src/main.rs")]
         );
         let err = processor.update_from_remote().unwrap_err();
@@ -3142,7 +3295,7 @@ mod tests {
         set_index_flag(&watched_path, "--skip-worktree", "src/main.rs");
 
         let processor = processor_for(&watched_path);
-        assert!(processor._tracked_local_changes().unwrap().is_empty());
+        assert!(processor._tracked_local_changes().unwrap().changes.is_empty());
         processor.update_from_remote().unwrap();
         drop(processor);
 
@@ -3365,7 +3518,7 @@ mod tests {
         }
 
         let processor = processor_for(&watched_path);
-        assert!(processor._tracked_local_changes().unwrap().is_empty());
+        assert!(processor._tracked_local_changes().unwrap().changes.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3382,7 +3535,7 @@ mod tests {
 
         let processor = processor_for(&watched_path);
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("src/main.rs")]
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -3411,7 +3564,7 @@ mod tests {
 
         let processor = processor_for(&watched_path);
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("src/main.rs")]
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -3447,7 +3600,7 @@ mod tests {
 
         let processor = processor_for(&watched_path);
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("link.txt")]
         );
         let err = processor.update_from_remote().unwrap_err();
@@ -3488,7 +3641,7 @@ mod tests {
         set_index_flag(&watched_path, "--skip-worktree", "data.txt");
 
         let processor = processor_for(&watched_path);
-        assert!(processor._tracked_local_changes().unwrap().is_empty());
+        assert!(processor._tracked_local_changes().unwrap().changes.is_empty());
         processor.update_from_remote().unwrap();
         drop(processor);
 
@@ -3531,7 +3684,7 @@ mod tests {
         set_index_flag(&watched_path, "--skip-worktree", "data.txt");
 
         let processor = processor_for(&watched_path);
-        assert!(processor._tracked_local_changes().unwrap().is_empty());
+        assert!(processor._tracked_local_changes().unwrap().changes.is_empty());
         processor.update_from_remote().unwrap();
         drop(processor);
 
@@ -3575,7 +3728,7 @@ mod tests {
 
         let processor = processor_for(&watched_path);
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("data.txt")]
         );
         let err = processor.update_from_remote().unwrap_err();
@@ -3627,7 +3780,7 @@ mod tests {
             external_filter_repo("external-filter-clean", "version two\n");
         std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
         let processor = processor_for(&watched_path);
-        assert!(processor._tracked_local_changes().unwrap().is_empty());
+        assert!(processor._tracked_local_changes().unwrap().changes.is_empty());
         processor.update_from_remote().unwrap();
         drop(processor);
         let watched = git2::Repository::open(&watched_path).unwrap();
@@ -3647,7 +3800,7 @@ mod tests {
         std::fs::write(watched_path.join("data.txt"), "Xgoodbye\n").unwrap();
         let processor = processor_for(&watched_path);
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("data.txt")]
         );
         let err = processor.update_from_remote().unwrap_err();
@@ -3664,6 +3817,160 @@ mod tests {
     }
 
     #[test]
+    fn external_clean_filter_recheck_distinguishes_mismatch_from_unverifiable() {
+        let (root, watched_path, _v1, _v2) =
+            external_filter_repo("external-filter-tristate", "version two\n");
+        let repo = git2::Repository::open(&watched_path).unwrap();
+        let mut index = repo.index().unwrap();
+        index.read(true).unwrap();
+        let entry_id = index.get_path(Path::new("data.txt"), 0).unwrap().id;
+        drop(index);
+        drop(repo);
+        let processor = processor_for(&watched_path);
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        assert_eq!(
+            processor._recheck_after_external_clean_filter_with_timeout(
+                &watched_path,
+                Path::new("data.txt"),
+                &watched_path.join("data.txt"),
+                entry_id,
+                std::time::Duration::from_secs(30)
+            ),
+            CleanRecheck::Match
+        );
+        std::fs::write(watched_path.join("data.txt"), "Xgoodbye\n").unwrap();
+        assert_eq!(
+            processor._recheck_after_external_clean_filter_with_timeout(
+                &watched_path,
+                Path::new("data.txt"),
+                &watched_path.join("data.txt"),
+                entry_id,
+                std::time::Duration::from_secs(30)
+            ),
+            CleanRecheck::Mismatch
+        );
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        assert_eq!(
+            processor._recheck_after_external_clean_filter_with_timeout(
+                &watched_path,
+                Path::new("data.txt"),
+                &watched_path.join("data.txt"),
+                entry_id,
+                std::time::Duration::from_secs(30)
+            ),
+            CleanRecheck::Unverifiable
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn file_whose_external_clean_filter_fails_is_unverifiable_not_a_local_change() {
+        let (root, watched_path, v1, _v2) =
+            external_filter_repo("external-filter-broken", "version two\n");
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        let processor = processor_for(&watched_path);
+        let tracked = processor._tracked_local_changes().unwrap();
+        assert!(tracked.changes.is_empty());
+        assert_eq!(tracked.unverifiable, vec![PathBuf::from("data.txt")]);
+        let err = processor.update_from_remote().unwrap_err();
+        let message = format!("{:?}", err);
+        assert!(
+            message.contains("could not be checked against their clean conversion"),
+            "{}",
+            message
+        );
+        assert!(message.contains("data.txt"), "{}", message);
+        assert!(
+            !message.contains("local changes to tracked files"),
+            "{}",
+            message
+        );
+        assert!(
+            !message.contains("Stash the work"),
+            "{}",
+            message
+        );
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"Xhello\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unverifiable_and_changed_files_are_named_separately_in_the_refusal() {
+        let (root, watched_path, v1, _v2) =
+            external_filter_repo("external-filter-mixed", "version two\n");
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        std::fs::write(
+            watched_path.join("src/main.rs"),
+            "fn main() { println!(\"edited\"); }\n",
+        )
+        .unwrap();
+        let processor = processor_for(&watched_path);
+        let tracked = processor._tracked_local_changes().unwrap();
+        assert_eq!(tracked.changes, vec![PathBuf::from("src/main.rs")]);
+        assert_eq!(tracked.unverifiable, vec![PathBuf::from("data.txt")]);
+        let err = processor.update_from_remote().unwrap_err();
+        let message = format!("{:?}", err);
+        assert!(
+            message.contains("local changes to tracked files (src/main.rs)"),
+            "{}",
+            message
+        );
+        assert!(
+            message.contains("could not be checked against their clean conversion"),
+            "{}",
+            message
+        );
+        assert!(message.contains("data.txt"), "{}", message);
+        assert!(message.contains("Stash the work"), "{}", message);
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_refusal_names_an_unverifiable_file_without_calling_it_a_local_change() {
+        let (root, watched_path, _v1, v2) =
+            external_filter_repo("external-filter-build-refusal", "version two\n");
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v2).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        std::fs::write(watched_path.join("data.txt"), "Xversion two\n").unwrap();
+        let mut processor = processor_for(&watched_path);
+        processor.config.out_dir = Some("dist-out".to_string());
+        let err = processor.update_from_remote().unwrap_err();
+        let message = format!("{:?}", err);
+        assert!(message.contains("Refusing to build"), "{}", message);
+        assert!(
+            message.contains("could not be checked against their clean conversion"),
+            "{}",
+            message
+        );
+        assert!(
+            !message.contains("local changes to tracked files"),
+            "{}",
+            message
+        );
+        assert!(!message.contains("Stash the work"), "{}", message);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn file_with_a_mode_change_after_an_external_clean_filter_still_refuses_fast_forward() {
         let (root, watched_path, v1, _v2) =
             external_filter_repo("external-filter-mode", "version two\n");
@@ -3676,7 +3983,7 @@ mod tests {
         .unwrap();
         let processor = processor_for(&watched_path);
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("data.txt")]
         );
         let err = processor.update_from_remote().unwrap_err();
@@ -3702,7 +4009,7 @@ mod tests {
         assert!(status.success());
         let processor = processor_for(&watched_path);
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("data.txt")]
         );
         let err = processor.update_from_remote().unwrap_err();
@@ -3755,7 +4062,7 @@ mod tests {
         set_repo_config(&watched_path, "core.autocrlf", "true");
         std::fs::write(watched_path.join("data.txt"), b"hello\r\n").unwrap();
         let processor = processor_for(&watched_path);
-        assert!(processor._tracked_local_changes().unwrap().is_empty());
+        assert!(processor._tracked_local_changes().unwrap().changes.is_empty());
         processor.update_from_remote().unwrap();
         drop(processor);
         let watched = git2::Repository::open(&watched_path).unwrap();
@@ -3778,7 +4085,7 @@ mod tests {
         );
         std::fs::write(watched_path.join("data.txt"), b"hello\r\n").unwrap();
         let processor = processor_for(&watched_path);
-        assert!(processor._tracked_local_changes().unwrap().is_empty());
+        assert!(processor._tracked_local_changes().unwrap().changes.is_empty());
         processor.update_from_remote().unwrap();
         drop(processor);
         let watched = git2::Repository::open(&watched_path).unwrap();
@@ -3798,7 +4105,7 @@ mod tests {
         set_repo_config(&watched_path, "core.autocrlf", "input");
         std::fs::write(watched_path.join("data.txt"), b"hello\r\n").unwrap();
         let processor = processor_for(&watched_path);
-        assert!(processor._tracked_local_changes().unwrap().is_empty());
+        assert!(processor._tracked_local_changes().unwrap().changes.is_empty());
         processor.update_from_remote().unwrap();
         drop(processor);
         let watched = git2::Repository::open(&watched_path).unwrap();
@@ -3821,7 +4128,7 @@ mod tests {
         );
         std::fs::write(watched_path.join("data.txt"), b"hello\r\n").unwrap();
         let processor = processor_for(&watched_path);
-        assert!(processor._tracked_local_changes().unwrap().is_empty());
+        assert!(processor._tracked_local_changes().unwrap().changes.is_empty());
         processor.update_from_remote().unwrap();
         drop(processor);
         let watched = git2::Repository::open(&watched_path).unwrap();
@@ -3842,7 +4149,7 @@ mod tests {
         std::fs::write(watched_path.join("data.txt"), b"goodbye\r\n").unwrap();
         let processor = processor_for(&watched_path);
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("data.txt")]
         );
         let err = processor.update_from_remote().unwrap_err();
@@ -3868,7 +4175,7 @@ mod tests {
         );
         std::fs::write(watched_path.join("data.txt"), b"hello\n").unwrap();
         let processor = processor_for(&watched_path);
-        assert!(processor._tracked_local_changes().unwrap().is_empty());
+        assert!(processor._tracked_local_changes().unwrap().changes.is_empty());
         processor.update_from_remote().unwrap();
         drop(processor);
         let watched = git2::Repository::open(&watched_path).unwrap();
@@ -3953,7 +4260,7 @@ mod tests {
         assert!(status.success());
         let processor = processor_for(&watched_path);
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("new.txt")]
         );
         processor.update_from_remote().unwrap();
@@ -4631,7 +4938,7 @@ mod tests {
 
         let processor = processor_for(&watched_path);
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("src/main.rs")]
         );
         let err = processor.update_from_remote().unwrap_err();
@@ -4653,7 +4960,7 @@ mod tests {
 
         let processor = processor_for(&watched_path);
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("keep.txt")]
         );
         processor.update_from_remote().unwrap();
@@ -4681,7 +4988,7 @@ mod tests {
 
         let processor = processor_for(&watched_path);
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("src/main.rs")]
         );
         let err = processor.update_from_remote().unwrap_err();
@@ -4704,7 +5011,7 @@ mod tests {
 
         let processor = processor_for(&watched_path);
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("src/main.rs")]
         );
         let err = processor.update_from_remote().unwrap_err();
@@ -4731,7 +5038,7 @@ mod tests {
 
         let processor = processor_for(&watched_path);
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("src/main.rs")]
         );
         let err = processor.update_from_remote().unwrap_err();
@@ -8224,7 +8531,7 @@ mod tests {
 
         let processor = processor_with_tracker(&watched_path, failed_builds.clone());
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("keep.txt")]
         );
         let err = processor.update_from_remote().unwrap_err();
@@ -8318,7 +8625,7 @@ mod tests {
 
         let mut processor = processor_for(&watched_path);
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("keep.txt")]
         );
         processor.config.out_dir = Some("dist-out".to_string());
@@ -8891,7 +9198,7 @@ mod tests {
             failed_restarts.clone(),
         );
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("keep.txt")]
         );
         let err = processor.update_from_remote().unwrap_err();
