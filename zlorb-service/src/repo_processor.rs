@@ -1373,15 +1373,23 @@ impl RepoProcessor {
         let mut whole_tree_refused = false;
         let (restore_paths, preserved_paths) = match &changed_paths {
             Some(paths) => {
-                let (safe, preserved) =
+                let (safe, preserved, classification_failed) =
                     self._rollback_restore_paths(local_oid, fetch_oid, paths);
                 for path in &preserved {
-                    Logger::error(format!(
-                        "Preserving local changes to {} in {} during rollback: the file changed after the update was checked and matches neither the rolled-back commit nor the fetched commit, so it is not being restored and the working tree is left diverged from {}",
-                        path.display(),
-                        self.config.name,
-                        local_oid
-                    ));
+                    if classification_failed {
+                        Logger::error(format!(
+                            "Preserving {} in {} during rollback: the changed paths could not be classified because a commit, tree, or the working directory could not be loaded, so it is not being restored",
+                            path.display(),
+                            self.config.name
+                        ));
+                    } else {
+                        Logger::error(format!(
+                            "Preserving local changes to {} in {} during rollback: the file changed after the update was checked and matches neither the rolled-back commit nor the fetched commit, so it is not being restored and the working tree is left diverged from {}",
+                            path.display(),
+                            self.config.name,
+                            local_oid
+                        ));
+                    }
                 }
                 (Some(safe), preserved)
             }
@@ -1652,19 +1660,68 @@ impl RepoProcessor {
         local_oid: Oid,
         fetch_oid: Oid,
         changed_paths: &[PathBuf],
-    ) -> (Vec<PathBuf>, Vec<PathBuf>) {
-        let (Ok(local_commit), Ok(fetch_commit)) = (
-            self.repo.find_commit(local_oid),
-            self.repo.find_commit(fetch_oid),
-        ) else {
-            return (Vec::new(), changed_paths.to_vec());
+    ) -> (Vec<PathBuf>, Vec<PathBuf>, bool) {
+        let mut load_failed = false;
+        let local_commit = match self.repo.find_commit(local_oid) {
+            Ok(commit) => Some(commit),
+            Err(e) => {
+                load_failed = true;
+                Logger::error(format!(
+                    "Could not load the current commit {} for {} to classify the changed paths, so every changed path is being preserved and none will be overwritten: {}",
+                    local_oid, self.config.name, e
+                ));
+                None
+            }
         };
-        let (Ok(local_tree), Ok(fetch_tree)) = (local_commit.tree(), fetch_commit.tree())
-        else {
-            return (Vec::new(), changed_paths.to_vec());
+        let fetch_commit = match self.repo.find_commit(fetch_oid) {
+            Ok(commit) => Some(commit),
+            Err(e) => {
+                load_failed = true;
+                Logger::error(format!(
+                    "Could not load the fetched commit {} for {} to classify the changed paths, so every changed path is being preserved and none will be overwritten: {}",
+                    fetch_oid, self.config.name, e
+                ));
+                None
+            }
         };
+        if load_failed {
+            return (Vec::new(), changed_paths.to_vec(), true);
+        }
+        let local_commit = local_commit.unwrap();
+        let fetch_commit = fetch_commit.unwrap();
+        let local_tree = match local_commit.tree() {
+            Ok(tree) => Some(tree),
+            Err(e) => {
+                load_failed = true;
+                Logger::error(format!(
+                    "Could not load the tree of the current commit {} for {} to classify the changed paths, so every changed path is being preserved and none will be overwritten: {}",
+                    local_oid, self.config.name, e
+                ));
+                None
+            }
+        };
+        let fetch_tree = match fetch_commit.tree() {
+            Ok(tree) => Some(tree),
+            Err(e) => {
+                load_failed = true;
+                Logger::error(format!(
+                    "Could not load the tree of the fetched commit {} for {} to classify the changed paths, so every changed path is being preserved and none will be overwritten: {}",
+                    fetch_oid, self.config.name, e
+                ));
+                None
+            }
+        };
+        if load_failed {
+            return (Vec::new(), changed_paths.to_vec(), true);
+        }
+        let local_tree = local_tree.unwrap();
+        let fetch_tree = fetch_tree.unwrap();
         let Some(workdir) = self.repo.workdir().map(|path| path.to_path_buf()) else {
-            return (Vec::new(), changed_paths.to_vec());
+            Logger::error(format!(
+                "{} has no working directory to classify the changed paths against, so every changed path is being preserved and none will be overwritten",
+                self.config.name
+            ));
+            return (Vec::new(), changed_paths.to_vec(), true);
         };
         let mut safe = Vec::new();
         let mut preserved = Vec::new();
@@ -1698,7 +1755,7 @@ impl RepoProcessor {
                 preserved.push(path.clone());
             }
         }
-        (safe, preserved)
+        (safe, preserved, false)
     }
 
     fn _rollback_scoped_fallback_paths(
@@ -2288,11 +2345,13 @@ impl RepoProcessor {
             if let Some(paths) = changed_paths {
                 let paths = match local_oid {
                     Some(local_oid) => {
-                        let (mut safe, classified) =
+                        let (mut safe, classified, classification_failed) =
                             self._rollback_restore_paths(local_oid, fetch_oid, paths);
                         let mut preserved = Vec::new();
                         for path in classified {
-                            if self._checkout_dir_is_safe(local_oid, fetch_oid, &path) {
+                            if !classification_failed
+                                && self._checkout_dir_is_safe(local_oid, fetch_oid, &path)
+                            {
                                 safe.push(path);
                             } else {
                                 preserved.push(path);
@@ -2300,11 +2359,26 @@ impl RepoProcessor {
                         }
                         if !preserved.is_empty() {
                             for path in &preserved {
-                                Logger::error(format!(
-                                    "Preserving local changes to {} in {} at checkout: the file changed after the update was checked and matches neither the current commit nor the fetched commit, so it is not being overwritten and the update is refused",
-                                    path.display(),
-                                    self.config.name
-                                ));
+                                if classification_failed {
+                                    Logger::error(format!(
+                                        "Preserving {} in {} at checkout: the changed paths could not be classified because a commit, tree, or the working directory could not be loaded, so it is not being overwritten and the update is refused",
+                                        path.display(),
+                                        self.config.name
+                                    ));
+                                } else {
+                                    Logger::error(format!(
+                                        "Preserving local changes to {} in {} at checkout: the file changed after the update was checked and matches neither the current commit nor the fetched commit, so it is not being overwritten and the update is refused",
+                                        path.display(),
+                                        self.config.name
+                                    ));
+                                }
+                            }
+                            if classification_failed {
+                                return Err(ZlorbError::Other(format!(
+                                    "Refusing to fast-forward {}: the changed paths ({}) could not be classified because a commit, tree, or the working directory could not be loaded, so no path is being overwritten by the checkout",
+                                    self.config.name,
+                                    display_paths(&preserved)
+                                )));
                             }
                             return Err(ZlorbError::Other(format!(
                                 "Refusing to fast-forward {}: local changes to tracked files ({}) would be overwritten by the checkout. Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch",
@@ -5182,7 +5256,7 @@ mod tests {
 
         let processor = processor_for(&watched_path);
         let changed = processor._changed_paths(v1, v2).unwrap();
-        let (safe, preserved) = processor._rollback_restore_paths(v1, v2, &changed);
+        let (safe, preserved, _) = processor._rollback_restore_paths(v1, v2, &changed);
         assert!(preserved.contains(&PathBuf::from("parent/thing")));
         assert!(preserved.contains(&PathBuf::from("parent/thing/a.txt")));
         assert!(!safe.contains(&PathBuf::from("parent/thing")));
@@ -5224,12 +5298,14 @@ mod tests {
         ];
 
         let processor = processor_for(&watched_path);
-        let (safe, preserved) = processor._rollback_restore_paths(v1, bogus, &changed);
+        let (safe, preserved, failed) = processor._rollback_restore_paths(v1, bogus, &changed);
         assert!(safe.is_empty());
         assert_eq!(preserved, changed);
-        let (safe, preserved) = processor._rollback_restore_paths(bogus, v2, &changed);
+        assert!(failed);
+        let (safe, preserved, failed) = processor._rollback_restore_paths(bogus, v2, &changed);
         assert!(safe.is_empty());
         assert_eq!(preserved, changed);
+        assert!(failed);
         drop(processor);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -5256,13 +5332,110 @@ mod tests {
         let processor = processor_for(&watched_path);
         assert!(processor.repo.find_commit(broken).is_ok());
         let changed = vec![PathBuf::from("src/main.rs")];
-        let (safe, preserved) = processor._rollback_restore_paths(broken, v1, &changed);
+        let (safe, preserved, failed) = processor._rollback_restore_paths(broken, v1, &changed);
         assert!(safe.is_empty());
         assert_eq!(preserved, changed);
-        let (safe, preserved) = processor._rollback_restore_paths(v1, broken, &changed);
+        assert!(failed);
+        let (safe, preserved, failed) = processor._rollback_restore_paths(v1, broken, &changed);
         assert!(safe.is_empty());
         assert_eq!(preserved, changed);
+        assert!(failed);
         drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_restore_paths_preserves_everything_when_the_repo_has_no_workdir() {
+        let root = temp_dir("rollback-restore-paths-no-workdir");
+        let source_path = root.join("source");
+        let bare_path = root.join("bare");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let source = git2::Repository::init_opts(&source_path, &init_opts).unwrap();
+        write_fixture_crate(&source_path, "fixture-version-one");
+        let v1 = commit_all(&source, "v1");
+        std::fs::write(source_path.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let v2 = commit_all(&source, "v2");
+        drop(source);
+        let status = std::process::Command::new("git")
+            .args(["clone", "--bare"])
+            .arg(&source_path)
+            .arg(&bare_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let bare = git2::Repository::open(&bare_path).unwrap();
+        assert!(bare.workdir().is_none());
+        assert!(bare.find_commit(v1).unwrap().tree().is_ok());
+        assert!(bare.find_commit(v2).unwrap().tree().is_ok());
+        drop(bare);
+
+        let processor = processor_for(&bare_path);
+        let changed = vec![PathBuf::from("src/main.rs")];
+        let (safe, preserved, failed) = processor._rollback_restore_paths(v1, v2, &changed);
+        assert!(safe.is_empty());
+        assert_eq!(preserved, changed);
+        assert!(failed);
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_refuses_with_a_classification_message_when_a_commit_cannot_be_loaded() {
+        let (root, watched_path, v1, v2) = two_file_repo("checkout-classification-failed");
+        let processor = processor_for(&watched_path);
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        let bogus = Oid::from_str("1111111111111111111111111111111111111111").unwrap();
+        match processor._checkout_and_get_ref(Some(v1), bogus, Some(&changed)) {
+            Ok(_) => panic!("checkout must refuse when classification cannot load a commit"),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("could not be classified"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("a.txt")).unwrap(),
+            "one-a\n"
+        );
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_does_not_promote_a_directory_when_classification_failed() {
+        let (root, watched_path, v1, v2) =
+            dir_to_file_repo_with_gitignore("checkout-dir-no-promotion-on-load-failure", "*.log\n");
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let odb = watched.odb().unwrap();
+        let broken = odb
+            .write(
+                git2::ObjectType::Commit,
+                b"tree 1111111111111111111111111111111111111111\nauthor A <a@a.invalid> 0 +0000\ncommitter A <a@a.invalid> 0 +0000\n\nbroken\n",
+            )
+            .unwrap();
+        drop(odb);
+        drop(watched);
+
+        let processor = processor_for(&watched_path);
+        assert!(processor._checkout_dir_is_safe(v1, broken, Path::new("thing")));
+        move_ref_to_v2(&processor, v2);
+        let changed = vec![PathBuf::from("thing")];
+        match processor._checkout_and_get_ref(Some(v1), broken, Some(&changed)) {
+            Ok(_) => panic!("checkout must refuse when classification cannot load a tree"),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("could not be classified"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        drop(processor);
+        assert!(watched_path.join("thing").is_dir());
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("thing/inner.txt")).unwrap(),
+            "inner\n"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -5282,11 +5455,11 @@ mod tests {
 
         let paths = vec![PathBuf::from("stable.txt")];
         let processor = processor_for(&watched_path);
-        let (safe, preserved) = processor._rollback_restore_paths(v1, v2, &paths);
+        let (safe, preserved, _) = processor._rollback_restore_paths(v1, v2, &paths);
         assert_eq!(safe, paths);
         assert!(preserved.is_empty());
         std::fs::write(watched_path.join("stable.txt"), "edited\n").unwrap();
-        let (safe, preserved) = processor._rollback_restore_paths(v1, v2, &paths);
+        let (safe, preserved, _) = processor._rollback_restore_paths(v1, v2, &paths);
         assert!(safe.is_empty());
         assert_eq!(preserved, paths);
         drop(processor);
@@ -5311,11 +5484,11 @@ mod tests {
 
         let paths = vec![PathBuf::from("sub")];
         let processor = processor_for(&watched_path);
-        let (safe, preserved) = processor._rollback_restore_paths(v1, v2, &paths);
+        let (safe, preserved, _) = processor._rollback_restore_paths(v1, v2, &paths);
         assert_eq!(safe, paths);
         assert!(preserved.is_empty());
         std::fs::write(watched_path.join("sub/extra.txt"), "extra\n").unwrap();
-        let (safe, preserved) = processor._rollback_restore_paths(v1, v2, &paths);
+        let (safe, preserved, _) = processor._rollback_restore_paths(v1, v2, &paths);
         assert!(safe.is_empty());
         assert_eq!(preserved, paths);
         drop(processor);
@@ -5342,11 +5515,11 @@ mod tests {
 
         let paths = vec![PathBuf::from("sub")];
         let processor = processor_for(&watched_path);
-        let (safe, preserved) = processor._rollback_restore_paths(v1, v2, &paths);
+        let (safe, preserved, _) = processor._rollback_restore_paths(v1, v2, &paths);
         assert_eq!(safe, paths);
         assert!(preserved.is_empty());
         std::fs::write(watched_path.join("sub/notes.txt"), "user notes\n").unwrap();
-        let (safe, preserved) = processor._rollback_restore_paths(v1, v2, &paths);
+        let (safe, preserved, _) = processor._rollback_restore_paths(v1, v2, &paths);
         assert!(safe.is_empty());
         assert_eq!(preserved, paths);
         drop(processor);
