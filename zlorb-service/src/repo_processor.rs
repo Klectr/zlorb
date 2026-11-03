@@ -4105,6 +4105,29 @@ mod tests {
     }
 
     #[test]
+    fn rollback_preserves_submodule_placeholder_with_an_ignored_file() {
+        let (root, watched_path, v1, v2, _sub_a, _sub_b) =
+            gitlink_fixture("rollback-gitlink-placeholder-ignored");
+        submodule_placeholder(&watched_path);
+        std::fs::write(
+            watched_path.join(".git/modules/sub/info/exclude"),
+            "data.db\n",
+        )
+        .unwrap();
+        std::fs::write(watched_path.join("sub/data.db"), "user data\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/data.db")).unwrap(),
+            "user data\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn rollback_preserves_submodule_placeholder_with_an_untracked_file() {
         let (root, watched_path, v1, v2, _sub_a, _sub_b) =
             gitlink_fixture("rollback-gitlink-placeholder-untracked");
