@@ -1585,7 +1585,7 @@ impl RepoProcessor {
         match git2::Repository::open(full_path) {
             Ok(sub_repo) => {
                 let Some(head) = sub_repo.head().ok().and_then(|head| head.target()) else {
-                    return false;
+                    return self._rollback_gitlink_is_submodule_placeholder(&sub_repo, full_path);
                 };
                 if head != expected {
                     return false;
@@ -1602,6 +1602,56 @@ impl RepoProcessor {
                 Err(_) => false,
             },
         }
+    }
+
+    fn _rollback_gitlink_is_submodule_placeholder(
+        &self,
+        sub_repo: &git2::Repository,
+        full_path: &Path,
+    ) -> bool {
+        if sub_repo.is_bare() {
+            return false;
+        }
+        let workdir_matches = match (sub_repo.workdir(), std::fs::canonicalize(full_path)) {
+            (Some(workdir), Ok(path)) => {
+                std::fs::canonicalize(workdir).map(|dir| dir == path).unwrap_or(false)
+            }
+            _ => false,
+        };
+        if !workdir_matches {
+            return false;
+        }
+        if !matches!(sub_repo.index(), Ok(index) if index.is_empty()) {
+            return false;
+        }
+        let Ok(gitdir) = std::fs::canonicalize(sub_repo.path()) else {
+            return false;
+        };
+        let Ok(modules_dir) = std::fs::canonicalize(self.repo.path().join("modules")) else {
+            return false;
+        };
+        if gitdir == modules_dir || !gitdir.starts_with(&modules_dir) {
+            return false;
+        }
+        let Ok(odb) = sub_repo.odb() else {
+            return false;
+        };
+        let object_count = std::cell::Cell::new(0usize);
+        let counted = odb
+            .foreach(|_| {
+                object_count.set(object_count.get() + 1);
+                true
+            })
+            .is_ok();
+        if !counted || object_count.get() != 0 {
+            return false;
+        }
+        let mut status_options = git2::StatusOptions::new();
+        status_options.include_untracked(true);
+        matches!(
+            sub_repo.statuses(Some(&mut status_options)),
+            Ok(statuses) if statuses.is_empty()
+        )
     }
 
     fn _rollback_dir_matches_tree(
@@ -3947,6 +3997,94 @@ mod tests {
             .map(|entry| entry.file_name())
             .collect();
         assert_eq!(names, vec![std::ffi::OsString::from(".git")]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn submodule_placeholder(watched_path: &Path) {
+        std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
+        let gitdir = watched_path.join(".git/modules/sub");
+        std::fs::create_dir_all(watched_path.join(".git/modules")).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-b", "master", "--separate-git-dir"])
+            .arg(&gitdir)
+            .arg(watched_path.join("sub"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn rollback_restores_submodule_placeholder_at_a_gitlink_path() {
+        let (root, watched_path, v1, v2, _sub_a, _sub_b) =
+            gitlink_fixture("rollback-gitlink-submodule-placeholder");
+        submodule_placeholder(&watched_path);
+        assert!(watched_path.join("sub/.git").is_file());
+
+        let processor = processor_for(&watched_path);
+        assert!(processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_submodule_placeholder_holding_an_object() {
+        let (root, watched_path, v1, v2, _sub_a, _sub_b) =
+            gitlink_fixture("rollback-gitlink-placeholder-with-object");
+        submodule_placeholder(&watched_path);
+        let placeholder = git2::Repository::open(watched_path.join("sub")).unwrap();
+        let blob = placeholder.blob(b"user object\n").unwrap();
+        drop(placeholder);
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        let placeholder = git2::Repository::open(watched_path.join("sub")).unwrap();
+        assert!(placeholder.find_blob(blob).is_ok());
+        drop(placeholder);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_submodule_placeholder_with_an_untracked_file() {
+        let (root, watched_path, v1, v2, _sub_a, _sub_b) =
+            gitlink_fixture("rollback-gitlink-placeholder-untracked");
+        submodule_placeholder(&watched_path);
+        std::fs::write(watched_path.join("sub/draft.txt"), "draft\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/draft.txt")).unwrap(),
+            "draft\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_submodule_placeholder_with_a_redirected_worktree() {
+        let (root, watched_path, v1, v2, _sub_a, _sub_b) =
+            gitlink_fixture("rollback-gitlink-placeholder-redirected-worktree");
+        submodule_placeholder(&watched_path);
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        set_repo_config(
+            &watched_path.join("sub"),
+            "core.worktree",
+            root.join("elsewhere").to_string_lossy().as_ref(),
+        );
+        std::fs::write(watched_path.join("sub/draft.txt"), "draft\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/draft.txt")).unwrap(),
+            "draft\n"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
