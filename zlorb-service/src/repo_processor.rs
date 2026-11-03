@@ -824,6 +824,7 @@ impl RepoProcessor {
             Some(paths) => tracked_changes
                 .into_iter()
                 .filter(|change| paths.contains(change))
+                .filter(|change| !self._path_is_skip_worktree_absent(change))
                 .collect(),
             None => tracked_changes,
         };
@@ -1373,7 +1374,7 @@ impl RepoProcessor {
         let mut whole_tree_refused = false;
         let (restore_paths, preserved_paths) = match &changed_paths {
             Some(paths) => {
-                let (safe, preserved, classification_failed) =
+                let (safe, preserved, _absent, classification_failed) =
                     self._rollback_restore_paths(local_oid, fetch_oid, paths);
                 for path in &preserved {
                     if classification_failed {
@@ -1660,7 +1661,7 @@ impl RepoProcessor {
         local_oid: Oid,
         fetch_oid: Oid,
         changed_paths: &[PathBuf],
-    ) -> (Vec<PathBuf>, Vec<PathBuf>, bool) {
+    ) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>, bool) {
         let mut load_failed = false;
         let local_commit = match self.repo.find_commit(local_oid) {
             Ok(commit) => Some(commit),
@@ -1685,7 +1686,7 @@ impl RepoProcessor {
             }
         };
         if load_failed {
-            return (Vec::new(), changed_paths.to_vec(), true);
+            return (Vec::new(), changed_paths.to_vec(), Vec::new(), true);
         }
         let local_commit = local_commit.unwrap();
         let fetch_commit = fetch_commit.unwrap();
@@ -1712,7 +1713,7 @@ impl RepoProcessor {
             }
         };
         if load_failed {
-            return (Vec::new(), changed_paths.to_vec(), true);
+            return (Vec::new(), changed_paths.to_vec(), Vec::new(), true);
         }
         let local_tree = local_tree.unwrap();
         let fetch_tree = fetch_tree.unwrap();
@@ -1721,10 +1722,11 @@ impl RepoProcessor {
                 "{} has no working directory to classify the changed paths against, so every changed path is being preserved and none will be overwritten",
                 self.config.name
             ));
-            return (Vec::new(), changed_paths.to_vec(), true);
+            return (Vec::new(), changed_paths.to_vec(), Vec::new(), true);
         };
         let mut safe = Vec::new();
         let mut preserved = Vec::new();
+        let mut absent = Vec::new();
         for path in changed_paths {
             if self._rollback_has_symlinked_ancestor(&workdir, path) {
                 preserved.push(path.clone());
@@ -1738,7 +1740,16 @@ impl RepoProcessor {
             let fetch_mode = fetch_entry.as_ref().map(|entry| entry.filemode());
             if std::fs::symlink_metadata(workdir.join(path)).is_err() {
                 if local_id.is_some() && fetch_id.is_some() {
-                    preserved.push(path.clone());
+                    if self._index_path_is_skip_worktree(path) {
+                        Logger::info(format!(
+                            "{} in {} is absent under skip-worktree or sparse checkout, so it is not a local deletion: the path is left absent and is not written",
+                            path.display(),
+                            self.config.name
+                        ));
+                        absent.push(path.clone());
+                    } else {
+                        preserved.push(path.clone());
+                    }
                 } else {
                     safe.push(path.clone());
                 }
@@ -1755,7 +1766,29 @@ impl RepoProcessor {
                 preserved.push(path.clone());
             }
         }
-        (safe, preserved, false)
+        (safe, preserved, absent, false)
+    }
+
+    fn _path_is_skip_worktree_absent(&self, path: &Path) -> bool {
+        let Some(workdir) = self.repo.workdir() else {
+            return false;
+        };
+        std::fs::symlink_metadata(workdir.join(path)).is_err()
+            && self._index_path_is_skip_worktree(path)
+    }
+
+    fn _index_path_is_skip_worktree(&self, path: &Path) -> bool {
+        let Ok(mut index) = self.repo.index() else {
+            return false;
+        };
+        if index.read(true).is_err() {
+            return false;
+        }
+        let Some(entry) = index.get_path(path, 0) else {
+            return false;
+        };
+        git2::IndexEntryExtendedFlag::from_bits_truncate(entry.flags_extended)
+            .is_skip_worktree()
     }
 
     fn _rollback_scoped_fallback_paths(
@@ -2355,7 +2388,7 @@ impl RepoProcessor {
             if let Some(paths) = changed_paths {
                 let paths = match local_oid {
                     Some(local_oid) => {
-                        let (mut safe, classified, classification_failed) =
+                        let (mut safe, classified, _absent, classification_failed) =
                             self._rollback_restore_paths(local_oid, fetch_oid, paths);
                         let mut preserved = Vec::new();
                         for path in classified {
@@ -2896,6 +2929,122 @@ mod tests {
                 .unwrap()
                 .contains("fixture-version-two")
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn skip_worktree_absent_file_does_not_block_fast_forward_and_stays_absent() {
+        let root = temp_dir("skip-worktree-absent");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        std::fs::write(upstream_path.join("data.txt"), "data-version-one\n").unwrap();
+        let v1 = commit_all(&upstream, "v1");
+        write_fixture_crate(&upstream_path, "fixture-version-two");
+        std::fs::write(upstream_path.join("data.txt"), "data-version-two\n").unwrap();
+        let v2 = commit_all(&upstream, "v2");
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v1).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        set_index_flag(&watched_path, "--skip-worktree", "data.txt");
+        std::fs::remove_file(watched_path.join("data.txt")).unwrap();
+
+        let processor = processor_for(&watched_path);
+        processor.update_from_remote().unwrap();
+        drop(processor);
+
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert!(!watched_path.join("data.txt").exists());
+        assert!(
+            std::fs::read_to_string(watched_path.join("src/main.rs"))
+                .unwrap()
+                .contains("fixture-version-two")
+        );
+
+        write_fixture_crate(&upstream_path, "fixture-version-three");
+        std::fs::write(upstream_path.join("data.txt"), "data-version-three\n").unwrap();
+        let v3 = commit_all(&upstream, "v3");
+        drop(upstream);
+
+        processor_for(&watched_path).update_from_remote().unwrap();
+
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v3);
+        drop(watched);
+        assert!(!watched_path.join("data.txt").exists());
+        assert!(
+            std::fs::read_to_string(watched_path.join("src/main.rs"))
+                .unwrap()
+                .contains("fixture-version-three")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_leaves_a_skip_worktree_absent_file_absent() {
+        let (root, watched_path, v1, v2) =
+            two_file_repo("rollback-skip-worktree-absent");
+        set_index_flag(&watched_path, "--skip-worktree", "b.txt");
+        std::fs::remove_file(watched_path.join("b.txt")).unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert!(!watched_path.join("b.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("a.txt")).unwrap(),
+            "one-a\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_restore_paths_classifies_skip_worktree_absence_as_absent() {
+        let (root, watched_path, v1, v2) =
+            two_file_repo("rollback-restore-paths-skip-worktree-absent");
+        set_index_flag(&watched_path, "--skip-worktree", "b.txt");
+        std::fs::remove_file(watched_path.join("b.txt")).unwrap();
+
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        let (safe, preserved, absent, failed) =
+            processor._rollback_restore_paths(v1, v2, &changed);
+        assert!(!failed);
+        assert_eq!(absent, vec![PathBuf::from("b.txt")]);
+        assert!(preserved.is_empty());
+        assert!(safe.contains(&PathBuf::from("a.txt")));
+        assert!(!safe.contains(&PathBuf::from("b.txt")));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_restore_paths_preserves_a_plain_deletion() {
+        let (root, watched_path, v1, v2) =
+            two_file_repo("rollback-restore-paths-plain-deletion");
+        std::fs::remove_file(watched_path.join("b.txt")).unwrap();
+
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        let (safe, preserved, absent, failed) =
+            processor._rollback_restore_paths(v1, v2, &changed);
+        assert!(!failed);
+        assert!(absent.is_empty());
+        assert_eq!(preserved, vec![PathBuf::from("b.txt")]);
+        assert!(safe.contains(&PathBuf::from("a.txt")));
+        drop(processor);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -5330,7 +5479,7 @@ mod tests {
 
         let processor = processor_for(&watched_path);
         let changed = processor._changed_paths(v1, v2).unwrap();
-        let (safe, preserved, _) = processor._rollback_restore_paths(v1, v2, &changed);
+        let (safe, preserved, _, _) = processor._rollback_restore_paths(v1, v2, &changed);
         assert!(preserved.contains(&PathBuf::from("parent/thing")));
         assert!(preserved.contains(&PathBuf::from("parent/thing/a.txt")));
         assert!(!safe.contains(&PathBuf::from("parent/thing")));
@@ -5372,11 +5521,11 @@ mod tests {
         ];
 
         let processor = processor_for(&watched_path);
-        let (safe, preserved, failed) = processor._rollback_restore_paths(v1, bogus, &changed);
+        let (safe, preserved, _, failed) = processor._rollback_restore_paths(v1, bogus, &changed);
         assert!(safe.is_empty());
         assert_eq!(preserved, changed);
         assert!(failed);
-        let (safe, preserved, failed) = processor._rollback_restore_paths(bogus, v2, &changed);
+        let (safe, preserved, _, failed) = processor._rollback_restore_paths(bogus, v2, &changed);
         assert!(safe.is_empty());
         assert_eq!(preserved, changed);
         assert!(failed);
@@ -5406,11 +5555,11 @@ mod tests {
         let processor = processor_for(&watched_path);
         assert!(processor.repo.find_commit(broken).is_ok());
         let changed = vec![PathBuf::from("src/main.rs")];
-        let (safe, preserved, failed) = processor._rollback_restore_paths(broken, v1, &changed);
+        let (safe, preserved, _, failed) = processor._rollback_restore_paths(broken, v1, &changed);
         assert!(safe.is_empty());
         assert_eq!(preserved, changed);
         assert!(failed);
-        let (safe, preserved, failed) = processor._rollback_restore_paths(v1, broken, &changed);
+        let (safe, preserved, _, failed) = processor._rollback_restore_paths(v1, broken, &changed);
         assert!(safe.is_empty());
         assert_eq!(preserved, changed);
         assert!(failed);
@@ -5446,7 +5595,7 @@ mod tests {
 
         let processor = processor_for(&bare_path);
         let changed = vec![PathBuf::from("src/main.rs")];
-        let (safe, preserved, failed) = processor._rollback_restore_paths(v1, v2, &changed);
+        let (safe, preserved, _, failed) = processor._rollback_restore_paths(v1, v2, &changed);
         assert!(safe.is_empty());
         assert_eq!(preserved, changed);
         assert!(failed);
@@ -5529,11 +5678,11 @@ mod tests {
 
         let paths = vec![PathBuf::from("stable.txt")];
         let processor = processor_for(&watched_path);
-        let (safe, preserved, _) = processor._rollback_restore_paths(v1, v2, &paths);
+        let (safe, preserved, _, _) = processor._rollback_restore_paths(v1, v2, &paths);
         assert_eq!(safe, paths);
         assert!(preserved.is_empty());
         std::fs::write(watched_path.join("stable.txt"), "edited\n").unwrap();
-        let (safe, preserved, _) = processor._rollback_restore_paths(v1, v2, &paths);
+        let (safe, preserved, _, _) = processor._rollback_restore_paths(v1, v2, &paths);
         assert!(safe.is_empty());
         assert_eq!(preserved, paths);
         drop(processor);
@@ -5558,11 +5707,11 @@ mod tests {
 
         let paths = vec![PathBuf::from("sub")];
         let processor = processor_for(&watched_path);
-        let (safe, preserved, _) = processor._rollback_restore_paths(v1, v2, &paths);
+        let (safe, preserved, _, _) = processor._rollback_restore_paths(v1, v2, &paths);
         assert_eq!(safe, paths);
         assert!(preserved.is_empty());
         std::fs::write(watched_path.join("sub/extra.txt"), "extra\n").unwrap();
-        let (safe, preserved, _) = processor._rollback_restore_paths(v1, v2, &paths);
+        let (safe, preserved, _, _) = processor._rollback_restore_paths(v1, v2, &paths);
         assert!(safe.is_empty());
         assert_eq!(preserved, paths);
         drop(processor);
@@ -5589,11 +5738,11 @@ mod tests {
 
         let paths = vec![PathBuf::from("sub")];
         let processor = processor_for(&watched_path);
-        let (safe, preserved, _) = processor._rollback_restore_paths(v1, v2, &paths);
+        let (safe, preserved, _, _) = processor._rollback_restore_paths(v1, v2, &paths);
         assert_eq!(safe, paths);
         assert!(preserved.is_empty());
         std::fs::write(watched_path.join("sub/notes.txt"), "user notes\n").unwrap();
-        let (safe, preserved, _) = processor._rollback_restore_paths(v1, v2, &paths);
+        let (safe, preserved, _, _) = processor._rollback_restore_paths(v1, v2, &paths);
         assert!(safe.is_empty());
         assert_eq!(preserved, paths);
         drop(processor);
