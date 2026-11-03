@@ -1478,23 +1478,18 @@ impl RepoProcessor {
     fn _rollback_gitlink_matches(&self, full_path: &Path, expected: Oid) -> bool {
         match git2::Repository::open(full_path) {
             Ok(sub_repo) => {
-                if let Some(head) = sub_repo.head().ok().and_then(|head| head.target()) {
-                    if head != expected {
-                        return false;
-                    }
-                    let mut status_options = git2::StatusOptions::new();
-                    status_options.include_untracked(true);
-                    return matches!(
-                        sub_repo.statuses(Some(&mut status_options)),
-                        Ok(statuses) if statuses.is_empty()
-                    );
+                let Some(head) = sub_repo.head().ok().and_then(|head| head.target()) else {
+                    return false;
+                };
+                if head != expected {
+                    return false;
                 }
-                match std::fs::read_dir(full_path) {
-                    Ok(entries) => entries
-                        .filter_map(|entry| entry.ok())
-                        .all(|entry| entry.file_name() == ".git"),
-                    Err(_) => false,
-                }
+                let mut status_options = git2::StatusOptions::new();
+                status_options.include_untracked(true);
+                matches!(
+                    sub_repo.statuses(Some(&mut status_options)),
+                    Ok(statuses) if statuses.is_empty()
+                )
             }
             Err(_) => match std::fs::read_dir(full_path) {
                 Ok(mut entries) => entries.next().is_none(),
@@ -3522,6 +3517,59 @@ mod tests {
             std::fs::read_to_string(watched_path.join("sub/draft.txt")).unwrap(),
             "draft\n"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_commitless_repo_holding_only_dot_git_at_a_gitlink_path() {
+        let (root, watched_path, v1, v2, _sub_a, _sub_b) =
+            gitlink_fixture("rollback-gitlink-commitless-only-dot-git");
+        std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let fresh = git2::Repository::init_opts(watched_path.join("sub"), &init_opts).unwrap();
+        drop(fresh);
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        let sub = git2::Repository::open(watched_path.join("sub")).unwrap();
+        assert!(sub.head().ok().and_then(|head| head.target()).is_none());
+        drop(sub);
+        let names: Vec<_> = std::fs::read_dir(watched_path.join("sub"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from(".git")]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_typechange_directory_holding_a_commitless_nested_gitlink() {
+        let (root, watched_path, v1, v2) =
+            nested_gitlink_fixture("rollback-nested-gitlink-commitless");
+        std::fs::remove_dir_all(watched_path.join("thing/sub")).unwrap();
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let fresh =
+            git2::Repository::init_opts(watched_path.join("thing/sub"), &init_opts).unwrap();
+        drop(fresh);
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        let sub = git2::Repository::open(watched_path.join("thing/sub")).unwrap();
+        assert!(sub.head().ok().and_then(|head| head.target()).is_none());
+        drop(sub);
+        let names: Vec<_> = std::fs::read_dir(watched_path.join("thing/sub"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from(".git")]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
