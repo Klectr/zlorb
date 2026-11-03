@@ -1290,7 +1290,7 @@ impl RepoProcessor {
                 Some((safe, preserved)) => {
                     for path in &preserved {
                         Logger::error(format!(
-                            "Preserving local changes to {} in {} during rollback: the path sits under a symlinked ancestor, so the scoped fallback restore is not writing through it and the working tree is left diverged from {}",
+                            "Preserving local changes to {} in {} during rollback: the path could not be certified as matching the rolled-back commit or the fetched commit, or it sits under a symlinked ancestor, so the scoped fallback restore is not writing to it and the working tree is left diverged from {}",
                             path.display(),
                             self.config.name,
                             local_oid
@@ -1461,8 +1461,31 @@ impl RepoProcessor {
         for path in paths {
             if self._rollback_has_symlinked_ancestor(&workdir, &path) {
                 preserved.push(path);
-            } else {
+                continue;
+            }
+            let local_entry = local_tree.get_path(&path).ok();
+            let fetch_entry = fetch_tree.get_path(&path).ok();
+            let local_id = local_entry.as_ref().map(|entry| entry.id());
+            let fetch_id = fetch_entry.as_ref().map(|entry| entry.id());
+            let local_mode = local_entry.as_ref().map(|entry| entry.filemode());
+            let fetch_mode = fetch_entry.as_ref().map(|entry| entry.filemode());
+            if std::fs::symlink_metadata(workdir.join(&path)).is_err() {
+                if local_id.is_some() && fetch_id.is_some() {
+                    preserved.push(path);
+                } else {
+                    safe.push(path);
+                }
+                continue;
+            }
+            if self._rollback_disk_matches(&workdir, &path, local_id, local_mode)
+                || self._rollback_disk_matches(&workdir, &path, fetch_id, fetch_mode)
+                || self._rollback_structured_matches(
+                    &workdir, &path, local_id, local_mode, fetch_id, fetch_mode,
+                )
+            {
                 safe.push(path);
+            } else {
+                preserved.push(path);
             }
         }
         Some((safe, preserved))
@@ -5032,6 +5055,131 @@ mod tests {
         assert!(safe.contains(&PathBuf::from("new.txt")));
         assert!(safe.contains(&PathBuf::from("src/main.rs")));
         assert!(preserved.is_empty());
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_scoped_fallback_preserves_a_path_matching_neither_tree() {
+        let root = temp_dir("rollback-fallback-neither-tree");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        let v1 = commit_all(&watched, "v1");
+        write_fixture_crate(&watched_path, "fixture-version-two");
+        let v2 = commit_all(&watched, "v2");
+        drop(watched);
+        std::fs::write(watched_path.join("src/main.rs"), "user edit\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        let (safe, preserved) = processor
+            ._rollback_scoped_fallback_paths(v1, v2)
+            .unwrap();
+        assert!(preserved.contains(&PathBuf::from("src/main.rs")));
+        assert!(!safe.contains(&PathBuf::from("src/main.rs")));
+        assert!(safe.contains(&PathBuf::from("Cargo.toml")));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_scoped_fallback_preserves_an_edited_path_identical_in_both_trees() {
+        let root = temp_dir("rollback-fallback-identical-edited");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        std::fs::write(watched_path.join("unchanged.txt"), "unchanged\n").unwrap();
+        let v1 = commit_all(&watched, "v1");
+        write_fixture_crate(&watched_path, "fixture-version-two");
+        let v2 = commit_all(&watched, "v2");
+        drop(watched);
+        std::fs::write(watched_path.join("unchanged.txt"), "user edit\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        let (safe, preserved) = processor
+            ._rollback_scoped_fallback_paths(v1, v2)
+            .unwrap();
+        assert!(preserved.contains(&PathBuf::from("unchanged.txt")));
+        assert!(!safe.contains(&PathBuf::from("unchanged.txt")));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_scoped_fallback_preserves_a_diverged_gitlink() {
+        let (root, watched_path, v1, v2, _sub_a, _sub_b) =
+            gitlink_fixture("rollback-fallback-gitlink-diverged");
+        let sub_path = watched_path.join("sub");
+        let sub = git2::Repository::open(&sub_path).unwrap();
+        std::fs::write(sub_path.join("sub.txt"), "sub three\n").unwrap();
+        commit_all(&sub, "sub c");
+        drop(sub);
+
+        let processor = processor_for(&watched_path);
+        let (safe, preserved) = processor
+            ._rollback_scoped_fallback_paths(v1, v2)
+            .unwrap();
+        assert!(preserved.contains(&PathBuf::from("sub")));
+        assert!(!safe.contains(&PathBuf::from("sub")));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_scoped_fallback_classifies_missing_paths_by_tree_membership() {
+        let root = temp_dir("rollback-fallback-missing");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        std::fs::write(watched_path.join("unchanged.txt"), "unchanged\n").unwrap();
+        let v1 = commit_all(&watched, "v1");
+        write_fixture_crate(&watched_path, "fixture-version-two");
+        std::fs::write(watched_path.join("new.txt"), "new in v2\n").unwrap();
+        let v2 = commit_all(&watched, "v2");
+        drop(watched);
+        std::fs::remove_file(watched_path.join("unchanged.txt")).unwrap();
+        std::fs::remove_file(watched_path.join("new.txt")).unwrap();
+
+        let processor = processor_for(&watched_path);
+        let (safe, preserved) = processor
+            ._rollback_scoped_fallback_paths(v1, v2)
+            .unwrap();
+        assert!(preserved.contains(&PathBuf::from("unchanged.txt")));
+        assert!(!safe.contains(&PathBuf::from("unchanged.txt")));
+        assert!(safe.contains(&PathBuf::from("new.txt")));
+        assert!(!preserved.contains(&PathBuf::from("new.txt")));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_scoped_fallback_preserves_a_retargeted_symlink_identical_in_both_trees() {
+        let root = temp_dir("rollback-fallback-symlink-retargeted");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        std::os::unix::fs::symlink("src/main.rs", watched_path.join("link.txt")).unwrap();
+        let v1 = commit_all(&watched, "v1");
+        write_fixture_crate(&watched_path, "fixture-version-two");
+        let v2 = commit_all(&watched, "v2");
+        drop(watched);
+        std::fs::remove_file(watched_path.join("link.txt")).unwrap();
+        std::os::unix::fs::symlink("Cargo.toml", watched_path.join("link.txt")).unwrap();
+
+        let processor = processor_for(&watched_path);
+        let (safe, preserved) = processor
+            ._rollback_scoped_fallback_paths(v1, v2)
+            .unwrap();
+        assert!(preserved.contains(&PathBuf::from("link.txt")));
+        assert!(!safe.contains(&PathBuf::from("link.txt")));
         drop(processor);
         let _ = std::fs::remove_dir_all(&root);
     }
