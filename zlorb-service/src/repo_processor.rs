@@ -1372,10 +1372,12 @@ impl RepoProcessor {
             }
         };
         let mut whole_tree_refused = false;
+        let mut absent_paths: Vec<PathBuf> = Vec::new();
         let (restore_paths, preserved_paths) = match &changed_paths {
             Some(paths) => {
-                let (safe, preserved, _absent, classification_failed) =
+                let (safe, preserved, absent, classification_failed) =
                     self._rollback_restore_paths(local_oid, fetch_oid, paths);
+                absent_paths = absent;
                 for path in &preserved {
                     if classification_failed {
                         Logger::error(format!(
@@ -1437,7 +1439,23 @@ impl RepoProcessor {
             Err(e) => Err(e),
         };
         match restore_result {
-            Ok(_) => tree_restored = preserved_paths.is_empty(),
+            Ok(_) => {
+                tree_restored = preserved_paths.is_empty();
+                if tree_restored && !absent_paths.is_empty() {
+                    if let Err(e) =
+                        self._advance_index_entries_to_tree(local_oid, &absent_paths)
+                    {
+                        Logger::error(format!(
+                            "Could not move the index entries of the absent skip-worktree paths ({}) in {} back to the rolled-back commit {}: {}",
+                            display_paths(&absent_paths),
+                            self.config.name,
+                            local_oid,
+                            e
+                        ));
+                        tree_restored = false;
+                    }
+                }
+            }
             Err(e) => {
                 Logger::error(format!(
                     "Failed to restore the working tree after a failed fast-forward: {}",
@@ -1775,6 +1793,47 @@ impl RepoProcessor {
         };
         std::fs::symlink_metadata(workdir.join(path)).is_err()
             && self._index_path_is_skip_worktree(path)
+    }
+
+    fn _advance_index_entries_to_tree(
+        &self,
+        oid: Oid,
+        paths: &[PathBuf],
+    ) -> Result<(), ZlorbError> {
+        let commit = self.repo.find_commit(oid).map_err(ZlorbError::Git)?;
+        let tree = commit.tree().map_err(ZlorbError::Git)?;
+        let mut index = self.repo.index().map_err(ZlorbError::Git)?;
+        for path in paths {
+            let Some(existing) = index.get_path(path, 0) else {
+                continue;
+            };
+            let mut entry = git2::IndexEntry {
+                ctime: existing.ctime,
+                mtime: existing.mtime,
+                dev: existing.dev,
+                ino: existing.ino,
+                mode: existing.mode,
+                uid: existing.uid,
+                gid: existing.gid,
+                file_size: existing.file_size,
+                id: existing.id,
+                flags: existing.flags,
+                flags_extended: existing.flags_extended,
+                path: existing.path.clone(),
+            };
+            match tree.get_path(path) {
+                Ok(tree_entry) => {
+                    entry.id = tree_entry.id();
+                    entry.mode = tree_entry.filemode() as u32;
+                    index.add(&entry).map_err(ZlorbError::Git)?;
+                }
+                Err(_) => {
+                    index.remove_path(path).map_err(ZlorbError::Git)?;
+                }
+            }
+        }
+        index.write().map_err(ZlorbError::Git)?;
+        Ok(())
     }
 
     fn _index_path_is_skip_worktree(&self, path: &Path) -> bool {
@@ -2385,11 +2444,13 @@ impl RepoProcessor {
             let mut checkout = git2::build::CheckoutBuilder::default();
             checkout.force();
             checkout.disable_pathspec_match(true);
+            let mut absent_paths: Vec<PathBuf> = Vec::new();
             if let Some(paths) = changed_paths {
                 let paths = match local_oid {
                     Some(local_oid) => {
-                        let (mut safe, classified, _absent, classification_failed) =
+                        let (mut safe, classified, absent, classification_failed) =
                             self._rollback_restore_paths(local_oid, fetch_oid, paths);
+                        absent_paths = absent;
                         let mut preserved = Vec::new();
                         for path in classified {
                             if !classification_failed
@@ -2445,6 +2506,18 @@ impl RepoProcessor {
             self.repo
                 .checkout_head(Some(&mut checkout))
                 .map_err(ZlorbError::Git)?;
+            if !absent_paths.is_empty() {
+                if let Err(e) = self._advance_index_entries_to_tree(fetch_oid, &absent_paths) {
+                    Logger::error(format!(
+                        "Could not advance the index entries of the absent skip-worktree paths ({}) in {} to the fetched commit {}: {}",
+                        display_paths(&absent_paths),
+                        self.config.name,
+                        fetch_oid,
+                        e
+                    ));
+                    return Err(e);
+                }
+            }
         }
 
         let remote_ref = self
@@ -2964,6 +3037,25 @@ mod tests {
 
         let watched = git2::Repository::open(&watched_path).unwrap();
         assert_eq!(head_oid(&watched), v2);
+        let v2_data_id = watched
+            .find_commit(v2)
+            .unwrap()
+            .tree()
+            .unwrap()
+            .get_path(Path::new("data.txt"))
+            .unwrap()
+            .id();
+        let index = watched.index().unwrap();
+        let entry = index.get_path(Path::new("data.txt"), 0).unwrap();
+        assert_eq!(entry.id, v2_data_id);
+        assert!(
+            git2::IndexEntryExtendedFlag::from_bits_truncate(entry.flags_extended)
+                .is_skip_worktree()
+        );
+        drop(index);
+        let status = watched.status_file(Path::new("data.txt")).unwrap();
+        assert!(!status.contains(git2::Status::INDEX_MODIFIED));
+        assert!(!status.contains(git2::Status::INDEX_NEW));
         drop(watched);
         assert!(!watched_path.join("data.txt").exists());
         assert!(
@@ -2997,9 +3089,55 @@ mod tests {
             two_file_repo("rollback-skip-worktree-absent");
         set_index_flag(&watched_path, "--skip-worktree", "b.txt");
         std::fs::remove_file(watched_path.join("b.txt")).unwrap();
+        let v1_b_id = {
+            let watched = git2::Repository::open(&watched_path).unwrap();
+            let v2_b_id = watched
+                .find_commit(v2)
+                .unwrap()
+                .tree()
+                .unwrap()
+                .get_path(Path::new("b.txt"))
+                .unwrap()
+                .id();
+            let v1_b_id = watched
+                .find_commit(v1)
+                .unwrap()
+                .tree()
+                .unwrap()
+                .get_path(Path::new("b.txt"))
+                .unwrap()
+                .id();
+            let mut index = watched.index().unwrap();
+            let existing = index.get_path(Path::new("b.txt"), 0).unwrap();
+            let entry = git2::IndexEntry {
+                ctime: existing.ctime,
+                mtime: existing.mtime,
+                dev: existing.dev,
+                ino: existing.ino,
+                mode: existing.mode,
+                uid: existing.uid,
+                gid: existing.gid,
+                file_size: existing.file_size,
+                id: v2_b_id,
+                flags: existing.flags,
+                flags_extended: existing.flags_extended,
+                path: existing.path.clone(),
+            };
+            index.add(&entry).unwrap();
+            index.write().unwrap();
+            v1_b_id
+        };
 
         let processor = processor_for(&watched_path);
         assert!(processor._rollback_fast_forward(v1, v2));
+        let index = processor.repo.index().unwrap();
+        let entry = index.get_path(Path::new("b.txt"), 0).unwrap();
+        assert_eq!(entry.id, v1_b_id);
+        assert!(
+            git2::IndexEntryExtendedFlag::from_bits_truncate(entry.flags_extended)
+                .is_skip_worktree()
+        );
+        drop(index);
         assert_eq!(head_oid(&processor.repo), v1);
         drop(processor);
         assert!(!watched_path.join("b.txt").exists());
