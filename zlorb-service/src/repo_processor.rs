@@ -1255,6 +1255,7 @@ impl RepoProcessor {
                 None
             }
         };
+        let mut whole_tree_refused = false;
         let (restore_paths, preserved_paths) = match &changed_paths {
             Some(paths) => {
                 let (safe, preserved) =
@@ -1269,7 +1270,27 @@ impl RepoProcessor {
                 }
                 (Some(safe), preserved)
             }
-            None => (None, Vec::new()),
+            None => match self._rollback_scoped_fallback_paths(local_oid) {
+                Some((safe, preserved)) => {
+                    for path in &preserved {
+                        Logger::error(format!(
+                            "Preserving local changes to {} in {} during rollback: the path sits under a symlinked ancestor, so the scoped fallback restore is not writing through it and the working tree is left diverged from {}",
+                            path.display(),
+                            self.config.name,
+                            local_oid
+                        ));
+                    }
+                    (Some(safe), preserved)
+                }
+                None => {
+                    whole_tree_refused = true;
+                    Logger::error(format!(
+                        "Refusing the fallback restore for {}: the paths changed by the update could not be computed and the rolled-back tree could not be enumerated, so no working-tree restore is being attempted and the working tree is left diverged from {}",
+                        self.config.name, local_oid
+                    ));
+                    (Some(Vec::new()), Vec::new())
+                }
+            },
         };
         let mut tree_restored = false;
         let restore_result = match self.repo.find_commit(local_oid) {
@@ -1299,6 +1320,9 @@ impl RepoProcessor {
                     e
                 ));
             }
+        }
+        if whole_tree_refused {
+            tree_restored = false;
         }
         let mut head_restored = !branch_restored;
         if branch_restored {
@@ -1333,14 +1357,14 @@ impl RepoProcessor {
             self.repo.find_commit(local_oid),
             self.repo.find_commit(fetch_oid),
         ) else {
-            return (changed_paths.to_vec(), Vec::new());
+            return (Vec::new(), changed_paths.to_vec());
         };
         let (Ok(local_tree), Ok(fetch_tree)) = (local_commit.tree(), fetch_commit.tree())
         else {
-            return (changed_paths.to_vec(), Vec::new());
+            return (Vec::new(), changed_paths.to_vec());
         };
         let Some(workdir) = self.repo.workdir().map(|path| path.to_path_buf()) else {
-            return (changed_paths.to_vec(), Vec::new());
+            return (Vec::new(), changed_paths.to_vec());
         };
         let mut safe = Vec::new();
         let mut preserved = Vec::new();
@@ -1379,6 +1403,37 @@ impl RepoProcessor {
             }
         }
         (safe, preserved)
+    }
+
+    fn _rollback_scoped_fallback_paths(
+        &self,
+        local_oid: Oid,
+    ) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
+        let workdir = self.repo.workdir()?.to_path_buf();
+        let tree = self.repo.find_commit(local_oid).ok()?.tree().ok()?;
+        let mut paths: Vec<PathBuf> = Vec::new();
+        let _ = tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+            if matches!(
+                entry.kind(),
+                Some(git2::ObjectType::Blob) | Some(git2::ObjectType::Commit)
+            ) {
+                paths.push(PathBuf::from(root).join(entry.name().unwrap_or_default()));
+            }
+            git2::TreeWalkResult::Ok
+        });
+        if paths.is_empty() {
+            return None;
+        }
+        let mut safe = Vec::new();
+        let mut preserved = Vec::new();
+        for path in paths {
+            if self._rollback_has_symlinked_ancestor(&workdir, &path) {
+                preserved.push(path);
+            } else {
+                safe.push(path);
+            }
+        }
+        Some((safe, preserved))
     }
 
     fn _rollback_has_symlinked_ancestor(&self, workdir: &Path, path: &Path) -> bool {
@@ -3573,6 +3628,113 @@ mod tests {
     }
 
     #[test]
+    fn rollback_restore_paths_preserves_everything_when_a_commit_cannot_be_loaded() {
+        let root = temp_dir("rollback-restore-paths-unloadable-commit");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        std::fs::create_dir_all(watched_path.join("parent/mid")).unwrap();
+        std::fs::write(watched_path.join("parent/mid/thing.txt"), "one\n").unwrap();
+        let v1 = commit_all(&watched, "v1");
+        std::fs::write(watched_path.join("parent/mid/thing.txt"), "two\n").unwrap();
+        let v2 = commit_all(&watched, "v2");
+        drop(watched);
+        let bogus = Oid::from_str("1111111111111111111111111111111111111111").unwrap();
+        let changed = vec![
+            PathBuf::from("src/main.rs"),
+            PathBuf::from("parent/mid/thing.txt"),
+        ];
+
+        let processor = processor_for(&watched_path);
+        let (safe, preserved) = processor._rollback_restore_paths(v1, bogus, &changed);
+        assert!(safe.is_empty());
+        assert_eq!(preserved, changed);
+        let (safe, preserved) = processor._rollback_restore_paths(bogus, v2, &changed);
+        assert!(safe.is_empty());
+        assert_eq!(preserved, changed);
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_restore_paths_preserves_everything_when_a_tree_cannot_be_loaded() {
+        let root = temp_dir("rollback-restore-paths-unloadable-tree");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        let v1 = commit_all(&watched, "v1");
+        let odb = watched.odb().unwrap();
+        let broken = odb
+            .write(
+                git2::ObjectType::Commit,
+                b"tree 1111111111111111111111111111111111111111\nauthor A <a@a.invalid> 0 +0000\ncommitter A <a@a.invalid> 0 +0000\n\nbroken\n",
+            )
+            .unwrap();
+        drop(odb);
+        drop(watched);
+
+        let processor = processor_for(&watched_path);
+        assert!(processor.repo.find_commit(broken).is_ok());
+        let changed = vec![PathBuf::from("src/main.rs")];
+        let (safe, preserved) = processor._rollback_restore_paths(broken, v1, &changed);
+        assert!(safe.is_empty());
+        assert_eq!(preserved, changed);
+        let (safe, preserved) = processor._rollback_restore_paths(v1, broken, &changed);
+        assert!(safe.is_empty());
+        assert_eq!(preserved, changed);
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_whole_tree_fallback_does_not_write_through_a_symlinked_ancestor() {
+        let root = temp_dir("rollback-whole-tree-fallback-symlink");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        std::fs::create_dir_all(watched_path.join("parent/mid")).unwrap();
+        std::fs::write(watched_path.join("parent/mid/thing.txt"), "one\n").unwrap();
+        let v1 = commit_all(&watched, "v1");
+        write_fixture_crate(&watched_path, "fixture-version-two");
+        std::fs::write(watched_path.join("parent/mid/thing.txt"), "two\n").unwrap();
+        let _v2 = commit_all(&watched, "v2");
+        drop(watched);
+        let outside_path = root.join("outside");
+        std::fs::create_dir_all(&outside_path).unwrap();
+        std::fs::write(outside_path.join("thing.txt"), "two\n").unwrap();
+        std::fs::remove_dir_all(watched_path.join("parent/mid")).unwrap();
+        std::os::unix::fs::symlink(&outside_path, watched_path.join("parent/mid")).unwrap();
+        let bogus = Oid::from_str("1111111111111111111111111111111111111111").unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, bogus));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert!(
+            std::fs::read_to_string(watched_path.join("src/main.rs"))
+                .unwrap()
+                .contains("fixture-version-one")
+        );
+        assert!(
+            std::fs::symlink_metadata(watched_path.join("parent/mid"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside_path.join("thing.txt")).unwrap(),
+            "two\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn rollback_preserves_typechange_directory_holding_a_symlinked_nested_gitlink() {
         let (root, watched_path, v1, v2) =
             nested_gitlink_fixture("rollback-nested-gitlink-symlink");
@@ -4417,6 +4579,47 @@ mod tests {
             "new file\n"
         );
         assert!(!watched_path.join("top.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_cleanup_skips_files_under_a_symlinked_ancestor_that_is_a_local_symlink_blob() {
+        let root = temp_dir("rollback-cleanup-symlink-blob-dir");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        let outside_path = root.join("outside");
+        std::fs::create_dir_all(&outside_path).unwrap();
+        std::fs::write(outside_path.join("a.txt"), "a\n").unwrap();
+        std::fs::write(outside_path.join("b.txt"), "other\n").unwrap();
+        std::os::unix::fs::symlink(&outside_path, watched_path.join("thing")).unwrap();
+        let v1 = commit_all(&watched, "v1");
+        std::fs::remove_file(watched_path.join("thing")).unwrap();
+        std::fs::create_dir_all(watched_path.join("thing")).unwrap();
+        std::fs::write(watched_path.join("thing/a.txt"), "a\n").unwrap();
+        std::fs::write(watched_path.join("thing/b.txt"), "b\n").unwrap();
+        let v2 = commit_all(&watched, "v2");
+        let v1_commit = watched.find_commit(v1).unwrap();
+        watched
+            .reset(v1_commit.as_object(), git2::ResetType::Mixed, None)
+            .unwrap();
+        drop(v1_commit);
+        drop(watched);
+        std::fs::remove_dir_all(watched_path.join("thing")).unwrap();
+        std::os::unix::fs::symlink(&outside_path, watched_path.join("thing")).unwrap();
+
+        processor_for(&watched_path)._remove_partial_update_files(v1, v2);
+
+        assert_eq!(
+            std::fs::read_to_string(outside_path.join("a.txt")).unwrap(),
+            "a\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside_path.join("b.txt")).unwrap(),
+            "other\n"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
