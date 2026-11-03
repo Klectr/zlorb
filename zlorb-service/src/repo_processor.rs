@@ -1699,7 +1699,7 @@ impl RepoProcessor {
         let mut absent_paths: Vec<PathBuf> = Vec::new();
         let (restore_paths, preserved_paths) = match &changed_paths {
             Some(paths) => {
-                let (safe, preserved, absent, classification_failed) =
+                let (safe, mut preserved, absent, unverifiable, classification_failed) =
                     self._rollback_restore_paths(local_oid, fetch_oid, paths);
                 absent_paths = absent;
                 for path in &preserved {
@@ -1718,6 +1718,15 @@ impl RepoProcessor {
                         ));
                     }
                 }
+                for path in &unverifiable {
+                    Logger::error(format!(
+                        "Preserving {} in {} during rollback: the file could not be checked against its clean conversion in the daemon environment, so it is not being restored and the working tree is left diverged from {}",
+                        path.display(),
+                        self.config.name,
+                        local_oid
+                    ));
+                }
+                preserved.extend(unverifiable);
                 (Some(safe), preserved)
             }
             None => match self._rollback_scoped_fallback_paths(local_oid, fetch_oid) {
@@ -2003,7 +2012,7 @@ impl RepoProcessor {
         local_oid: Oid,
         fetch_oid: Oid,
         changed_paths: &[PathBuf],
-    ) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>, bool) {
+    ) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>, bool) {
         let mut load_failed = false;
         let local_commit = match self.repo.find_commit(local_oid) {
             Ok(commit) => Some(commit),
@@ -2028,7 +2037,7 @@ impl RepoProcessor {
             }
         };
         if load_failed {
-            return (Vec::new(), changed_paths.to_vec(), Vec::new(), true);
+            return (Vec::new(), changed_paths.to_vec(), Vec::new(), Vec::new(), true);
         }
         let local_commit = local_commit.unwrap();
         let fetch_commit = fetch_commit.unwrap();
@@ -2055,7 +2064,7 @@ impl RepoProcessor {
             }
         };
         if load_failed {
-            return (Vec::new(), changed_paths.to_vec(), Vec::new(), true);
+            return (Vec::new(), changed_paths.to_vec(), Vec::new(), Vec::new(), true);
         }
         let local_tree = local_tree.unwrap();
         let fetch_tree = fetch_tree.unwrap();
@@ -2064,11 +2073,12 @@ impl RepoProcessor {
                 "{} has no working directory to classify the changed paths against, so every changed path is being preserved and none will be overwritten",
                 self.config.name
             ));
-            return (Vec::new(), changed_paths.to_vec(), Vec::new(), true);
+            return (Vec::new(), changed_paths.to_vec(), Vec::new(), Vec::new(), true);
         };
         let mut safe = Vec::new();
         let mut preserved = Vec::new();
         let mut absent = Vec::new();
+        let mut unverifiable = Vec::new();
         for path in changed_paths {
             if self._rollback_has_symlinked_ancestor(&workdir, path) {
                 preserved.push(path.clone());
@@ -2097,18 +2107,29 @@ impl RepoProcessor {
                 }
                 continue;
             }
-            if self._rollback_disk_matches(&workdir, path, local_id, local_mode)
-                || self._rollback_disk_matches(&workdir, path, fetch_id, fetch_mode)
+            let local_recheck =
+                self._rollback_disk_recheck(&workdir, path, local_id, local_mode);
+            if local_recheck == CleanRecheck::Match {
+                safe.push(path.clone());
+                continue;
+            }
+            let fetch_recheck =
+                self._rollback_disk_recheck(&workdir, path, fetch_id, fetch_mode);
+            if fetch_recheck == CleanRecheck::Match
                 || self._rollback_structured_matches(
                     &workdir, path, local_id, local_mode, fetch_id, fetch_mode,
                 )
             {
                 safe.push(path.clone());
+            } else if local_recheck == CleanRecheck::Unverifiable
+                || fetch_recheck == CleanRecheck::Unverifiable
+            {
+                unverifiable.push(path.clone());
             } else {
                 preserved.push(path.clone());
             }
         }
-        (safe, preserved, absent, false)
+        (safe, preserved, absent, unverifiable, false)
     }
 
     fn _path_is_skip_worktree_absent(&self, path: &Path) -> bool {
@@ -2266,33 +2287,48 @@ impl RepoProcessor {
         entry_id: Option<Oid>,
         entry_mode: Option<i32>,
     ) -> bool {
+        self._rollback_disk_recheck(workdir, path, entry_id, entry_mode) == CleanRecheck::Match
+    }
+
+    fn _rollback_disk_recheck(
+        &self,
+        workdir: &Path,
+        path: &Path,
+        entry_id: Option<Oid>,
+        entry_mode: Option<i32>,
+    ) -> CleanRecheck {
         let Some(expected) = entry_id else {
-            return false;
+            return CleanRecheck::Mismatch;
         };
         let full_path = workdir.join(path);
         let Ok(metadata) = std::fs::symlink_metadata(&full_path) else {
-            return false;
+            return CleanRecheck::Mismatch;
         };
         let file_type = metadata.file_type();
         if file_type.is_symlink() {
             if entry_mode != Some(0o120000) {
-                return false;
+                return CleanRecheck::Mismatch;
             }
             let Ok(target) = std::fs::read_link(&full_path) else {
-                return false;
+                return CleanRecheck::Mismatch;
             };
             let target_bytes = {
                 use std::os::unix::ffi::OsStrExt;
                 target.as_os_str().as_bytes().to_vec()
             };
-            return Oid::hash_object(git2::ObjectType::Blob, &target_bytes).ok()
-                == Some(expected);
+            return if Oid::hash_object(git2::ObjectType::Blob, &target_bytes).ok()
+                == Some(expected)
+            {
+                CleanRecheck::Match
+            } else {
+                CleanRecheck::Mismatch
+            };
         }
         if !file_type.is_file() {
-            return false;
+            return CleanRecheck::Mismatch;
         }
         if !matches!(entry_mode, Some(0o100644) | Some(0o100755)) {
-            return false;
+            return CleanRecheck::Mismatch;
         }
         let file_mode = self
             .repo
@@ -2307,19 +2343,28 @@ impl RepoProcessor {
                 0o100644
             };
             if Some(disk_mode) != entry_mode {
-                return false;
+                return CleanRecheck::Mismatch;
             }
         }
         if let Ok(contents) = std::fs::read(&full_path) {
             if Oid::hash_object(git2::ObjectType::Blob, &contents).ok() == Some(expected)
             {
-                return true;
+                return CleanRecheck::Match;
             }
         }
         if self._rollback_filtered_disk_id(path, &full_path) == Some(expected) {
-            return true;
+            return CleanRecheck::Match;
         }
-        self._matches_after_external_clean_filter(workdir, path, &full_path, expected)
+        if self._external_clean_filter_name(path).is_none() {
+            return CleanRecheck::Mismatch;
+        }
+        self._recheck_after_external_clean_filter_with_timeout(
+            workdir,
+            path,
+            &full_path,
+            expected,
+            std::time::Duration::from_secs(30),
+        )
     }
 
     fn _rollback_structured_matches(
@@ -2772,7 +2817,7 @@ impl RepoProcessor {
             if let Some(paths) = changed_paths {
                 let paths = match local_oid {
                     Some(local_oid) => {
-                        let (mut safe, classified, absent, classification_failed) =
+                        let (mut safe, classified, absent, unverifiable, classification_failed) =
                             self._rollback_restore_paths(local_oid, fetch_oid, paths);
                         absent_paths = absent;
                         let mut preserved = Vec::new();
@@ -2785,7 +2830,7 @@ impl RepoProcessor {
                                 preserved.push(path);
                             }
                         }
-                        if !preserved.is_empty() {
+                        if !preserved.is_empty() || !unverifiable.is_empty() {
                             for path in &preserved {
                                 if classification_failed {
                                     Logger::error(format!(
@@ -2801,6 +2846,13 @@ impl RepoProcessor {
                                     ));
                                 }
                             }
+                            for path in &unverifiable {
+                                Logger::error(format!(
+                                    "Preserving {} in {} at checkout: the file could not be checked against its clean conversion in the daemon environment, so it is not being overwritten and the update is refused",
+                                    path.display(),
+                                    self.config.name
+                                ));
+                            }
                             if classification_failed {
                                 return Err(ZlorbError::Other(format!(
                                     "Refusing to fast-forward {}: the changed paths ({}) could not be classified because a commit, tree, or the working directory could not be loaded, so no path is being overwritten by the checkout",
@@ -2808,10 +2860,25 @@ impl RepoProcessor {
                                     display_paths(&preserved)
                                 )));
                             }
+                            if preserved.is_empty() {
+                                return Err(ZlorbError::Other(format!(
+                                    "Refusing to fast-forward {}: {}. The re-check errors above name the conversion that could not be applied; make it runnable by the daemon so these files can be verified",
+                                    self.config.name,
+                                    unverifiable_clause(&unverifiable)
+                                )));
+                            }
+                            if unverifiable.is_empty() {
+                                return Err(ZlorbError::Other(format!(
+                                    "Refusing to fast-forward {}: local changes to tracked files ({}) would be overwritten by the checkout. Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch",
+                                    self.config.name,
+                                    display_paths(&preserved)
+                                )));
+                            }
                             return Err(ZlorbError::Other(format!(
-                                "Refusing to fast-forward {}: local changes to tracked files ({}) would be overwritten by the checkout. Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch",
+                                "Refusing to fast-forward {}: local changes to tracked files ({}) would be overwritten by the checkout; {}. Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch; make the conversion named in the re-check errors above runnable by the daemon so the unverifiable files can be verified",
                                 self.config.name,
-                                display_paths(&preserved)
+                                display_paths(&preserved),
+                                unverifiable_clause(&unverifiable)
                             )));
                         }
                         safe
@@ -3481,7 +3548,7 @@ mod tests {
 
         let processor = processor_for(&watched_path);
         let changed = processor._changed_paths(v1, v2).unwrap();
-        let (safe, preserved, absent, failed) =
+        let (safe, preserved, absent, _, failed) =
             processor._rollback_restore_paths(v1, v2, &changed);
         assert!(!failed);
         assert_eq!(absent, vec![PathBuf::from("b.txt")]);
@@ -3500,13 +3567,143 @@ mod tests {
 
         let processor = processor_for(&watched_path);
         let changed = processor._changed_paths(v1, v2).unwrap();
-        let (safe, preserved, absent, failed) =
+        let (safe, preserved, absent, _, failed) =
             processor._rollback_restore_paths(v1, v2, &changed);
         assert!(!failed);
         assert!(absent.is_empty());
         assert_eq!(preserved, vec![PathBuf::from("b.txt")]);
         assert!(safe.contains(&PathBuf::from("a.txt")));
         drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_restore_paths_classifies_a_file_whose_external_clean_filter_fails_as_unverifiable() {
+        let (root, watched_path, v1, v2) =
+            external_filter_repo("classifier-unverifiable", "version two\n");
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        let (safe, preserved, absent, unverifiable, failed) =
+            processor._rollback_restore_paths(v1, v2, &changed);
+        assert!(!failed);
+        assert!(absent.is_empty());
+        assert!(preserved.is_empty());
+        assert_eq!(unverifiable, vec![PathBuf::from("data.txt")]);
+        assert!(safe.contains(&PathBuf::from("src/main.rs")));
+        assert!(!safe.contains(&PathBuf::from("data.txt")));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_restore_paths_classifies_a_file_changed_after_an_external_clean_filter_as_preserved() {
+        let (root, watched_path, v1, v2) =
+            external_filter_repo("classifier-preserved-on-mismatch", "version two\n");
+        std::fs::write(watched_path.join("data.txt"), "Xgoodbye\n").unwrap();
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        let (safe, preserved, _, unverifiable, failed) =
+            processor._rollback_restore_paths(v1, v2, &changed);
+        assert!(!failed);
+        assert_eq!(preserved, vec![PathBuf::from("data.txt")]);
+        assert!(unverifiable.is_empty());
+        assert!(safe.contains(&PathBuf::from("src/main.rs")));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_names_a_file_whose_external_clean_filter_fails_as_unverifiable() {
+        let (root, watched_path, v1, v2) =
+            external_filter_repo("checkout-unverifiable", "version two\n");
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        let processor = processor_for(&watched_path);
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        match processor._checkout_and_get_ref(Some(v1), v2, Some(&changed)) {
+            Ok(_) => panic!("checkout must refuse when a changed file cannot be verified"),
+            Err(e) => {
+                let message = format!("{:?}", e);
+                assert!(
+                    message.contains("could not be checked against their clean conversion"),
+                    "{}",
+                    message
+                );
+                assert!(message.contains("data.txt"), "{}", message);
+                assert!(
+                    !message.contains("local changes to tracked files"),
+                    "{}",
+                    message
+                );
+                assert!(!message.contains("Stash the work"), "{}", message);
+            }
+        }
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"Xhello\n"
+        );
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_names_preserved_and_unverifiable_files_separately() {
+        let (root, watched_path, v1, v2) =
+            external_filter_repo("checkout-mixed-preserved-unverifiable", "version two\n");
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        std::fs::write(
+            watched_path.join("src/main.rs"),
+            "fn main() { println!(\"edited\"); }\n",
+        )
+        .unwrap();
+        let processor = processor_for(&watched_path);
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        match processor._checkout_and_get_ref(Some(v1), v2, Some(&changed)) {
+            Ok(_) => panic!("checkout must refuse when a changed file cannot be verified"),
+            Err(e) => {
+                let message = format!("{:?}", e);
+                assert!(
+                    message.contains("local changes to tracked files (src/main.rs)"),
+                    "{}",
+                    message
+                );
+                assert!(
+                    message.contains("could not be checked against their clean conversion"),
+                    "{}",
+                    message
+                );
+                assert!(message.contains("data.txt"), "{}", message);
+                assert!(message.contains("Stash the work"), "{}", message);
+                assert!(message.contains("can be verified"), "{}", message);
+            }
+        }
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"Xhello\n"
+        );
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_a_file_whose_external_clean_filter_fails() {
+        let (root, watched_path, v1, v2) =
+            external_filter_repo("rollback-unverifiable", "version two\n");
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"Xhello\n"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -6594,7 +6791,7 @@ mod tests {
 
         let processor = processor_for(&watched_path);
         let changed = processor._changed_paths(v1, v2).unwrap();
-        let (safe, preserved, _, _) = processor._rollback_restore_paths(v1, v2, &changed);
+        let (safe, preserved, _, _, _) = processor._rollback_restore_paths(v1, v2, &changed);
         assert!(preserved.contains(&PathBuf::from("parent/thing")));
         assert!(preserved.contains(&PathBuf::from("parent/thing/a.txt")));
         assert!(!safe.contains(&PathBuf::from("parent/thing")));
@@ -6636,11 +6833,11 @@ mod tests {
         ];
 
         let processor = processor_for(&watched_path);
-        let (safe, preserved, _, failed) = processor._rollback_restore_paths(v1, bogus, &changed);
+        let (safe, preserved, _, _, failed) = processor._rollback_restore_paths(v1, bogus, &changed);
         assert!(safe.is_empty());
         assert_eq!(preserved, changed);
         assert!(failed);
-        let (safe, preserved, _, failed) = processor._rollback_restore_paths(bogus, v2, &changed);
+        let (safe, preserved, _, _, failed) = processor._rollback_restore_paths(bogus, v2, &changed);
         assert!(safe.is_empty());
         assert_eq!(preserved, changed);
         assert!(failed);
@@ -6670,11 +6867,11 @@ mod tests {
         let processor = processor_for(&watched_path);
         assert!(processor.repo.find_commit(broken).is_ok());
         let changed = vec![PathBuf::from("src/main.rs")];
-        let (safe, preserved, _, failed) = processor._rollback_restore_paths(broken, v1, &changed);
+        let (safe, preserved, _, _, failed) = processor._rollback_restore_paths(broken, v1, &changed);
         assert!(safe.is_empty());
         assert_eq!(preserved, changed);
         assert!(failed);
-        let (safe, preserved, _, failed) = processor._rollback_restore_paths(v1, broken, &changed);
+        let (safe, preserved, _, _, failed) = processor._rollback_restore_paths(v1, broken, &changed);
         assert!(safe.is_empty());
         assert_eq!(preserved, changed);
         assert!(failed);
@@ -6710,7 +6907,7 @@ mod tests {
 
         let processor = processor_for(&bare_path);
         let changed = vec![PathBuf::from("src/main.rs")];
-        let (safe, preserved, _, failed) = processor._rollback_restore_paths(v1, v2, &changed);
+        let (safe, preserved, _, _, failed) = processor._rollback_restore_paths(v1, v2, &changed);
         assert!(safe.is_empty());
         assert_eq!(preserved, changed);
         assert!(failed);
@@ -6793,11 +6990,11 @@ mod tests {
 
         let paths = vec![PathBuf::from("stable.txt")];
         let processor = processor_for(&watched_path);
-        let (safe, preserved, _, _) = processor._rollback_restore_paths(v1, v2, &paths);
+        let (safe, preserved, _, _, _) = processor._rollback_restore_paths(v1, v2, &paths);
         assert_eq!(safe, paths);
         assert!(preserved.is_empty());
         std::fs::write(watched_path.join("stable.txt"), "edited\n").unwrap();
-        let (safe, preserved, _, _) = processor._rollback_restore_paths(v1, v2, &paths);
+        let (safe, preserved, _, _, _) = processor._rollback_restore_paths(v1, v2, &paths);
         assert!(safe.is_empty());
         assert_eq!(preserved, paths);
         drop(processor);
@@ -6822,11 +7019,11 @@ mod tests {
 
         let paths = vec![PathBuf::from("sub")];
         let processor = processor_for(&watched_path);
-        let (safe, preserved, _, _) = processor._rollback_restore_paths(v1, v2, &paths);
+        let (safe, preserved, _, _, _) = processor._rollback_restore_paths(v1, v2, &paths);
         assert_eq!(safe, paths);
         assert!(preserved.is_empty());
         std::fs::write(watched_path.join("sub/extra.txt"), "extra\n").unwrap();
-        let (safe, preserved, _, _) = processor._rollback_restore_paths(v1, v2, &paths);
+        let (safe, preserved, _, _, _) = processor._rollback_restore_paths(v1, v2, &paths);
         assert!(safe.is_empty());
         assert_eq!(preserved, paths);
         drop(processor);
@@ -6853,11 +7050,11 @@ mod tests {
 
         let paths = vec![PathBuf::from("sub")];
         let processor = processor_for(&watched_path);
-        let (safe, preserved, _, _) = processor._rollback_restore_paths(v1, v2, &paths);
+        let (safe, preserved, _, _, _) = processor._rollback_restore_paths(v1, v2, &paths);
         assert_eq!(safe, paths);
         assert!(preserved.is_empty());
         std::fs::write(watched_path.join("sub/notes.txt"), "user notes\n").unwrap();
-        let (safe, preserved, _, _) = processor._rollback_restore_paths(v1, v2, &paths);
+        let (safe, preserved, _, _, _) = processor._rollback_restore_paths(v1, v2, &paths);
         assert!(safe.is_empty());
         assert_eq!(preserved, paths);
         drop(processor);
