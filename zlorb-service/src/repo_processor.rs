@@ -1019,8 +1019,11 @@ impl RepoProcessor {
                 return false;
             }
         }
-        self._matches_after_external_clean_filter(&workdir, path, &full_path, entry_id)
-            || self._matches_after_builtin_conversion(&workdir, path, &full_path, entry_id)
+        if self._external_clean_filter_name(path).is_some() {
+            self._matches_after_external_clean_filter(&workdir, path, &full_path, entry_id)
+        } else {
+            self._matches_after_builtin_conversion(&workdir, path, &full_path, entry_id)
+        }
     }
 
     fn _hidden_local_changes(&self, known: &[PathBuf]) -> Vec<PathBuf> {
@@ -1224,12 +1227,12 @@ impl RepoProcessor {
             full_path,
             expected,
             std::time::Duration::from_secs(30),
-            "the built-in text/eol/ident conversion",
+            "the built-in conversion (text/eol/ident/autocrlf)",
         )
     }
 
     fn _builtin_conversion_may_apply(&self, path: &Path) -> bool {
-        for attr in ["text", "eol", "ident", "working-tree-encoding"] {
+        for attr in ["text", "eol", "ident"] {
             let Ok(value) = self
                 .repo
                 .get_attr(path, attr, git2::AttrCheckFlags::FILE_THEN_INDEX)
@@ -1245,7 +1248,15 @@ impl RepoProcessor {
         }
         if let Ok(config) = self.repo.config() {
             if let Ok(autocrlf) = config.get_string("core.autocrlf") {
-                if matches!(autocrlf.trim(), "true" | "input") {
+                if matches!(
+                    autocrlf.trim().to_ascii_lowercase().as_str(),
+                    "true" | "yes" | "on" | "1" | "input" | ""
+                ) {
+                    return true;
+                }
+            }
+            if let Ok(autocrlf) = config.get_bool("core.autocrlf") {
+                if autocrlf {
                     return true;
                 }
             }
@@ -3708,7 +3719,6 @@ mod tests {
     }
 
 
-
     fn conversion_repo(label: &str, attrs: &str, v1_data: &[u8], v2_data: &[u8]) -> (PathBuf, PathBuf, Oid, Oid) {
         let root = temp_dir(label);
         let upstream_path = root.join("upstream");
@@ -3754,6 +3764,49 @@ mod tests {
         assert_eq!(
             std::fs::read(watched_path.join("data.txt")).unwrap(),
             b"version two\r\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn crlf_only_difference_with_bare_text_attribute_does_not_block_fast_forward() {
+        let (root, watched_path, _v1, v2) = conversion_repo(
+            "bare-text-clean",
+            "*.txt text\n",
+            b"hello\n",
+            b"version two\n",
+        );
+        std::fs::write(watched_path.join("data.txt"), b"hello\r\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert!(processor._tracked_local_changes().unwrap().is_empty());
+        processor.update_from_remote().unwrap();
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"version two\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn crlf_only_difference_with_autocrlf_input_does_not_block_fast_forward() {
+        let (root, watched_path, _v1, v2) =
+            conversion_repo("autocrlf-input-clean", "", b"hello\n", b"version two\n");
+        set_repo_config(&watched_path, "core.autocrlf", "input");
+        std::fs::write(watched_path.join("data.txt"), b"hello\r\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert!(processor._tracked_local_changes().unwrap().is_empty());
+        processor.update_from_remote().unwrap();
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"version two\n"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3806,14 +3859,14 @@ mod tests {
     }
 
     #[test]
-    fn crlf_only_difference_with_eol_crlf_does_not_block_fast_forward() {
+    fn lf_only_difference_with_eol_crlf_does_not_block_fast_forward() {
         let (root, watched_path, _v1, v2) = conversion_repo(
             "eol-crlf-clean",
             "*.txt text eol=crlf\n",
             b"hello\n",
             b"version two\n",
         );
-        std::fs::write(watched_path.join("data.txt"), b"hello\r\n").unwrap();
+        std::fs::write(watched_path.join("data.txt"), b"hello\n").unwrap();
         let processor = processor_for(&watched_path);
         assert!(processor._tracked_local_changes().unwrap().is_empty());
         processor.update_from_remote().unwrap();
@@ -3821,13 +3874,17 @@ mod tests {
         let watched = git2::Repository::open(&watched_path).unwrap();
         assert_eq!(head_oid(&watched), v2);
         drop(watched);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"version two\r\n"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn ident_only_difference_does_not_block_fast_forward() {
-        let (root, watched_path, _v1, v2) = conversion_repo(
-            "ident-clean",
+    fn builtin_recheck_matches_an_ident_only_difference_and_rejects_a_real_one() {
+        let (root, watched_path, _v1, _v2) = conversion_repo(
+            "ident-recheck",
             "*.txt ident\n",
             b"rev $Id$\n",
             b"version two\n",
@@ -3837,13 +3894,27 @@ mod tests {
             b"rev $Id: 0123456789abcdef0123456789abcdef01234567 $\n",
         )
         .unwrap();
+        let repo = git2::Repository::open(&watched_path).unwrap();
+        let mut index = repo.index().unwrap();
+        index.read(true).unwrap();
+        let entry_id = index.get_path(Path::new("data.txt"), 0).unwrap().id;
+        drop(index);
+        drop(repo);
         let processor = processor_for(&watched_path);
-        assert!(processor._tracked_local_changes().unwrap().is_empty());
-        processor.update_from_remote().unwrap();
-        drop(processor);
-        let watched = git2::Repository::open(&watched_path).unwrap();
-        assert_eq!(head_oid(&watched), v2);
-        drop(watched);
+        assert!(processor._builtin_conversion_may_apply(Path::new("data.txt")));
+        assert!(processor._matches_after_builtin_conversion(
+            &watched_path,
+            Path::new("data.txt"),
+            &watched_path.join("data.txt"),
+            entry_id
+        ));
+        std::fs::write(watched_path.join("data.txt"), b"rev changed\n").unwrap();
+        assert!(!processor._matches_after_builtin_conversion(
+            &watched_path,
+            Path::new("data.txt"),
+            &watched_path.join("data.txt"),
+            entry_id
+        ));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3896,6 +3967,7 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
     }
+
 
     fn pipe_pair() -> (std::fs::File, std::fs::File) {
         use std::os::unix::io::FromRawFd;
