@@ -795,7 +795,7 @@ impl RepoProcessor {
             Ok(paths) => Some(paths),
             Err(e) => {
                 Logger::error(format!(
-                    "Could not compute the paths changed by the update for {}; falling back to refusing on any local change and checking out the whole tree: {}",
+                    "Could not compute the paths changed by the update for {}; falling back to refusing on any local change, and the checkout will be refused because the changed paths are unknown: {}",
                     self.config.name, e
                 ));
                 None
@@ -2339,6 +2339,16 @@ impl RepoProcessor {
     ) -> Result<Reference<'_>, ZlorbError> {
         let skip_checkout = matches!(changed_paths, Some(paths) if paths.is_empty());
         if !skip_checkout {
+            if changed_paths.is_none() {
+                Logger::error(format!(
+                    "Refusing the checkout for {}: the paths changed by the update could not be computed, so no path can be checked against the current or the fetched commit and no path is being overwritten",
+                    self.config.name
+                ));
+                return Err(ZlorbError::Other(format!(
+                    "Refusing to fast-forward {}: the paths changed by the update could not be computed, so the checkout cannot be checked and no path is being overwritten",
+                    self.config.name
+                )));
+            }
             let mut checkout = git2::build::CheckoutBuilder::default();
             checkout.force();
             checkout.disable_pathspec_match(true);
@@ -4627,6 +4637,70 @@ mod tests {
                 "unexpected error: {:?}",
                 e
             ),
+        }
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("a.txt")).unwrap(),
+            "one-a\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("b.txt")).unwrap(),
+            "one-b\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_refuses_when_changed_paths_are_unknown() {
+        let (root, watched_path, v1, v2) = two_file_repo("checkout-unknown-changed-paths");
+        let processor = processor_for(&watched_path);
+        move_ref_to_v2(&processor, v2);
+        std::fs::write(watched_path.join("b.txt"), "race edit\n").unwrap();
+        match processor._checkout_and_get_ref(Some(v1), v2, None) {
+            Ok(_) => panic!("checkout must refuse when the changed paths are unknown"),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("could not be computed"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("a.txt")).unwrap(),
+            "one-a\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("b.txt")).unwrap(),
+            "race edit\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn apply_step_refuses_when_changed_paths_are_unknown() {
+        let (root, watched_path, v1, v2) = two_file_repo("apply-unknown-changed-paths");
+        let processor = processor_for(&watched_path);
+        processor
+            .repo
+            .reference("refs/remotes/origin/master", v2, true, "test")
+            .unwrap();
+        {
+            let fetch_ref = processor
+                .repo
+                .find_reference("refs/remotes/origin/master")
+                .unwrap();
+            let fetch_commit = processor
+                .repo
+                .reference_to_annotated_commit(&fetch_ref)
+                .unwrap();
+            match processor._apply_fast_forward(fetch_commit, v1, None) {
+                Ok(_) => panic!("apply must refuse when the changed paths are unknown"),
+                Err(e) => assert!(
+                    format!("{:?}", e).contains("could not be computed"),
+                    "unexpected error: {:?}",
+                    e
+                ),
+            }
         }
         drop(processor);
         assert_eq!(
