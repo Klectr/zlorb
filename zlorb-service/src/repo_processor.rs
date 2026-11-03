@@ -2238,7 +2238,12 @@ impl RepoProcessor {
                         }
                         safe
                     }
-                    None => paths.to_vec(),
+                    None => {
+                        return Err(ZlorbError::Other(format!(
+                            "Refusing to fast-forward {}: the current commit could not be determined, so the checkout cannot be checked against it and no path is being overwritten",
+                            self.config.name
+                        )));
+                    }
                 };
                 for path in &paths {
                     checkout.path(path);
@@ -4021,6 +4026,32 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(watched_path.join("thing/inner.txt")).unwrap(),
             "inner\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_refuses_when_the_current_commit_is_unknown() {
+        let (root, watched_path, v1, v2) = two_file_repo("checkout-revalidate-unknown-local");
+        let processor = processor_for(&watched_path);
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        match processor._checkout_and_get_ref(None, v2, Some(&changed)) {
+            Ok(_) => panic!("checkout must refuse when the current commit is unknown"),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("could not be determined"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("a.txt")).unwrap(),
+            "one-a\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("b.txt")).unwrap(),
+            "one-b\n"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
