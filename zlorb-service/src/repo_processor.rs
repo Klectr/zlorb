@@ -35,6 +35,77 @@ fn pipe_drain_deadline() -> std::time::Instant {
     std::time::Instant::now() + std::time::Duration::from_secs(10)
 }
 
+fn pipe_target(fd: libc::c_int) -> Option<String> {
+    let target = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()?;
+    let target = target.to_string_lossy().into_owned();
+    target.starts_with("pipe:[").then_some(target)
+}
+
+fn process_start_time(pid: libc::pid_t) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let close = stat.rfind(')')?;
+    stat[close + 1..].split_whitespace().nth(19)?.parse().ok()
+}
+
+fn process_holds_pipe_write_ends(pid: libc::pid_t, targets: &[String]) -> bool {
+    let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Ok(target) = std::fs::read_link(entry.path()) else {
+            continue;
+        };
+        let target = target.to_string_lossy();
+        if !targets.iter().any(|held| held == target.as_ref()) {
+            continue;
+        }
+        let Ok(info) =
+            std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{}", entry.file_name().to_string_lossy()))
+        else {
+            continue;
+        };
+        let writable = info
+            .lines()
+            .find_map(|line| line.strip_prefix("flags:"))
+            .and_then(|flags| i64::from_str_radix(flags.trim(), 8).ok())
+            .map(|flags| flags & 0o3 != 0)
+            .unwrap_or(false);
+        if writable {
+            return true;
+        }
+    }
+    false
+}
+
+fn kill_pipe_holders(targets: &[String]) {
+    if targets.is_empty() {
+        return;
+    }
+    let own = std::process::id() as libc::pid_t;
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<libc::pid_t>() else {
+            continue;
+        };
+        if pid == own || !process_holds_pipe_write_ends(pid, targets) {
+            continue;
+        }
+        let Some(started) = process_start_time(pid) else {
+            continue;
+        };
+        if process_start_time(pid) != Some(started)
+            || !process_holds_pipe_write_ends(pid, targets)
+        {
+            continue;
+        }
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+}
+
 fn set_nonblocking(fd: libc::c_int) {
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
@@ -156,7 +227,13 @@ impl PipeDrains {
         let first_end = deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(5));
         self.drain_until(first_end);
         if !self.all_eof() {
+            let targets: Vec<String> = [&self.stdout, &self.stderr]
+                .iter()
+                .filter(|drain| !drain.eof)
+                .filter_map(|drain| pipe_target(drain.fd))
+                .collect();
             kill_process_group(pgid);
+            kill_pipe_holders(&targets);
             let grace_end = std::time::Instant::now() + std::time::Duration::from_millis(250);
             self.drain_until(deadline.max(grace_end));
         }
@@ -2754,7 +2831,10 @@ mod tests {
     fn pipe_pair() -> (std::fs::File, std::fs::File) {
         use std::os::unix::io::FromRawFd;
         let mut fds = [0 as libc::c_int; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        assert_eq!(
+            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
         let read = unsafe { std::fs::File::from_raw_fd(fds[0]) };
         let write = unsafe { std::fs::File::from_raw_fd(fds[1]) };
         (read, write)
