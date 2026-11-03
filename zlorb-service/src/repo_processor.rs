@@ -35,6 +35,77 @@ fn pipe_drain_deadline() -> std::time::Instant {
     std::time::Instant::now() + std::time::Duration::from_secs(10)
 }
 
+fn pipe_target(fd: libc::c_int) -> Option<String> {
+    let target = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()?;
+    let target = target.to_string_lossy().into_owned();
+    target.starts_with("pipe:[").then_some(target)
+}
+
+fn process_start_time(pid: libc::pid_t) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let close = stat.rfind(')')?;
+    stat[close + 1..].split_whitespace().nth(19)?.parse().ok()
+}
+
+fn process_holds_pipe_write_ends(pid: libc::pid_t, targets: &[String]) -> bool {
+    let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Ok(target) = std::fs::read_link(entry.path()) else {
+            continue;
+        };
+        let target = target.to_string_lossy();
+        if !targets.iter().any(|held| held == target.as_ref()) {
+            continue;
+        }
+        let Ok(info) =
+            std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{}", entry.file_name().to_string_lossy()))
+        else {
+            continue;
+        };
+        let writable = info
+            .lines()
+            .find_map(|line| line.strip_prefix("flags:"))
+            .and_then(|flags| i64::from_str_radix(flags.trim(), 8).ok())
+            .map(|flags| flags & 0o3 != 0)
+            .unwrap_or(false);
+        if writable {
+            return true;
+        }
+    }
+    false
+}
+
+fn kill_pipe_holders(targets: &[String]) {
+    if targets.is_empty() {
+        return;
+    }
+    let own = std::process::id() as libc::pid_t;
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<libc::pid_t>() else {
+            continue;
+        };
+        if pid == own || !process_holds_pipe_write_ends(pid, targets) {
+            continue;
+        }
+        let Some(started) = process_start_time(pid) else {
+            continue;
+        };
+        if process_start_time(pid) != Some(started)
+            || !process_holds_pipe_write_ends(pid, targets)
+        {
+            continue;
+        }
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+}
+
 fn set_nonblocking(fd: libc::c_int) {
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
@@ -156,7 +227,13 @@ impl PipeDrains {
         let first_end = deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(5));
         self.drain_until(first_end);
         if !self.all_eof() {
+            let targets: Vec<String> = [&self.stdout, &self.stderr]
+                .iter()
+                .filter(|drain| !drain.eof)
+                .filter_map(|drain| pipe_target(drain.fd))
+                .collect();
             kill_process_group(pgid);
+            kill_pipe_holders(&targets);
             let grace_end = std::time::Instant::now() + std::time::Duration::from_millis(250);
             self.drain_until(deadline.max(grace_end));
         }
@@ -2754,7 +2831,10 @@ mod tests {
     fn pipe_pair() -> (std::fs::File, std::fs::File) {
         use std::os::unix::io::FromRawFd;
         let mut fds = [0 as libc::c_int; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        assert_eq!(
+            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
         let read = unsafe { std::fs::File::from_raw_fd(fds[0]) };
         let write = unsafe { std::fs::File::from_raw_fd(fds[1]) };
         (read, write)
@@ -2764,6 +2844,20 @@ mod tests {
         let (read, write) = pipe_pair();
         drop(write);
         read
+    }
+
+    fn process_is_running(pid: i32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let Some(close) = stat.rfind(')') else {
+            return false;
+        };
+        stat[close + 1..]
+            .split_whitespace()
+            .next()
+            .map(|state| state != "Z")
+            .unwrap_or(false)
     }
 
     fn spawn_sleep_group() -> (std::process::Child, libc::pid_t) {
@@ -2845,6 +2939,43 @@ mod tests {
             target_after.map(|target| target != target_before).unwrap_or(true),
             "read end fd {fd} still points at the drained pipe after the drains were dropped"
         );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn pipe_drain_deadline_kills_a_setsid_process_holding_the_pipe() {
+        use std::os::unix::process::ExitStatusExt;
+        let (out_read, out_write) = pipe_pair();
+        let mut escapee = Command::new("setsid")
+            .arg("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(out_write))
+            .spawn()
+            .unwrap();
+        let (mut child, pgid) = spawn_sleep_group();
+        let mut drains = PipeDrains::new(out_read, closed_pipe_pair());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(600);
+        assert!(drains.finish(deadline, pgid));
+        let mut status = None;
+        for _ in 0..60 {
+            if let Ok(Some(found)) = escapee.try_wait() {
+                status = Some(found);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let status = match status {
+            Some(status) => status,
+            None => {
+                let _ = escapee.kill();
+                let _ = escapee.wait();
+                panic!("setsid process holding the pipe was not killed at the drain deadline");
+            }
+        };
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -3110,6 +3241,85 @@ mod tests {
         );
         assert!(matched);
         assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn external_clean_filter_setsid_descendant_holding_a_pipe_is_killed() {
+        let root = temp_dir("skip-worktree-external-filter-setsid-kill");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        std::fs::write(upstream_path.join(".gitattributes"), "*.txt filter=strip\n").unwrap();
+        std::fs::write(upstream_path.join("data.txt"), "hello\n").unwrap();
+        let v1 = commit_all(&upstream, "v1");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        let escapee = write_filter_script(
+            &root,
+            "escapee.sh",
+            &format!(
+                "#!/bin/sh\necho $$ > \"{}\"\nexec sleep 30\n",
+                root.join("escapee.pid").display()
+            ),
+        );
+        let script = write_filter_script(
+            &root,
+            "strip-filter-setsid-kill.sh",
+            &format!(
+                "#!/bin/sh\nsed 's/^X//'\nsetsid \"{}\" >/dev/null &\n",
+                escapee.display()
+            ),
+        );
+        set_repo_config(
+            &watched_path,
+            "filter.strip.clean",
+            script.to_string_lossy().as_ref(),
+        );
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        set_index_flag(&watched_path, "--skip-worktree", "data.txt");
+
+        let processor = processor_for(&watched_path);
+        let entry_id = processor
+            .repo
+            .index()
+            .unwrap()
+            .get_path(Path::new("data.txt"), 0)
+            .unwrap()
+            .id;
+        let started = std::time::Instant::now();
+        let matched = processor._matches_after_external_clean_filter_with_timeout(
+            &watched_path,
+            Path::new("data.txt"),
+            &watched_path.join("data.txt"),
+            entry_id,
+            std::time::Duration::from_secs(30),
+        );
+        assert!(matched);
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        let pid: i32 = std::fs::read_to_string(root.join("escapee.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while process_is_running(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let running = process_is_running(pid);
+        if running {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        assert!(!running, "setsid descendant {pid} survived the recheck");
         let _ = std::fs::remove_dir_all(&root);
     }
 
