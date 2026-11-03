@@ -1623,6 +1623,9 @@ impl RepoProcessor {
                 if head != expected {
                     return false;
                 }
+                if sub_repo.is_bare() {
+                    return false;
+                }
                 let mut status_options = git2::StatusOptions::new();
                 status_options.include_untracked(true);
                 status_options.include_ignored(include_ignored);
@@ -4084,6 +4087,93 @@ mod tests {
             .map(|entry| entry.file_name())
             .collect();
         assert_eq!(names, vec![std::ffi::OsString::from(".git")]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn bare_clone_at_gitlink(watched_path: &Path, root: &Path) {
+        let bare_tmp = root.join("bare-clone");
+        let status = std::process::Command::new("git")
+            .args(["clone", "--bare"])
+            .arg(watched_path.join("sub"))
+            .arg(&bare_tmp)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::rename(&bare_tmp, watched_path.join("sub")).unwrap();
+    }
+
+    #[test]
+    fn rollback_preserves_bare_repo_whose_head_matches_the_fetched_commit() {
+        let (root, watched_path, v1, v2, sub_a, sub_b) =
+            gitlink_fixture("rollback-gitlink-bare-fetched");
+        bare_clone_at_gitlink(&watched_path, &root);
+        let bare = git2::Repository::open(watched_path.join("sub")).unwrap();
+        assert!(bare.is_bare());
+        assert_eq!(head_oid(&bare), sub_b);
+        bare.reference("refs/heads/user-work", sub_a, false, "test")
+            .unwrap();
+        drop(bare);
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        let bare = git2::Repository::open(watched_path.join("sub")).unwrap();
+        assert!(bare.is_bare());
+        assert_eq!(head_oid(&bare), sub_b);
+        assert_eq!(
+            bare.find_reference("refs/heads/user-work")
+                .unwrap()
+                .target(),
+            Some(sub_a)
+        );
+        drop(bare);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_bare_repo_whose_head_matches_the_local_commit() {
+        let (root, watched_path, v1, v2, sub_a, _sub_b) =
+            gitlink_fixture("rollback-gitlink-bare-local");
+        bare_clone_at_gitlink(&watched_path, &root);
+        let bare = git2::Repository::open(watched_path.join("sub")).unwrap();
+        assert!(bare.is_bare());
+        bare.set_head_detached(sub_a).unwrap();
+        assert_eq!(head_oid(&bare), sub_a);
+        drop(bare);
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        let bare = git2::Repository::open(watched_path.join("sub")).unwrap();
+        assert!(bare.is_bare());
+        assert_eq!(head_oid(&bare), sub_a);
+        drop(bare);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_commitless_bare_repo_at_a_gitlink_path() {
+        let (root, watched_path, v1, v2, _sub_a, _sub_b) =
+            gitlink_fixture("rollback-gitlink-bare-commitless");
+        std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        init_opts.bare(true);
+        let bare = git2::Repository::init_opts(watched_path.join("sub"), &init_opts).unwrap();
+        assert!(bare.is_bare());
+        drop(bare);
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        let bare = git2::Repository::open(watched_path.join("sub")).unwrap();
+        assert!(bare.is_bare());
+        assert!(bare.head().ok().and_then(|head| head.target()).is_none());
+        drop(bare);
         let _ = std::fs::remove_dir_all(&root);
     }
 
