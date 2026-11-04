@@ -369,6 +369,22 @@ fn stat_matches_index_entry(entry: &git2::IndexEntry, metadata: &std::fs::Metada
         && metadata.ctime_nsec() == i64::from(entry.ctime.nanoseconds())
 }
 
+fn raw_blob_hash_matches(
+    repo: &git2::Repository,
+    full_path: &Path,
+    expected: Oid,
+    disk_len: u64,
+) -> bool {
+    match repo.find_blob(expected) {
+        Ok(blob) if disk_len != blob.size() as u64 => return false,
+        _ => {}
+    }
+    std::fs::read(full_path)
+        .ok()
+        .and_then(|contents| Oid::hash_object(git2::ObjectType::Blob, &contents).ok())
+        == Some(expected)
+}
+
 fn display_paths(paths: &[PathBuf]) -> String {
     paths
         .iter()
@@ -1269,6 +1285,9 @@ impl RepoProcessor {
                 }
             }
             if stat_matches_index_entry(&entry, &metadata) {
+                continue;
+            }
+            if raw_blob_hash_matches(&self.repo, &full_path, entry.id, metadata.len()) {
                 continue;
             }
             let mut writer = match self.repo.blob_writer(Some(&path)) {
@@ -2549,11 +2568,8 @@ impl RepoProcessor {
                 return CleanRecheck::Mismatch;
             }
         }
-        if let Ok(contents) = std::fs::read(&full_path) {
-            if Oid::hash_object(git2::ObjectType::Blob, &contents).ok() == Some(expected)
-            {
-                return CleanRecheck::Match;
-            }
+        if raw_blob_hash_matches(&self.repo, &full_path, expected, metadata.len()) {
+            return CleanRecheck::Match;
         }
         if self._rollback_filtered_disk_id(path, &full_path) == Some(expected) {
             return CleanRecheck::Match;
@@ -2717,12 +2733,12 @@ impl RepoProcessor {
                             return false;
                         }
                     }
-                    std::fs::read(&flagged_full)
-                        .ok()
-                        .and_then(|contents| {
-                            Oid::hash_object(git2::ObjectType::Blob, &contents).ok()
-                        })
-                        == Some(entry.id)
+                    raw_blob_hash_matches(
+                        &sub_repo,
+                        &flagged_full,
+                        entry.id,
+                        flagged_metadata.len(),
+                    )
                         || sub_repo
                             .blob_writer(Some(&rel_path))
                             .ok()
@@ -3025,13 +3041,12 @@ impl RepoProcessor {
                                     return false;
                                 }
                             }
-                            std::fs::read(&flagged_full)
-                                .ok()
-                                .and_then(|contents| {
-                                    Oid::hash_object(git2::ObjectType::Blob, &contents)
-                                        .ok()
-                                })
-                                == Some(entry.id)
+                            raw_blob_hash_matches(
+                                &sub_repo,
+                                &flagged_full,
+                                entry.id,
+                                flagged_metadata.len(),
+                            )
                                 || sub_repo
                                     .blob_writer(Some(&rel_path))
                                     .ok()
@@ -5026,6 +5041,84 @@ mod tests {
         let hidden = processor._hidden_local_changes(&[]).unwrap();
         assert!(hidden.changes.is_empty());
         assert_eq!(hidden.unverifiable, vec![PathBuf::from("b.txt")]);
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn hidden_flagged_crlf_repo(label: &str, flag: &str) -> (PathBuf, PathBuf) {
+        let root = temp_dir(label);
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        std::fs::write(watched_path.join("data.txt"), b"hello\r\n").unwrap();
+        commit_all(&watched, "v1");
+        let info_dir = watched_path.join(".git").join("info");
+        std::fs::create_dir_all(&info_dir).unwrap();
+        std::fs::write(info_dir.join("attributes"), "data.txt text\n").unwrap();
+        {
+            let index = watched.index().unwrap();
+            let entry = index.get_path(Path::new("data.txt"), 0).unwrap();
+            let blob = watched.find_blob(entry.id).unwrap();
+            assert_eq!(blob.content(), b"hello\r\n");
+        }
+        drop(watched);
+        set_index_flag(&watched_path, flag, "data.txt");
+        (root, watched_path)
+    }
+
+    #[test]
+    fn assume_unchanged_file_whose_blob_and_disk_bytes_are_identical_crlf_is_not_a_local_change(
+    ) {
+        let (root, watched_path) =
+            hidden_flagged_crlf_repo("hidden-flagged-raw-crlf", "--assume-unchanged");
+        std::fs::write(watched_path.join("data.txt"), b"hello\r\n").unwrap();
+        let processor = processor_for(&watched_path);
+        let hidden = processor._hidden_local_changes(&[]).unwrap();
+        assert!(hidden.changes.is_empty(), "{:?}", hidden.changes);
+        assert!(hidden.unverifiable.is_empty(), "{:?}", hidden.unverifiable);
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn skip_worktree_file_whose_blob_and_disk_bytes_are_identical_crlf_is_not_a_local_change()
+    {
+        let (root, watched_path) =
+            hidden_flagged_crlf_repo("hidden-flagged-raw-crlf-skip", "--skip-worktree");
+        std::fs::write(watched_path.join("data.txt"), b"hello\r\n").unwrap();
+        let processor = processor_for(&watched_path);
+        let hidden = processor._hidden_local_changes(&[]).unwrap();
+        assert!(hidden.changes.is_empty(), "{:?}", hidden.changes);
+        assert!(hidden.unverifiable.is_empty(), "{:?}", hidden.unverifiable);
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn assume_unchanged_crlf_file_with_same_length_different_content_is_a_local_change() {
+        let (root, watched_path) = hidden_flagged_crlf_repo(
+            "hidden-flagged-raw-crlf-changed",
+            "--assume-unchanged",
+        );
+        std::fs::write(watched_path.join("data.txt"), b"hallo\r\n").unwrap();
+        let processor = processor_for(&watched_path);
+        let hidden = processor._hidden_local_changes(&[]).unwrap();
+        assert_eq!(hidden.changes, vec![PathBuf::from("data.txt")]);
+        assert!(hidden.unverifiable.is_empty());
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn assume_unchanged_crlf_file_whose_disk_bytes_lost_the_cr_is_a_local_change() {
+        let (root, watched_path) =
+            hidden_flagged_crlf_repo("hidden-flagged-raw-crlf-lf-disk", "--assume-unchanged");
+        std::fs::write(watched_path.join("data.txt"), b"hello\n").unwrap();
+        let processor = processor_for(&watched_path);
+        let hidden = processor._hidden_local_changes(&[]).unwrap();
+        assert_eq!(hidden.changes, vec![PathBuf::from("data.txt")]);
+        assert!(hidden.unverifiable.is_empty());
         drop(processor);
         let _ = std::fs::remove_dir_all(&root);
     }
