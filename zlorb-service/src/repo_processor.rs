@@ -1186,10 +1186,20 @@ impl RepoProcessor {
             let full_path = workdir.join(&path);
             let metadata = match std::fs::symlink_metadata(&full_path) {
                 Ok(metadata) => metadata,
-                Err(_) => {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     if assume_unchanged {
                         hidden.push(path);
                     }
+                    continue;
+                }
+                Err(e) => {
+                    Logger::error(format!(
+                        "Could not check {} in {} for local changes under skip-worktree or assume-unchanged ({}); treating it as unverifiable so the update is refused rather than risk discarding it",
+                        path.display(),
+                        self.config.name,
+                        e
+                    ));
+                    hidden_unverifiable.push(path);
                     continue;
                 }
             };
@@ -4075,6 +4085,52 @@ mod tests {
         let hidden = processor._hidden_local_changes(&[]);
         assert!(hidden.changes.is_empty());
         assert_eq!(hidden.unverifiable, vec![PathBuf::from("b.txt")]);
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn hidden_metadata_loop_repo(label: &str, flag: &str) -> (PathBuf, PathBuf) {
+        let root = temp_dir(label);
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        std::fs::create_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::write(watched_path.join("sub").join("b.txt"), "one-b\n").unwrap();
+        commit_all(&watched, "v1");
+        drop(watched);
+        set_index_flag(&watched_path, flag, "sub/b.txt");
+        std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
+        std::os::unix::fs::symlink("sub", watched_path.join("sub")).unwrap();
+        (root, watched_path)
+    }
+
+    #[test]
+    fn skip_worktree_file_whose_metadata_cannot_be_read_is_unverifiable_not_cleared() {
+        let (root, watched_path) =
+            hidden_metadata_loop_repo("skip-worktree-metadata-loop", "--skip-worktree");
+        let processor = processor_for(&watched_path);
+        let hidden = processor._hidden_local_changes(&[]);
+        assert!(hidden.changes.is_empty());
+        assert_eq!(
+            hidden.unverifiable,
+            vec![PathBuf::from("sub").join("b.txt")]
+        );
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn assume_unchanged_file_whose_metadata_cannot_be_read_is_unverifiable_not_a_local_change() {
+        let (root, watched_path) =
+            hidden_metadata_loop_repo("assume-unchanged-metadata-loop", "--assume-unchanged");
+        let processor = processor_for(&watched_path);
+        let hidden = processor._hidden_local_changes(&[]);
+        assert!(hidden.changes.is_empty());
+        assert_eq!(
+            hidden.unverifiable,
+            vec![PathBuf::from("sub").join("b.txt")]
+        );
         drop(processor);
         let _ = std::fs::remove_dir_all(&root);
     }
