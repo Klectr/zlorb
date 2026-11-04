@@ -379,10 +379,7 @@ fn raw_blob_hash_matches(
         Ok(blob) if disk_len != blob.size() as u64 => return false,
         _ => {}
     }
-    std::fs::read(full_path)
-        .ok()
-        .and_then(|contents| Oid::hash_object(git2::ObjectType::Blob, &contents).ok())
-        == Some(expected)
+    Oid::hash_file(git2::ObjectType::Blob, full_path).ok() == Some(expected)
 }
 
 fn display_paths(paths: &[PathBuf]) -> String {
@@ -4004,6 +4001,53 @@ mod tests {
             out_dir: None,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn raw_blob_hash_matches_agrees_with_git2_across_sizes() {
+        let root = temp_dir("raw-hash-sizes");
+        let repo = git2::Repository::init(&root).unwrap();
+        let path = root.join("data.bin");
+        for size in [
+            0usize, 1, 47, 48, 55, 56, 57, 63, 64, 65, 119, 120, 127, 128, 8191, 8192, 8193,
+            200_000, 3_000_001,
+        ] {
+            let contents: Vec<u8> = (0..size)
+                .map(|i| (i.wrapping_mul(31).wrapping_add(i >> 8) % 251) as u8)
+                .collect();
+            std::fs::write(&path, &contents).unwrap();
+            let expected = Oid::hash_object(git2::ObjectType::Blob, &contents).unwrap();
+            assert!(
+                raw_blob_hash_matches(&repo, &path, expected, size as u64),
+                "size {}",
+                size
+            );
+            let other = Oid::hash_object(git2::ObjectType::Blob, b"different").unwrap();
+            assert!(
+                !raw_blob_hash_matches(&repo, &path, other, size as u64),
+                "size {}",
+                size
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn raw_blob_hash_matches_rejects_same_length_edits_and_missing_files() {
+        let root = temp_dir("raw-hash-mismatch");
+        let repo = git2::Repository::init(&root).unwrap();
+        let path = root.join("data.bin");
+        std::fs::write(&path, b"aaaaaaaa").unwrap();
+        let expected = Oid::hash_object(git2::ObjectType::Blob, b"aaaaaaaa").unwrap();
+        std::fs::write(&path, b"aaaaaaab").unwrap();
+        assert!(!raw_blob_hash_matches(&repo, &path, expected, 8));
+        assert!(!raw_blob_hash_matches(
+            &repo,
+            &root.join("missing.bin"),
+            expected,
+            8
+        ));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
