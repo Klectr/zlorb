@@ -1196,6 +1196,12 @@ impl RepoProcessor {
             let file_type = metadata.file_type();
             if file_type.is_symlink() {
                 let Ok(target) = std::fs::read_link(&full_path) else {
+                    Logger::error(format!(
+                        "Could not read the symlink {} in {} to check it for local changes under skip-worktree or assume-unchanged; treating it as unverifiable so the update is refused rather than risk discarding it",
+                        path.display(),
+                        self.config.name
+                    ));
+                    hidden_unverifiable.push(path);
                     continue;
                 };
                 let target_bytes = {
@@ -1204,6 +1210,12 @@ impl RepoProcessor {
                 };
                 let Ok(disk_id) = Oid::hash_object(git2::ObjectType::Blob, &target_bytes)
                 else {
+                    Logger::error(format!(
+                        "Could not hash the symlink target of {} in {} to check it for local changes under skip-worktree or assume-unchanged; treating it as unverifiable so the update is refused rather than risk discarding it",
+                        path.display(),
+                        self.config.name
+                    ));
+                    hidden_unverifiable.push(path);
                     continue;
                 };
                 if disk_id != entry.id {
@@ -1236,12 +1248,12 @@ impl RepoProcessor {
                 Ok(writer) => writer,
                 Err(e) => {
                     Logger::error(format!(
-                        "Could not check {} in {} for local changes under skip-worktree or assume-unchanged ({}); treating it as changed so the update is refused rather than risk discarding it",
+                        "Could not check {} in {} for local changes under skip-worktree or assume-unchanged ({}); treating it as unverifiable so the update is refused rather than risk discarding it",
                         path.display(),
                         self.config.name,
                         e
                     ));
-                    hidden.push(path);
+                    hidden_unverifiable.push(path);
                     continue;
                 }
             };
@@ -1249,35 +1261,35 @@ impl RepoProcessor {
                 Ok(file) => file,
                 Err(e) => {
                     Logger::error(format!(
-                        "Could not read {} in {} to check it for local changes under skip-worktree or assume-unchanged ({}); treating it as changed so the update is refused rather than risk discarding it",
+                        "Could not read {} in {} to check it for local changes under skip-worktree or assume-unchanged ({}); treating it as unverifiable so the update is refused rather than risk discarding it",
                         path.display(),
                         self.config.name,
                         e
                     ));
-                    hidden.push(path);
+                    hidden_unverifiable.push(path);
                     continue;
                 }
             };
             if let Err(e) = std::io::copy(&mut file, &mut writer) {
                 Logger::error(format!(
-                    "Could not read {} in {} to check it for local changes under skip-worktree or assume-unchanged ({}); treating it as changed so the update is refused rather than risk discarding it",
+                    "Could not read {} in {} to check it for local changes under skip-worktree or assume-unchanged ({}); treating it as unverifiable so the update is refused rather than risk discarding it",
                     path.display(),
                     self.config.name,
                     e
                 ));
-                hidden.push(path);
+                hidden_unverifiable.push(path);
                 continue;
             }
             let disk_id = match writer.commit() {
                 Ok(disk_id) => disk_id,
                 Err(e) => {
                     Logger::error(format!(
-                        "Could not hash {} in {} to check it for local changes under skip-worktree or assume-unchanged ({}); treating it as changed so the update is refused rather than risk discarding it",
+                        "Could not hash {} in {} to check it for local changes under skip-worktree or assume-unchanged ({}); treating it as unverifiable so the update is refused rather than risk discarding it",
                         path.display(),
                         self.config.name,
                         e
                     ));
-                    hidden.push(path);
+                    hidden_unverifiable.push(path);
                     continue;
                 }
             };
@@ -4046,6 +4058,24 @@ mod tests {
         let tracked = processor._tracked_local_changes().unwrap();
         assert_eq!(tracked.changes, vec![PathBuf::from("b.txt")]);
         assert!(tracked.unverifiable.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn skip_worktree_file_that_cannot_be_hashed_is_unverifiable_not_a_local_change() {
+        let (root, watched_path, _v1, _v2) = two_file_repo("skip-worktree-blob-writer-fails");
+        std::fs::write(watched_path.join("b.txt"), "edited-b\n").unwrap();
+        set_index_flag(&watched_path, "--skip-worktree", "b.txt");
+        let processor = processor_for(&watched_path);
+        std::fs::rename(
+            watched_path.join(".git").join("objects"),
+            root.join("objects-away"),
+        )
+        .unwrap();
+        let hidden = processor._hidden_local_changes(&[]);
+        assert!(hidden.changes.is_empty());
+        assert_eq!(hidden.unverifiable, vec![PathBuf::from("b.txt")]);
+        drop(processor);
         let _ = std::fs::remove_dir_all(&root);
     }
 
