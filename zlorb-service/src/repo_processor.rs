@@ -1742,40 +1742,91 @@ impl RepoProcessor {
             Some(paths) => self._seeded_preclone_paths(local_oid, fetch_oid, paths),
             None => Vec::new(),
         };
+        let mut restored_preclone_paths: Vec<PathBuf> = Vec::new();
         if !preclone_paths.is_empty() {
             match self.repo.index() {
                 Ok(mut index) => {
-                    let mut removed = Vec::new();
-                    for path in &preclone_paths {
-                        if index.remove_path(path).is_ok() {
-                            removed.push(path.clone());
-                        }
-                    }
-                    if !removed.is_empty() {
-                        match index.write() {
-                            Ok(_) => {
-                                for path in &removed {
-                                    Logger::info(format!(
-                                        "Restored the pre-cloned submodule at {} in {} to its pre-update state during rollback: the gitlink entry the failed update added to the index is dropped and the clone on disk is left untouched",
+                    if let Err(e) = index.read(true) {
+                        Logger::error(format!(
+                            "Could not reload the index of {} during rollback to drop the seeded gitlink entries ({}), so they are being preserved instead: {}",
+                            self.config.name,
+                            display_paths(&preclone_paths),
+                            e
+                        ));
+                    } else {
+                        let mut removed = Vec::new();
+                        let mut removal_failed = false;
+                        for path in &preclone_paths {
+                            match index.remove_path(path) {
+                                Ok(_) => removed.push(path.clone()),
+                                Err(e) => {
+                                    removal_failed = true;
+                                    Logger::error(format!(
+                                        "Could not drop the seeded gitlink entry for {} in {} from the index during rollback, so no seeded entries are being dropped and they are being preserved instead: {}",
                                         path.display(),
-                                        self.config.name
+                                        self.config.name,
+                                        e
                                     ));
                                 }
                             }
-                            Err(e) => {
-                                Logger::error(format!(
-                                    "Could not drop the seeded gitlink entries ({}) in {} from the index during rollback: {}",
-                                    display_paths(&removed),
-                                    self.config.name,
-                                    e
-                                ));
+                        }
+                        if removal_failed {
+                            if let Ok(fetch_tree) = self
+                                .repo
+                                .find_commit(fetch_oid)
+                                .and_then(|commit| commit.tree())
+                            {
+                                for path in &removed {
+                                    if let Ok(fetch_entry) = fetch_tree.get_path(path) {
+                                        use std::os::unix::ffi::OsStrExt;
+                                        let path_bytes =
+                                            path.as_os_str().as_bytes().to_vec();
+                                        let entry = git2::IndexEntry {
+                                            ctime: git2::IndexTime::new(0, 0),
+                                            mtime: git2::IndexTime::new(0, 0),
+                                            dev: 0,
+                                            ino: 0,
+                                            mode: 0o160000,
+                                            uid: 0,
+                                            gid: 0,
+                                            file_size: 0,
+                                            id: fetch_entry.id(),
+                                            flags: path_bytes.len().min(0x0FFF) as u16,
+                                            flags_extended: 0,
+                                            path: path_bytes,
+                                        };
+                                        let _ = index.add(&entry);
+                                    }
+                                }
+                            }
+                        } else if !removed.is_empty() {
+                            match index.write() {
+                                Ok(_) => {
+                                    for path in &removed {
+                                        Logger::info(format!(
+                                            "Restored the pre-cloned submodule at {} in {} to its pre-update state during rollback: the gitlink entry the failed update added to the index is dropped and the clone on disk is left untouched",
+                                            path.display(),
+                                            self.config.name
+                                        ));
+                                    }
+                                    restored_preclone_paths = removed;
+                                }
+                                Err(e) => {
+                                    let _ = index.read(true);
+                                    Logger::error(format!(
+                                        "Could not drop the seeded gitlink entries ({}) in {} from the index during rollback, so they are being preserved instead: {}",
+                                        display_paths(&removed),
+                                        self.config.name,
+                                        e
+                                    ));
+                                }
                             }
                         }
                     }
                 }
                 Err(e) => {
                     Logger::error(format!(
-                        "Could not load the index of {} during rollback to drop the seeded gitlink entries ({}): {}",
+                        "Could not load the index of {} during rollback to drop the seeded gitlink entries ({}), so they are being preserved instead: {}",
                         self.config.name,
                         display_paths(&preclone_paths),
                         e
@@ -1854,10 +1905,16 @@ impl RepoProcessor {
                 .filter(|path| !preclone_paths.contains(path))
                 .collect::<Vec<PathBuf>>()
         });
-        let preserved_paths: Vec<PathBuf> = preserved_paths
+        let mut preserved_paths: Vec<PathBuf> = preserved_paths
             .into_iter()
-            .filter(|path| !preclone_paths.contains(path))
+            .filter(|path| !restored_preclone_paths.contains(path))
             .collect();
+        for path in &preclone_paths {
+            if !restored_preclone_paths.contains(path) && !preserved_paths.contains(path)
+            {
+                preserved_paths.push(path.clone());
+            }
+        }
         let mut tree_restored = false;
         let restore_result = match self.repo.find_commit(local_oid) {
             Ok(commit) => {
@@ -2573,6 +2630,9 @@ impl RepoProcessor {
             return false;
         };
         let full_path = workdir.join(path);
+        if self._rollback_has_symlinked_ancestor(&workdir, path) {
+            return false;
+        }
         if !std::fs::symlink_metadata(&full_path)
             .map(|metadata| metadata.file_type().is_dir())
             .unwrap_or(false)
@@ -2601,13 +2661,43 @@ impl RepoProcessor {
         if sub_repo.head().ok().and_then(|head| head.target()) != Some(expected) {
             return false;
         }
-        if let Ok(sub_index) = sub_repo.index() {
-            let hidden = sub_index.iter().any(|entry| {
-                git2::IndexEntryExtendedFlag::from_bits_truncate(entry.flags_extended)
-                    .is_skip_worktree()
-                    || entry.flags & 0x8000 != 0
-            });
-            if hidden {
+        let Ok(sub_index) = sub_repo.index() else {
+            return false;
+        };
+        let Some(sub_workdir) = sub_repo.workdir().map(|dir| dir.to_path_buf()) else {
+            return false;
+        };
+        for entry in sub_index.iter() {
+            let flagged = git2::IndexEntryExtendedFlag::from_bits_truncate(
+                entry.flags_extended,
+            )
+            .is_skip_worktree()
+                || entry.flags & 0x8000 != 0;
+            if !flagged {
+                continue;
+            }
+            let rel_path = path_from_bytes(&entry.path);
+            let flagged_full = sub_workdir.join(&rel_path);
+            let Ok(flagged_metadata) = std::fs::symlink_metadata(&flagged_full) else {
+                continue;
+            };
+            let flagged_type = flagged_metadata.file_type();
+            let disk_id = if flagged_type.is_symlink() {
+                std::fs::read_link(&flagged_full).ok().and_then(|target| {
+                    use std::os::unix::ffi::OsStrExt;
+                    Oid::hash_object(git2::ObjectType::Blob, target.as_os_str().as_bytes())
+                        .ok()
+                })
+            } else if flagged_type.is_file() {
+                sub_repo.blob_writer(Some(&rel_path)).ok().and_then(|mut writer| {
+                    let mut file = std::fs::File::open(&flagged_full).ok()?;
+                    std::io::copy(&mut file, &mut writer).ok()?;
+                    writer.commit().ok()
+                })
+            } else {
+                return false;
+            };
+            if disk_id != Some(entry.id) {
                 return false;
             }
         }
@@ -2627,18 +2717,32 @@ impl RepoProcessor {
         fetch_oid: Oid,
         changed_paths: &[PathBuf],
     ) -> Result<Vec<PathBuf>, ZlorbError> {
-        let (Ok(local_commit), Ok(fetch_commit)) = (
-            self.repo.find_commit(local_oid),
-            self.repo.find_commit(fetch_oid),
-        ) else {
-            return Ok(Vec::new());
-        };
-        let (Ok(local_tree), Ok(fetch_tree)) = (local_commit.tree(), fetch_commit.tree())
-        else {
-            return Ok(Vec::new());
-        };
+        let local_commit = self.repo.find_commit(local_oid).map_err(|e| {
+            ZlorbError::Other(format!(
+                "Refusing to fast-forward {}: the current commit {} could not be loaded to seed the pre-cloned submodule gitlinks ({}), so no path is being handed to the checkout unseeded",
+                self.config.name, local_oid, e
+            ))
+        })?;
+        let fetch_commit = self.repo.find_commit(fetch_oid).map_err(|e| {
+            ZlorbError::Other(format!(
+                "Refusing to fast-forward {}: the fetched commit {} could not be loaded to seed the pre-cloned submodule gitlinks ({}), so no path is being handed to the checkout unseeded",
+                self.config.name, fetch_oid, e
+            ))
+        })?;
+        let local_tree = local_commit.tree().map_err(|e| {
+            ZlorbError::Other(format!(
+                "Refusing to fast-forward {}: the tree of the current commit {} could not be loaded to seed the pre-cloned submodule gitlinks ({}), so no path is being handed to the checkout unseeded",
+                self.config.name, local_oid, e
+            ))
+        })?;
+        let fetch_tree = fetch_commit.tree().map_err(|e| {
+            ZlorbError::Other(format!(
+                "Refusing to fast-forward {}: the tree of the fetched commit {} could not be loaded to seed the pre-cloned submodule gitlinks ({}), so no path is being handed to the checkout unseeded",
+                self.config.name, fetch_oid, e
+            ))
+        })?;
         let mut index = self.repo.index().map_err(ZlorbError::Git)?;
-        let mut seeded = Vec::new();
+        let mut seeded: Vec<PathBuf> = Vec::new();
         for path in changed_paths {
             if local_tree.get_path(path).is_ok() {
                 continue;
@@ -2668,25 +2772,31 @@ impl RepoProcessor {
                 flags_extended: 0,
                 path: path_bytes,
             };
-            index.add(&entry).map_err(|e| {
-                ZlorbError::Other(format!(
+            if let Err(e) = index.add(&entry) {
+                for seeded_path in &seeded {
+                    let _ = index.remove_path(seeded_path);
+                }
+                return Err(ZlorbError::Other(format!(
                     "Refusing to fast-forward {}: the gitlink entry for the pre-cloned submodule at {} could not be seeded into the index ({}), so the path is not being handed to the checkout, which would delete the clone",
                     self.config.name,
                     path.display(),
                     e
-                ))
-            })?;
+                )));
+            }
             seeded.push(path.clone());
         }
         if !seeded.is_empty() {
-            index.write().map_err(|e| {
-                ZlorbError::Other(format!(
+            if let Err(e) = index.write() {
+                for seeded_path in &seeded {
+                    let _ = index.remove_path(seeded_path);
+                }
+                return Err(ZlorbError::Other(format!(
                     "Refusing to fast-forward {}: the seeded gitlink entries ({}) could not be written to the index ({}), so those paths are not being handed to the checkout, which would delete the pre-cloned submodules",
                     self.config.name,
                     display_paths(&seeded),
                     e
-                ))
-            })?;
+                )));
+            }
         }
         Ok(seeded)
     }
@@ -8783,11 +8893,20 @@ mod tests {
 
     #[test]
     fn checkout_step_aborts_when_seeding_an_added_gitlink_preclone_cannot_be_written() {
-        let (root, watched_path, v1, v2, _sub_a) =
-            added_gitlink_fixture("checkout-seed-write-fails");
+        let (root, watched_path, v1, v2, _sub_a, _sub_b) =
+            added_gitlink_preclone_fixture("checkout-seed-write-fails");
         std::fs::write(watched_path.join("sub/data.db"), "build output\n").unwrap();
         let processor = processor_for(&watched_path);
-        move_ref_to_v2(&processor, v2);
+        let fetch_ref = processor
+            .repo
+            .find_reference("refs/remotes/origin/master")
+            .unwrap();
+        let fetch_commit = processor
+            .repo
+            .reference_to_annotated_commit(&fetch_ref)
+            .unwrap();
+        drop(fetch_ref);
+        processor._setup_repo_for_checkout(fetch_commit).unwrap();
         let changed = processor._changed_paths(v1, v2).unwrap();
         let lock_path = watched_path.join(".git/index.lock");
         std::fs::write(&lock_path, "").unwrap();
@@ -8800,9 +8919,22 @@ mod tests {
             Ok(_) => panic!(
                 "a seeding write failure must abort the checkout instead of handing the pre-clone to the force checkout"
             ),
-            Err(e) => assert!(e.contains("index"), "unexpected error: {}", e),
+            Err(e) => assert!(
+                e.contains("could not be seeded")
+                    || e.contains("could not be written to the index"),
+                "unexpected error: {}",
+                e
+            ),
         }
+        let index = processor.repo.index().unwrap();
+        assert!(index.get_path(Path::new("sub"), 0).is_none());
+        drop(index);
         drop(processor);
+        assert!(
+            std::fs::read_to_string(watched_path.join("src/main.rs"))
+                .unwrap()
+                .contains("fixture-version-one")
+        );
         assert_eq!(
             std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
             "sub one\n"
@@ -8810,6 +8942,163 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(watched_path.join("sub/data.db")).unwrap(),
             "build output\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_reports_failure_when_the_seeded_gitlink_entry_cannot_be_dropped() {
+        let root = temp_dir("rollback-seeded-unseed-fails");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        let v1 = commit_all(&upstream, "v1");
+        let up_sub_path = upstream_path.join("sub");
+        let up_sub = git2::Repository::init_opts(&up_sub_path, &init_opts).unwrap();
+        std::fs::write(up_sub_path.join(".gitignore"), "data.db\n").unwrap();
+        std::fs::write(up_sub_path.join("sub.txt"), "sub one\n").unwrap();
+        let sub_a = commit_all(&up_sub, "sub a");
+        drop(up_sub);
+        let v2 = commit_with_gitlink(&upstream, sub_a, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v1).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        git2::Repository::clone(
+            up_sub_path.to_string_lossy().as_ref(),
+            watched_path.join("sub"),
+        )
+        .unwrap();
+
+        let processor = processor_for(&watched_path);
+        let fetch_ref = processor
+            .repo
+            .find_reference("refs/remotes/origin/master")
+            .unwrap();
+        let fetch_commit = processor
+            .repo
+            .reference_to_annotated_commit(&fetch_ref)
+            .unwrap();
+        drop(fetch_ref);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        assert_eq!(changed, vec![PathBuf::from("sub")]);
+        processor
+            ._apply_fast_forward(fetch_commit, v1, Some(&changed))
+            .unwrap();
+        let lock_path = watched_path.join(".git/index.lock");
+        std::fs::write(&lock_path, "").unwrap();
+        let rolled_back = processor._rollback_fast_forward(v1, v2);
+        std::fs::remove_file(&lock_path).unwrap();
+        assert!(!rolled_back);
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
+            "sub one\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn set_entry_flags(watched_path: &Path, flags_mask: u16, extended_mask: u16) {
+        let sub_path = watched_path.join("sub");
+        let sub = git2::Repository::open(&sub_path).unwrap();
+        let mut index = sub.index().unwrap();
+        let existing = index.get_path(Path::new("sub.txt"), 0).unwrap();
+        let entry = git2::IndexEntry {
+            ctime: existing.ctime,
+            mtime: existing.mtime,
+            dev: existing.dev,
+            ino: existing.ino,
+            mode: existing.mode,
+            uid: existing.uid,
+            gid: existing.gid,
+            file_size: existing.file_size,
+            id: existing.id,
+            flags: existing.flags | flags_mask,
+            flags_extended: existing.flags_extended | extended_mask,
+            path: existing.path.clone(),
+        };
+        index.add(&entry).unwrap();
+        index.write().unwrap();
+    }
+
+    #[test]
+    fn fast_forward_accepts_an_added_gitlink_whose_preclone_has_a_flagged_but_unmodified_entry()
+    {
+        let (root, watched_path, _v1, v2, _sub_a, _sub_b) =
+            added_gitlink_preclone_fixture("full-flow-added-gitlink-precloned-fsmonitor-flag");
+        set_entry_flags(&watched_path, 0x8000, 0);
+
+        processor_for(&watched_path).update_from_remote().unwrap();
+
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
+            "sub one\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fast_forward_accepts_an_added_gitlink_whose_preclone_has_a_flagged_crlf_converted_entry()
+    {
+        let (root, watched_path, _v1, v2, _sub_a, _sub_b) =
+            added_gitlink_preclone_fixture("full-flow-added-gitlink-precloned-flagged-crlf");
+        {
+            let sub = git2::Repository::open(watched_path.join("sub")).unwrap();
+            let mut config = sub.config().unwrap();
+            config.set_bool("core.autocrlf", true).unwrap();
+        }
+        set_entry_flags(&watched_path, 0x8000, 0);
+        std::fs::write(watched_path.join("sub/sub.txt"), "sub one\r\n").unwrap();
+
+        processor_for(&watched_path).update_from_remote().unwrap();
+
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
+            "sub one\r\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fast_forward_refuses_an_added_gitlink_whose_preclone_hides_an_edit_behind_assume_unchanged()
+    {
+        let (root, watched_path, v1, _v2, _sub_a, _sub_b) =
+            added_gitlink_preclone_fixture(
+                "full-flow-added-gitlink-precloned-assume-unchanged",
+            );
+        set_entry_flags(&watched_path, 0x8000, 0);
+        std::fs::write(watched_path.join("sub/sub.txt"), "hidden edit\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("sub"),
+            "unexpected error: {:?}",
+            err
+        );
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
+            "hidden edit\n"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
