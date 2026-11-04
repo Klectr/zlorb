@@ -2616,7 +2616,12 @@ impl RepoProcessor {
             return false;
         };
         if loose_fallbacks {
-            return statuses.is_empty();
+            return statuses.is_empty()
+                && Self::_rollback_placeholder_loose_holds_only_plain_ignored(
+                    sub_repo,
+                    full_path,
+                    Path::new(""),
+                );
         }
         statuses.iter().all(|entry| {
             entry.status() == git2::Status::IGNORED
@@ -2624,6 +2629,63 @@ impl RepoProcessor {
                     .path()
                     .is_some_and(|path| Self::_rollback_dir_holds_no_files(&full_path.join(path)))
         })
+    }
+
+    fn _rollback_placeholder_loose_holds_only_plain_ignored(
+        sub_repo: &git2::Repository,
+        root: &Path,
+        rel_path: &Path,
+    ) -> bool {
+        let Ok(entries) = std::fs::read_dir(root.join(rel_path)) else {
+            return false;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return false;
+            };
+            let name = entry.file_name();
+            let child_rel = rel_path.join(&name);
+            let child_full = root.join(&child_rel);
+            let Ok(metadata) = std::fs::symlink_metadata(&child_full) else {
+                return false;
+            };
+            let file_type = metadata.file_type();
+            if rel_path.as_os_str().is_empty()
+                && name == std::ffi::OsStr::new(".git")
+                && !file_type.is_dir()
+            {
+                continue;
+            }
+            if file_type.is_dir() {
+                if git2::Repository::open_ext(
+                    &child_full,
+                    git2::RepositoryOpenFlags::NO_SEARCH,
+                    Vec::<&Path>::new(),
+                )
+                .is_ok()
+                {
+                    return false;
+                }
+                if child_full.join("HEAD").is_file()
+                    && child_full.join("objects").is_dir()
+                    && child_full.join("refs").is_dir()
+                {
+                    return false;
+                }
+                if !Self::_rollback_placeholder_loose_holds_only_plain_ignored(
+                    sub_repo, root, &child_rel,
+                ) {
+                    return false;
+                }
+            } else if file_type.is_file() {
+                if !sub_repo.is_path_ignored(&child_rel).unwrap_or(false) {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+        true
     }
 
     fn _rollback_dir_holds_no_files(dir: &Path) -> bool {
@@ -7905,6 +7967,133 @@ mod tests {
         assert_eq!(remote_ref.target(), Some(v2));
         drop(remote_ref);
         drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_classification_accepts_a_removed_gitlink_placeholder_with_a_plain_file_in_an_ignored_directory(
+    ) {
+        let (root, watched_path, v1, v2, _sub_a) = removed_gitlink_fixture(
+            "checkout-placeholder-removed-gitlink-ignored-dir-plain-file",
+        );
+        submodule_placeholder(&watched_path);
+        std::fs::write(
+            watched_path.join(".git/modules/sub/info/exclude"),
+            "logs/\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(watched_path.join("sub/logs")).unwrap();
+        std::fs::write(watched_path.join("sub/logs/x.txt"), "build log\n").unwrap();
+        let processor = processor_for(&watched_path);
+        let (safe, preserved, _absent, _unverifiable, failed) =
+            processor._checkout_restore_paths(v1, v2, &[PathBuf::from("sub")]);
+        assert!(!failed);
+        assert_eq!(safe, vec![PathBuf::from("sub")]);
+        assert!(preserved.is_empty());
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_classification_refuses_a_removed_gitlink_placeholder_with_a_nested_repo_in_an_ignored_directory(
+    ) {
+        let (root, watched_path, v1, v2, _sub_a) = removed_gitlink_fixture(
+            "checkout-placeholder-removed-gitlink-ignored-dir-nested-repo",
+        );
+        submodule_placeholder(&watched_path);
+        std::fs::write(
+            watched_path.join(".git/modules/sub/info/exclude"),
+            "cache/\n",
+        )
+        .unwrap();
+        let nested_path = watched_path.join("sub/cache/nested");
+        std::fs::create_dir_all(&nested_path).unwrap();
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let nested = git2::Repository::init_opts(&nested_path, &init_opts).unwrap();
+        std::fs::write(nested_path.join("inner.txt"), "inner\n").unwrap();
+        drop(nested);
+        let processor = processor_for(&watched_path);
+        let (safe, preserved, _absent, _unverifiable, failed) =
+            processor._checkout_restore_paths(v1, v2, &[PathBuf::from("sub")]);
+        assert!(!failed);
+        assert!(safe.is_empty());
+        assert_eq!(preserved, vec![PathBuf::from("sub")]);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(nested_path.join("inner.txt")).unwrap(),
+            "inner\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_classification_refuses_a_removed_gitlink_placeholder_with_a_symlink_in_an_ignored_directory(
+    ) {
+        let (root, watched_path, v1, v2, _sub_a) = removed_gitlink_fixture(
+            "checkout-placeholder-removed-gitlink-ignored-dir-symlink",
+        );
+        submodule_placeholder(&watched_path);
+        std::fs::write(
+            watched_path.join(".git/modules/sub/info/exclude"),
+            "cache/\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(watched_path.join("sub/cache")).unwrap();
+        std::fs::write(watched_path.join("sub/cache/target.txt"), "target\n").unwrap();
+        std::os::unix::fs::symlink("target.txt", watched_path.join("sub/cache/link"))
+            .unwrap();
+        let processor = processor_for(&watched_path);
+        let (safe, preserved, _absent, _unverifiable, failed) =
+            processor._checkout_restore_paths(v1, v2, &[PathBuf::from("sub")]);
+        assert!(!failed);
+        assert!(safe.is_empty());
+        assert_eq!(preserved, vec![PathBuf::from("sub")]);
+        drop(processor);
+        assert!(std::fs::symlink_metadata(watched_path.join("sub/cache/link"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_refuses_a_removed_gitlink_placeholder_with_a_nested_repo_in_an_ignored_directory(
+    ) {
+        let (root, watched_path, v1, v2, _sub_a) = removed_gitlink_fixture(
+            "checkout-step-placeholder-removed-gitlink-ignored-dir-nested-repo",
+        );
+        submodule_placeholder(&watched_path);
+        std::fs::write(
+            watched_path.join(".git/modules/sub/info/exclude"),
+            "cache/\n",
+        )
+        .unwrap();
+        let nested_path = watched_path.join("sub/cache/nested");
+        std::fs::create_dir_all(&nested_path).unwrap();
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let nested = git2::Repository::init_opts(&nested_path, &init_opts).unwrap();
+        std::fs::write(nested_path.join("inner.txt"), "inner\n").unwrap();
+        drop(nested);
+        let processor = processor_for(&watched_path);
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        match processor._checkout_and_get_ref(Some(v1), v2, Some(&changed)) {
+            Ok(_) => panic!(
+                "a removed gitlink placeholder holding a nested repo inside an ignored directory must refuse the checkout"
+            ),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("sub"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(nested_path.join("inner.txt")).unwrap(),
+            "inner\n"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
