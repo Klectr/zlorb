@@ -422,6 +422,33 @@ fn directory_is_tracked_typechange(
     true
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CleanRecheck {
+    Match,
+    Mismatch,
+    Unverifiable,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GuardRecheck {
+    NotCandidate,
+    Match,
+    Mismatch,
+    Unverifiable,
+}
+
+struct TrackedLocalChanges {
+    changes: Vec<PathBuf>,
+    unverifiable: Vec<PathBuf>,
+}
+
+fn unverifiable_clause(paths: &[PathBuf]) -> String {
+    format!(
+        "tracked files ({}) could not be checked against their clean conversion in the daemon environment, so they are treated as changed",
+        display_paths(paths)
+    )
+}
+
 pub struct RepoProcessor {
     pub(crate) repo_path: PathBuf,
     pub repo: git2::Repository,
@@ -570,12 +597,43 @@ impl RepoProcessor {
         Logger::info(format!("Should run build: {}", should_run_build));
 
         if should_run_build && !has_updates {
-            let tracked_changes = self._tracked_local_changes()?;
-            if !tracked_changes.is_empty() {
+            let tracked = self._tracked_local_changes()?;
+            let tracked_changes: Vec<PathBuf> = tracked
+                .changes
+                .into_iter()
+                .filter(|change| !self._path_is_skip_worktree_absent(change))
+                .collect();
+            let unverifiable: Vec<PathBuf> = tracked
+                .unverifiable
+                .into_iter()
+                .filter(|change| !self._path_is_skip_worktree_absent(change))
+                .collect();
+            if !tracked_changes.is_empty() || !unverifiable.is_empty() {
+                let mut clauses = Vec::new();
+                if !tracked_changes.is_empty() {
+                    clauses.push(format!(
+                        "local changes to tracked files ({}) are not part of the commit being built",
+                        display_paths(&tracked_changes)
+                    ));
+                }
+                if !unverifiable.is_empty() {
+                    clauses.push(format!(
+                        "{} and are not part of the commit being built",
+                        unverifiable_clause(&unverifiable)
+                    ));
+                }
+                let advice = if unverifiable.is_empty() {
+                    "Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch"
+                } else if tracked_changes.is_empty() {
+                    "The re-check errors above name the conversion that could not be applied; make it runnable by the daemon so these files can be verified"
+                } else {
+                    "Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch; make the conversion named in the re-check errors above runnable by the daemon so the unverifiable files can be verified"
+                };
                 return Err(ZlorbError::Other(format!(
-                    "Refusing to build {}: local changes to tracked files ({}) are not part of the commit being built. Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch",
+                    "Refusing to build {}: {}. {}",
                     self.config.name,
-                    display_paths(&tracked_changes)
+                    clauses.join("; "),
+                    advice
                 )));
             }
         }
@@ -646,12 +704,43 @@ impl RepoProcessor {
             return Ok(());
         }
         if !build_ran_this_cycle {
-            let tracked_changes = self._tracked_local_changes()?;
-            if !tracked_changes.is_empty() {
+            let tracked = self._tracked_local_changes()?;
+            let tracked_changes: Vec<PathBuf> = tracked
+                .changes
+                .into_iter()
+                .filter(|change| !self._path_is_skip_worktree_absent(change))
+                .collect();
+            let unverifiable: Vec<PathBuf> = tracked
+                .unverifiable
+                .into_iter()
+                .filter(|change| !self._path_is_skip_worktree_absent(change))
+                .collect();
+            if !tracked_changes.is_empty() || !unverifiable.is_empty() {
+                let mut clauses = Vec::new();
+                if !tracked_changes.is_empty() {
+                    clauses.push(format!(
+                        "local changes to tracked files ({}) are not part of the commit being restarted on",
+                        display_paths(&tracked_changes)
+                    ));
+                }
+                if !unverifiable.is_empty() {
+                    clauses.push(format!(
+                        "{} and are not part of the commit being restarted on",
+                        unverifiable_clause(&unverifiable)
+                    ));
+                }
+                let advice = if unverifiable.is_empty() {
+                    "Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch"
+                } else if tracked_changes.is_empty() {
+                    "The re-check errors above name the conversion that could not be applied; make it runnable by the daemon so these files can be verified"
+                } else {
+                    "Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch; make the conversion named in the re-check errors above runnable by the daemon so the unverifiable files can be verified"
+                };
                 return Err(ZlorbError::Other(format!(
-                    "Refusing to run the restart command for {}: local changes to tracked files ({}) are not part of the commit being restarted on. Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch",
+                    "Refusing to run the restart command for {}: {}. {}",
                     self.config.name,
-                    display_paths(&tracked_changes)
+                    clauses.join("; "),
+                    advice
                 )));
             }
         }
@@ -795,7 +884,7 @@ impl RepoProcessor {
             Ok(paths) => Some(paths),
             Err(e) => {
                 Logger::error(format!(
-                    "Could not compute the paths changed by the update for {}; falling back to refusing on any local change and checking out the whole tree: {}",
+                    "Could not compute the paths changed by the update for {}; falling back to refusing on any local change, and the checkout will be refused because the changed paths are unknown: {}",
                     self.config.name, e
                 ));
                 None
@@ -819,35 +908,59 @@ impl RepoProcessor {
         fetch_commit: &AnnotatedCommit,
         changed_paths: Option<&[PathBuf]>,
     ) -> Result<(), ZlorbError> {
-        let tracked_changes = self._tracked_local_changes()?;
-        let tracked_changes: Vec<PathBuf> = match changed_paths {
-            Some(paths) => tracked_changes
-                .into_iter()
-                .filter(|change| paths.contains(change))
-                .collect(),
-            None => tracked_changes,
+        let tracked = self._tracked_local_changes()?;
+        let (tracked_changes, unverifiable): (Vec<PathBuf>, Vec<PathBuf>) = match changed_paths {
+            Some(paths) => (
+                tracked
+                    .changes
+                    .into_iter()
+                    .filter(|change| paths.contains(change))
+                    .filter(|change| !self._path_is_skip_worktree_absent(change))
+                    .collect(),
+                tracked
+                    .unverifiable
+                    .into_iter()
+                    .filter(|change| paths.contains(change))
+                    .filter(|change| !self._path_is_skip_worktree_absent(change))
+                    .collect(),
+            ),
+            None => (tracked.changes, tracked.unverifiable),
         };
         let untracked_collisions = self._untracked_collisions(fetch_commit)?;
-        if tracked_changes.is_empty() && untracked_collisions.is_empty() {
+        if tracked_changes.is_empty()
+            && unverifiable.is_empty()
+            && untracked_collisions.is_empty()
+        {
             return Ok(());
         }
         let mut reasons = Vec::new();
         if !tracked_changes.is_empty() {
             reasons.push(format!(
-                "local changes to tracked files ({})",
+                "local changes to tracked files ({}) would be overwritten",
                 display_paths(&tracked_changes)
             ));
         }
+        if !unverifiable.is_empty() {
+            reasons.push(unverifiable_clause(&unverifiable));
+        }
         if !untracked_collisions.is_empty() {
             reasons.push(format!(
-                "untracked files in the way ({})",
+                "untracked files in the way ({}) would be overwritten",
                 untracked_collisions.join(", ")
             ));
         }
+        let advice = if unverifiable.is_empty() {
+            "Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch"
+        } else if tracked_changes.is_empty() && untracked_collisions.is_empty() {
+            "The re-check errors above name the conversion that could not be applied; make it runnable by the daemon so these files can be verified"
+        } else {
+            "Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch; make the conversion named in the re-check errors above runnable by the daemon so the unverifiable files can be verified"
+        };
         Err(ZlorbError::Other(format!(
-            "Refusing to fast-forward {}: {} would be overwritten. Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch",
+            "Refusing to fast-forward {}: {}. {}",
             self.config.name,
-            reasons.join(" and ")
+            reasons.join("; "),
+            advice
         )))
     }
 
@@ -904,6 +1017,13 @@ impl RepoProcessor {
                     };
                     let is_full_path = position + 1 == components.len();
                     let blocks_descent = !is_full_path && !metadata.is_dir();
+                    if is_full_path
+                        && entry.kind() == Some(git2::ObjectType::Commit)
+                        && !self._rollback_has_symlinked_ancestor(&workdir, &prefix)
+                        && self._precloned_gitlink_matches(&prefix, entry.id())
+                    {
+                        break;
+                    }
                     if (is_full_path || blocks_descent)
                         && index.get_path(&prefix, 0).is_none()
                     {
@@ -930,7 +1050,7 @@ impl RepoProcessor {
         Ok(collisions)
     }
 
-    fn _tracked_local_changes(&self) -> Result<Vec<PathBuf>, ZlorbError> {
+    fn _tracked_local_changes(&self) -> Result<TrackedLocalChanges, ZlorbError> {
         let mut opts = git2::StatusOptions::new();
         opts.include_untracked(false);
         opts.include_ignored(false);
@@ -938,26 +1058,123 @@ impl RepoProcessor {
             .repo
             .statuses(Some(&mut opts))
             .map_err(ZlorbError::Git)?;
-        let mut changes: Vec<PathBuf> = statuses
-            .iter()
-            .map(|entry| path_from_bytes(entry.path_bytes()))
-            .collect();
-        changes.extend(self._hidden_local_changes(&changes));
-        Ok(changes)
+        let mut changes: Vec<PathBuf> = Vec::new();
+        let mut unverifiable: Vec<PathBuf> = Vec::new();
+        for entry in statuses.iter() {
+            let path = path_from_bytes(entry.path_bytes());
+            match self._guard_recheck(entry.status(), &path) {
+                GuardRecheck::Match => {}
+                GuardRecheck::Unverifiable => unverifiable.push(path),
+                GuardRecheck::Mismatch | GuardRecheck::NotCandidate => changes.push(path),
+            }
+        }
+        let mut known = changes.clone();
+        known.extend(unverifiable.iter().cloned());
+        let hidden = self._hidden_local_changes(&known)?;
+        changes.extend(hidden.changes);
+        unverifiable.extend(hidden.unverifiable);
+        Ok(TrackedLocalChanges {
+            changes,
+            unverifiable,
+        })
     }
 
-    fn _hidden_local_changes(&self, known: &[PathBuf]) -> Vec<PathBuf> {
+    fn _guard_recheck(&self, status: git2::Status, path: &Path) -> GuardRecheck {
+        let other_flags = git2::Status::INDEX_NEW
+            | git2::Status::INDEX_MODIFIED
+            | git2::Status::INDEX_DELETED
+            | git2::Status::INDEX_RENAMED
+            | git2::Status::INDEX_TYPECHANGE
+            | git2::Status::WT_NEW
+            | git2::Status::WT_DELETED
+            | git2::Status::WT_TYPECHANGE
+            | git2::Status::WT_RENAMED
+            | git2::Status::WT_UNREADABLE
+            | git2::Status::IGNORED
+            | git2::Status::CONFLICTED;
+        if !status.contains(git2::Status::WT_MODIFIED) || status.intersects(other_flags) {
+            return GuardRecheck::NotCandidate;
+        }
         let Some(workdir) = self.repo.workdir().map(|path| path.to_path_buf()) else {
-            return Vec::new();
+            return GuardRecheck::NotCandidate;
+        };
+        let Ok(mut index) = self.repo.index() else {
+            return GuardRecheck::NotCandidate;
+        };
+        if index.read(true).is_err() {
+            return GuardRecheck::NotCandidate;
+        }
+        let Some(entry) = index.get_path(path, 0) else {
+            return GuardRecheck::NotCandidate;
+        };
+        if !matches!(entry.mode, 0o100644 | 0o100755) {
+            return GuardRecheck::NotCandidate;
+        }
+        let entry_id = entry.id;
+        let entry_mode = entry.mode;
+        let full_path = workdir.join(path);
+        let Ok(metadata) = std::fs::symlink_metadata(&full_path) else {
+            return GuardRecheck::NotCandidate;
+        };
+        if !metadata.file_type().is_file() {
+            return GuardRecheck::NotCandidate;
+        }
+        let file_mode = self
+            .repo
+            .config()
+            .and_then(|config| config.get_bool("core.fileMode"))
+            .unwrap_or(true);
+        if file_mode {
+            use std::os::unix::fs::PermissionsExt;
+            let disk_mode = if metadata.permissions().mode() & 0o111 != 0 {
+                0o100755
+            } else {
+                0o100644
+            };
+            if disk_mode != entry_mode {
+                return GuardRecheck::NotCandidate;
+            }
+        }
+        let recheck = if self._external_clean_filter_name(path).is_some() {
+            self._recheck_after_external_clean_filter_with_timeout(
+                &workdir,
+                path,
+                &full_path,
+                entry_id,
+                std::time::Duration::from_secs(30),
+            )
+        } else {
+            self._recheck_after_builtin_conversion(&workdir, path, &full_path, entry_id)
+        };
+        match recheck {
+            CleanRecheck::Match => GuardRecheck::Match,
+            CleanRecheck::Mismatch => GuardRecheck::Mismatch,
+            CleanRecheck::Unverifiable => GuardRecheck::Unverifiable,
+        }
+    }
+
+    fn _hidden_local_changes(
+        &self,
+        known: &[PathBuf],
+    ) -> Result<TrackedLocalChanges, ZlorbError> {
+        let Some(workdir) = self.repo.workdir().map(|path| path.to_path_buf()) else {
+            Logger::error(format!(
+                "{} has no working directory; local changes under skip-worktree or assume-unchanged cannot be checked, so the update is refused rather than risk discarding them",
+                self.config.name
+            ));
+            return Err(ZlorbError::Other(format!(
+                "{} has no working directory, so local changes under skip-worktree or assume-unchanged cannot be checked",
+                self.config.name
+            )));
         };
         let index = match self.repo.index() {
             Ok(index) => index,
             Err(e) => {
                 Logger::error(format!(
-                    "Could not read the index for {}; local changes under skip-worktree or assume-unchanged cannot be checked this cycle and would not be reported: {}",
+                    "Could not read the index for {}; local changes under skip-worktree or assume-unchanged cannot be checked, so the update is refused rather than risk discarding them: {}",
                     self.config.name, e
                 ));
-                return Vec::new();
+                return Err(ZlorbError::Git(e));
             }
         };
         let file_mode = self
@@ -966,6 +1183,7 @@ impl RepoProcessor {
             .and_then(|config| config.get_bool("core.fileMode"))
             .unwrap_or(true);
         let mut hidden = Vec::new();
+        let mut hidden_unverifiable = Vec::new();
         for entry in index.iter() {
             if entry.flags & 0x3000 != 0 {
                 continue;
@@ -979,22 +1197,38 @@ impl RepoProcessor {
                 continue;
             }
             let path = path_from_bytes(&entry.path);
-            if known.contains(&path) || hidden.contains(&path) {
+            if known.contains(&path) || hidden.contains(&path) || hidden_unverifiable.contains(&path) {
                 continue;
             }
             let full_path = workdir.join(&path);
             let metadata = match std::fs::symlink_metadata(&full_path) {
                 Ok(metadata) => metadata,
-                Err(_) => {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     if assume_unchanged {
                         hidden.push(path);
                     }
+                    continue;
+                }
+                Err(e) => {
+                    Logger::error(format!(
+                        "Could not check {} in {} for local changes under skip-worktree or assume-unchanged ({}); treating it as unverifiable so the update is refused rather than risk discarding it",
+                        path.display(),
+                        self.config.name,
+                        e
+                    ));
+                    hidden_unverifiable.push(path);
                     continue;
                 }
             };
             let file_type = metadata.file_type();
             if file_type.is_symlink() {
                 let Ok(target) = std::fs::read_link(&full_path) else {
+                    Logger::error(format!(
+                        "Could not read the symlink {} in {} to check it for local changes under skip-worktree or assume-unchanged; treating it as unverifiable so the update is refused rather than risk discarding it",
+                        path.display(),
+                        self.config.name
+                    ));
+                    hidden_unverifiable.push(path);
                     continue;
                 };
                 let target_bytes = {
@@ -1003,6 +1237,12 @@ impl RepoProcessor {
                 };
                 let Ok(disk_id) = Oid::hash_object(git2::ObjectType::Blob, &target_bytes)
                 else {
+                    Logger::error(format!(
+                        "Could not hash the symlink target of {} in {} to check it for local changes under skip-worktree or assume-unchanged; treating it as unverifiable so the update is refused rather than risk discarding it",
+                        path.display(),
+                        self.config.name
+                    ));
+                    hidden_unverifiable.push(path);
                     continue;
                 };
                 if disk_id != entry.id {
@@ -1035,12 +1275,12 @@ impl RepoProcessor {
                 Ok(writer) => writer,
                 Err(e) => {
                     Logger::error(format!(
-                        "Could not check {} in {} for local changes under skip-worktree or assume-unchanged ({}); treating it as changed so the update is refused rather than risk discarding it",
+                        "Could not check {} in {} for local changes under skip-worktree or assume-unchanged ({}); treating it as unverifiable so the update is refused rather than risk discarding it",
                         path.display(),
                         self.config.name,
                         e
                     ));
-                    hidden.push(path);
+                    hidden_unverifiable.push(path);
                     continue;
                 }
             };
@@ -1048,50 +1288,60 @@ impl RepoProcessor {
                 Ok(file) => file,
                 Err(e) => {
                     Logger::error(format!(
-                        "Could not read {} in {} to check it for local changes under skip-worktree or assume-unchanged ({}); treating it as changed so the update is refused rather than risk discarding it",
+                        "Could not read {} in {} to check it for local changes under skip-worktree or assume-unchanged ({}); treating it as unverifiable so the update is refused rather than risk discarding it",
                         path.display(),
                         self.config.name,
                         e
                     ));
-                    hidden.push(path);
+                    hidden_unverifiable.push(path);
                     continue;
                 }
             };
             if let Err(e) = std::io::copy(&mut file, &mut writer) {
                 Logger::error(format!(
-                    "Could not read {} in {} to check it for local changes under skip-worktree or assume-unchanged ({}); treating it as changed so the update is refused rather than risk discarding it",
+                    "Could not read {} in {} to check it for local changes under skip-worktree or assume-unchanged ({}); treating it as unverifiable so the update is refused rather than risk discarding it",
                     path.display(),
                     self.config.name,
                     e
                 ));
-                hidden.push(path);
+                hidden_unverifiable.push(path);
                 continue;
             }
             let disk_id = match writer.commit() {
                 Ok(disk_id) => disk_id,
                 Err(e) => {
                     Logger::error(format!(
-                        "Could not hash {} in {} to check it for local changes under skip-worktree or assume-unchanged ({}); treating it as changed so the update is refused rather than risk discarding it",
+                        "Could not hash {} in {} to check it for local changes under skip-worktree or assume-unchanged ({}); treating it as unverifiable so the update is refused rather than risk discarding it",
                         path.display(),
                         self.config.name,
                         e
                     ));
-                    hidden.push(path);
+                    hidden_unverifiable.push(path);
                     continue;
                 }
             };
             if disk_id != entry.id {
-                if !self._matches_after_external_clean_filter(
-                    &workdir,
-                    &path,
-                    &full_path,
-                    entry.id,
-                ) {
+                if self._external_clean_filter_name(&path).is_some() {
+                    match self._recheck_after_external_clean_filter_with_timeout(
+                        &workdir,
+                        &path,
+                        &full_path,
+                        entry.id,
+                        std::time::Duration::from_secs(30),
+                    ) {
+                        CleanRecheck::Match => {}
+                        CleanRecheck::Mismatch => hidden.push(path),
+                        CleanRecheck::Unverifiable => hidden_unverifiable.push(path),
+                    }
+                } else {
                     hidden.push(path);
                 }
             }
         }
-        hidden
+        Ok(TrackedLocalChanges {
+            changes: hidden,
+            unverifiable: hidden_unverifiable,
+        })
     }
 
     fn _matches_after_external_clean_filter(
@@ -1118,14 +1368,110 @@ impl RepoProcessor {
         expected: Oid,
         timeout: std::time::Duration,
     ) -> bool {
+        self._recheck_after_external_clean_filter_with_timeout(
+            workdir, path, full_path, expected, timeout,
+        ) == CleanRecheck::Match
+    }
+
+    fn _recheck_after_external_clean_filter_with_timeout(
+        &self,
+        workdir: &Path,
+        path: &Path,
+        full_path: &Path,
+        expected: Oid,
+        timeout: std::time::Duration,
+    ) -> CleanRecheck {
         let Some(filter_name) = self._external_clean_filter_name(path) else {
-            return false;
+            return CleanRecheck::Unverifiable;
         };
+        self._recheck_after_clean_conversion_with_timeout(
+            workdir,
+            path,
+            full_path,
+            expected,
+            timeout,
+            &format!("the external clean filter {}", filter_name),
+        )
+    }
+
+    fn _matches_after_builtin_conversion(
+        &self,
+        workdir: &Path,
+        path: &Path,
+        full_path: &Path,
+        expected: Oid,
+    ) -> bool {
+        self._recheck_after_builtin_conversion(workdir, path, full_path, expected)
+            == CleanRecheck::Match
+    }
+
+    fn _recheck_after_builtin_conversion(
+        &self,
+        workdir: &Path,
+        path: &Path,
+        full_path: &Path,
+        expected: Oid,
+    ) -> CleanRecheck {
+        if !self._builtin_conversion_may_apply(path) {
+            return CleanRecheck::Mismatch;
+        }
+        self._recheck_after_clean_conversion_with_timeout(
+            workdir,
+            path,
+            full_path,
+            expected,
+            std::time::Duration::from_secs(30),
+            "the built-in conversion (text/eol/ident/autocrlf)",
+        )
+    }
+
+    fn _builtin_conversion_may_apply(&self, path: &Path) -> bool {
+        for attr in ["text", "eol", "ident"] {
+            let Ok(value) = self
+                .repo
+                .get_attr(path, attr, git2::AttrCheckFlags::FILE_THEN_INDEX)
+            else {
+                continue;
+            };
+            if matches!(
+                git2::AttrValue::from_string(value),
+                git2::AttrValue::True | git2::AttrValue::String(_) | git2::AttrValue::Bytes(_)
+            ) {
+                return true;
+            }
+        }
+        if let Ok(config) = self.repo.config() {
+            if let Ok(autocrlf) = config.get_string("core.autocrlf") {
+                if matches!(
+                    autocrlf.trim().to_ascii_lowercase().as_str(),
+                    "true" | "yes" | "on" | "1" | "input" | ""
+                ) {
+                    return true;
+                }
+            }
+            if let Ok(autocrlf) = config.get_bool("core.autocrlf") {
+                if autocrlf {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn _recheck_after_clean_conversion_with_timeout(
+        &self,
+        workdir: &Path,
+        path: &Path,
+        full_path: &Path,
+        expected: Oid,
+        timeout: std::time::Duration,
+        conversion: &str,
+    ) -> CleanRecheck {
         Logger::info(format!(
-            "Re-checking {} in {} through git hash-object so the external clean filter {} is applied",
+            "Re-checking {} in {} through git hash-object so {} is applied",
             path.display(),
             self.config.name,
-            filter_name
+            conversion
         ));
         use std::os::unix::process::CommandExt;
         let mut command = Command::new("git");
@@ -1143,13 +1489,13 @@ impl RepoProcessor {
             Ok(child) => child,
             Err(e) => {
                 Logger::error(format!(
-                    "Could not run git hash-object for {} in {} to apply the external clean filter {} ({}); treating it as changed so the update is refused rather than risk discarding it",
+                    "Could not run git hash-object for {} in {} to apply {} ({}); treating it as changed so the update is refused rather than risk discarding it",
                     path.display(),
                     self.config.name,
-                    filter_name,
+                    conversion,
                     e
                 ));
-                return false;
+                return CleanRecheck::Unverifiable;
             }
         };
         let pgid = child.id() as libc::pid_t;
@@ -1160,12 +1506,12 @@ impl RepoProcessor {
                 let _ = child.kill();
                 let _ = child.wait();
                 Logger::error(format!(
-                    "git hash-object for {} in {} did not provide output pipes while applying the external clean filter {}; treating it as changed so the update is refused rather than risk discarding it",
+                    "git hash-object for {} in {} did not provide output pipes while applying {}; treating it as changed so the update is refused rather than risk discarding it",
                     path.display(),
                     self.config.name,
-                    filter_name
+                    conversion
                 ));
-                return false;
+                return CleanRecheck::Unverifiable;
             }
         };
         let deadline = std::time::Instant::now() + timeout;
@@ -1177,15 +1523,15 @@ impl RepoProcessor {
                         kill_process_group(pgid);
                         let _ = child.wait();
                         Logger::error(format!(
-                            "git hash-object for {} in {} did not finish within {} seconds while applying the external clean filter {}; treating it as changed so the update is refused rather than risk discarding it",
+                            "git hash-object for {} in {} did not finish within {} seconds while applying {}; treating it as changed so the update is refused rather than risk discarding it",
                             path.display(),
                             self.config.name,
                             timeout.as_secs(),
-                            filter_name
+                            conversion
                         ));
                         let drain_deadline = pipe_drain_deadline();
                         let _ = drains.finish(drain_deadline, pgid);
-                        return false;
+                        return CleanRecheck::Unverifiable;
                     }
                     drains.poll_ready(std::time::Duration::from_millis(10));
                 }
@@ -1194,62 +1540,84 @@ impl RepoProcessor {
                     let _ = child.kill();
                     let _ = child.wait();
                     Logger::error(format!(
-                        "Could not wait for git hash-object for {} in {} to apply the external clean filter {} ({}); treating it as changed so the update is refused rather than risk discarding it",
+                        "Could not wait for git hash-object for {} in {} to apply {} ({}); treating it as changed so the update is refused rather than risk discarding it",
                         path.display(),
                         self.config.name,
-                        filter_name,
+                        conversion,
                         e
                     ));
                     let drain_deadline = pipe_drain_deadline();
                     let _ = drains.finish(drain_deadline, pgid);
-                    return false;
+                    return CleanRecheck::Unverifiable;
                 }
             }
         };
         let drain_deadline = pipe_drain_deadline();
         if !drains.finish(drain_deadline, pgid) {
             Logger::error(format!(
-                "git hash-object for {} in {} left its output pipes open after exiting while applying the external clean filter {}; treating it as changed so the update is refused rather than risk discarding it",
+                "git hash-object for {} in {} left its output pipes open after exiting while applying {}; treating it as changed so the update is refused rather than risk discarding it",
                 path.display(),
                 self.config.name,
-                filter_name
+                conversion
             ));
-            return false;
+            return CleanRecheck::Unverifiable;
         }
         let stdout = std::mem::take(&mut drains.stdout.buf);
         let stderr = std::mem::take(&mut drains.stderr.buf);
         if !status.success() {
             Logger::error(format!(
-                "git hash-object for {} in {} failed ({}) while applying the external clean filter {}; treating it as changed so the update is refused rather than risk discarding it: {}",
+                "git hash-object for {} in {} failed ({}) while applying {}; treating it as changed so the update is refused rather than risk discarding it: {}",
                 path.display(),
                 self.config.name,
                 status,
-                filter_name,
+                conversion,
                 String::from_utf8_lossy(&stderr).trim()
             ));
-            return false;
+            return CleanRecheck::Unverifiable;
         }
         let text = String::from_utf8_lossy(&stdout);
         match Oid::from_str(text.trim()) {
             Ok(external_id) => {
-                if external_id != expected {
-                    Logger::warn(format!(
-                        "Re-checking {} in {} through the external clean filter {} still produced a different hash than the index; treating it as changed",
-                        path.display(),
-                        self.config.name,
-                        filter_name
-                    ));
+                if external_id == expected {
+                    CleanRecheck::Match
+                } else {
+                    let stderr_text = String::from_utf8_lossy(&stderr);
+                    let filter_failed = stderr_text.lines().any(|line| {
+                        (line.starts_with("error: external filter '") && line.contains("failed"))
+                            || (line.starts_with("error: initialization for subprocess '")
+                                && line.contains("failed"))
+                            || line.starts_with("error: cannot fork to run subprocess '")
+                            || line.starts_with("error: cannot run ")
+                    });
+                    if filter_failed {
+                        Logger::error(format!(
+                            "git hash-object for {} in {} reported that {} failed, so the hash it returned is of the unfiltered content and cannot be compared with the index; treating it as unverifiable rather than as a change: {}",
+                            path.display(),
+                            self.config.name,
+                            conversion,
+                            stderr_text.trim()
+                        ));
+                        CleanRecheck::Unverifiable
+                    } else {
+                        Logger::warn(format!(
+                            "Re-checking {} in {} through {} still produced a different hash than the index; treating it as changed",
+                            path.display(),
+                            self.config.name,
+                            conversion
+                        ));
+                        CleanRecheck::Mismatch
+                    }
                 }
-                external_id == expected
             }
             Err(e) => {
                 Logger::error(format!(
-                    "Could not parse the git hash-object result for {} in {} ({}); treating it as changed so the update is refused rather than risk discarding it",
+                    "Could not parse the git hash-object result for {} in {} while applying {} ({}); treating it as changed so the update is refused rather than risk discarding it",
                     path.display(),
                     self.config.name,
+                    conversion,
                     e
                 ));
-                false
+                CleanRecheck::Unverifiable
             }
         }
     }
@@ -1370,23 +1738,129 @@ impl RepoProcessor {
                 None
             }
         };
+        let preclone_paths: Vec<PathBuf> = match &changed_paths {
+            Some(paths) => self._seeded_preclone_paths(local_oid, fetch_oid, paths),
+            None => Vec::new(),
+        };
+        let mut restored_preclone_paths: Vec<PathBuf> = Vec::new();
+        if !preclone_paths.is_empty() {
+            match self.repo.index() {
+                Ok(mut index) => {
+                    let mut removed = Vec::new();
+                    let mut removal_failed = false;
+                    for path in &preclone_paths {
+                        match index.remove_path(path) {
+                            Ok(_) => removed.push(path.clone()),
+                            Err(e) => {
+                                removal_failed = true;
+                                Logger::error(format!(
+                                    "Could not drop the seeded gitlink entry for {} in {} from the index during rollback, so no seeded entries are being dropped and they are being preserved instead: {}",
+                                    path.display(),
+                                    self.config.name,
+                                    e
+                                ));
+                            }
+                        }
+                    }
+                    if removal_failed {
+                        if let Ok(fetch_tree) = self
+                            .repo
+                            .find_commit(fetch_oid)
+                            .and_then(|commit| commit.tree())
+                        {
+                            for path in &removed {
+                                if let Ok(fetch_entry) = fetch_tree.get_path(path) {
+                                    use std::os::unix::ffi::OsStrExt;
+                                    let path_bytes =
+                                        path.as_os_str().as_bytes().to_vec();
+                                    let entry = git2::IndexEntry {
+                                        ctime: git2::IndexTime::new(0, 0),
+                                        mtime: git2::IndexTime::new(0, 0),
+                                        dev: 0,
+                                        ino: 0,
+                                        mode: 0o160000,
+                                        uid: 0,
+                                        gid: 0,
+                                        file_size: 0,
+                                        id: fetch_entry.id(),
+                                        flags: path_bytes.len().min(0x0FFF) as u16,
+                                        flags_extended: 0,
+                                        path: path_bytes,
+                                    };
+                                    let _ = index.add(&entry);
+                                }
+                            }
+                        }
+                    } else if !removed.is_empty() {
+                        match index.write() {
+                            Ok(_) => {
+                                for path in &removed {
+                                    Logger::info(format!(
+                                        "Restored the pre-cloned submodule at {} in {} to its pre-update state during rollback: the gitlink entry the failed update added to the index is dropped and the clone on disk is left untouched",
+                                        path.display(),
+                                        self.config.name
+                                    ));
+                                }
+                                restored_preclone_paths = removed;
+                            }
+                            Err(e) => {
+                                let _ = index.read(true);
+                                Logger::error(format!(
+                                    "Could not drop the seeded gitlink entries ({}) in {} from the index during rollback, so they are being preserved instead: {}",
+                                    display_paths(&removed),
+                                    self.config.name,
+                                    e
+                                ));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    Logger::error(format!(
+                        "Could not load the index of {} during rollback to drop the seeded gitlink entries ({}), so they are being preserved instead: {}",
+                        self.config.name,
+                        display_paths(&preclone_paths),
+                        e
+                    ));
+                }
+            }
+        }
         let mut whole_tree_refused = false;
+        let mut absent_paths: Vec<PathBuf> = Vec::new();
         let (restore_paths, preserved_paths) = match &changed_paths {
             Some(paths) => {
-                let (safe, preserved) =
+                let (safe, mut preserved, absent, unverifiable, classification_failed) =
                     self._rollback_restore_paths(local_oid, fetch_oid, paths);
+                absent_paths = absent;
                 for path in &preserved {
+                    if classification_failed {
+                        Logger::error(format!(
+                            "Preserving {} in {} during rollback: the changed paths could not be classified because a commit, tree, or the working directory could not be loaded, so it is not being restored",
+                            path.display(),
+                            self.config.name
+                        ));
+                    } else {
+                        Logger::error(format!(
+                            "Preserving local changes to {} in {} during rollback: the file changed after the update was checked and matches neither the rolled-back commit nor the fetched commit, so it is not being restored and the working tree is left diverged from {}",
+                            path.display(),
+                            self.config.name,
+                            local_oid
+                        ));
+                    }
+                }
+                for path in &unverifiable {
                     Logger::error(format!(
-                        "Preserving local changes to {} in {} during rollback: the file changed after the update was checked and matches neither the rolled-back commit nor the fetched commit, so it is not being restored and the working tree is left diverged from {}",
+                        "Preserving {} in {} during rollback: the file could not be checked against its clean conversion in the daemon environment, so it is not being restored and the working tree is left diverged from {}",
                         path.display(),
                         self.config.name,
                         local_oid
                     ));
                 }
+                preserved.extend(unverifiable);
                 (Some(safe), preserved)
             }
             None => match self._rollback_scoped_fallback_paths(local_oid, fetch_oid) {
-                Some((safe, preserved)) => {
+                Some((safe, mut preserved, unverifiable)) => {
                     for path in &preserved {
                         Logger::error(format!(
                             "Preserving local changes to {} in {} during rollback: the path could not be certified as matching the rolled-back commit or the fetched commit, or it sits under a symlinked ancestor, so the scoped fallback restore is not writing to it and the working tree is left diverged from {}",
@@ -1395,6 +1869,15 @@ impl RepoProcessor {
                             local_oid
                         ));
                     }
+                    for path in &unverifiable {
+                        Logger::error(format!(
+                            "Preserving {} in {} during rollback: the file could not be checked against its clean conversion in the daemon environment, so it is not being restored and the working tree is left diverged from {}",
+                            path.display(),
+                            self.config.name,
+                            local_oid
+                        ));
+                    }
+                    preserved.extend(unverifiable);
                     (Some(safe), preserved)
                 }
                 None => {
@@ -1407,6 +1890,22 @@ impl RepoProcessor {
                 }
             },
         };
+        let restore_paths = restore_paths.map(|paths| {
+            paths
+                .into_iter()
+                .filter(|path| !preclone_paths.contains(path))
+                .collect::<Vec<PathBuf>>()
+        });
+        let mut preserved_paths: Vec<PathBuf> = preserved_paths
+            .into_iter()
+            .filter(|path| !restored_preclone_paths.contains(path))
+            .collect();
+        for path in &preclone_paths {
+            if !restored_preclone_paths.contains(path) && !preserved_paths.contains(path)
+            {
+                preserved_paths.push(path.clone());
+            }
+        }
         let mut tree_restored = false;
         let restore_result = match self.repo.find_commit(local_oid) {
             Ok(commit) => {
@@ -1428,7 +1927,23 @@ impl RepoProcessor {
             Err(e) => Err(e),
         };
         match restore_result {
-            Ok(_) => tree_restored = preserved_paths.is_empty(),
+            Ok(_) => {
+                tree_restored = preserved_paths.is_empty();
+                if tree_restored && !absent_paths.is_empty() {
+                    if let Err(e) =
+                        self._advance_index_entries_to_tree(local_oid, &absent_paths)
+                    {
+                        Logger::error(format!(
+                            "Could not move the index entries of the absent skip-worktree paths ({}) in {} back to the rolled-back commit {}: {}",
+                            display_paths(&absent_paths),
+                            self.config.name,
+                            local_oid,
+                            e
+                        ));
+                        tree_restored = false;
+                    }
+                }
+            }
             Err(e) => {
                 Logger::error(format!(
                     "Failed to restore the working tree after a failed fast-forward: {}",
@@ -1547,7 +2062,7 @@ impl RepoProcessor {
                 }
                 Some(git2::ObjectType::Commit) => {
                     child_is_real_dir
-                        && self._rollback_gitlink_matches(&child_full, entry.id(), true)
+                        && self._rollback_gitlink_matches(&child_full, entry.id(), true, false)
                 }
                 _ => self._rollback_disk_matches(
                     workdir,
@@ -1652,22 +2167,92 @@ impl RepoProcessor {
         local_oid: Oid,
         fetch_oid: Oid,
         changed_paths: &[PathBuf],
-    ) -> (Vec<PathBuf>, Vec<PathBuf>) {
-        let (Ok(local_commit), Ok(fetch_commit)) = (
-            self.repo.find_commit(local_oid),
-            self.repo.find_commit(fetch_oid),
-        ) else {
-            return (Vec::new(), changed_paths.to_vec());
+    ) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>, bool) {
+        self._classify_restore_paths(local_oid, fetch_oid, changed_paths, true)
+    }
+
+    fn _checkout_restore_paths(
+        &self,
+        local_oid: Oid,
+        fetch_oid: Oid,
+        changed_paths: &[PathBuf],
+    ) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>, bool) {
+        self._classify_restore_paths(local_oid, fetch_oid, changed_paths, false)
+    }
+
+    fn _classify_restore_paths(
+        &self,
+        local_oid: Oid,
+        fetch_oid: Oid,
+        changed_paths: &[PathBuf],
+        gitlink_ignored_blocks: bool,
+    ) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>, bool) {
+        let mut load_failed = false;
+        let local_commit = match self.repo.find_commit(local_oid) {
+            Ok(commit) => Some(commit),
+            Err(e) => {
+                load_failed = true;
+                Logger::error(format!(
+                    "Could not load the current commit {} for {} to classify the changed paths, so every changed path is being preserved and none will be overwritten: {}",
+                    local_oid, self.config.name, e
+                ));
+                None
+            }
         };
-        let (Ok(local_tree), Ok(fetch_tree)) = (local_commit.tree(), fetch_commit.tree())
-        else {
-            return (Vec::new(), changed_paths.to_vec());
+        let fetch_commit = match self.repo.find_commit(fetch_oid) {
+            Ok(commit) => Some(commit),
+            Err(e) => {
+                load_failed = true;
+                Logger::error(format!(
+                    "Could not load the fetched commit {} for {} to classify the changed paths, so every changed path is being preserved and none will be overwritten: {}",
+                    fetch_oid, self.config.name, e
+                ));
+                None
+            }
         };
+        if load_failed {
+            return (Vec::new(), changed_paths.to_vec(), Vec::new(), Vec::new(), true);
+        }
+        let local_commit = local_commit.unwrap();
+        let fetch_commit = fetch_commit.unwrap();
+        let local_tree = match local_commit.tree() {
+            Ok(tree) => Some(tree),
+            Err(e) => {
+                load_failed = true;
+                Logger::error(format!(
+                    "Could not load the tree of the current commit {} for {} to classify the changed paths, so every changed path is being preserved and none will be overwritten: {}",
+                    local_oid, self.config.name, e
+                ));
+                None
+            }
+        };
+        let fetch_tree = match fetch_commit.tree() {
+            Ok(tree) => Some(tree),
+            Err(e) => {
+                load_failed = true;
+                Logger::error(format!(
+                    "Could not load the tree of the fetched commit {} for {} to classify the changed paths, so every changed path is being preserved and none will be overwritten: {}",
+                    fetch_oid, self.config.name, e
+                ));
+                None
+            }
+        };
+        if load_failed {
+            return (Vec::new(), changed_paths.to_vec(), Vec::new(), Vec::new(), true);
+        }
+        let local_tree = local_tree.unwrap();
+        let fetch_tree = fetch_tree.unwrap();
         let Some(workdir) = self.repo.workdir().map(|path| path.to_path_buf()) else {
-            return (Vec::new(), changed_paths.to_vec());
+            Logger::error(format!(
+                "{} has no working directory to classify the changed paths against, so every changed path is being preserved and none will be overwritten",
+                self.config.name
+            ));
+            return (Vec::new(), changed_paths.to_vec(), Vec::new(), Vec::new(), true);
         };
         let mut safe = Vec::new();
         let mut preserved = Vec::new();
+        let mut absent = Vec::new();
+        let mut unverifiable = Vec::new();
         for path in changed_paths {
             if self._rollback_has_symlinked_ancestor(&workdir, path) {
                 preserved.push(path.clone());
@@ -1679,33 +2264,130 @@ impl RepoProcessor {
             let fetch_id = fetch_entry.as_ref().map(|entry| entry.id());
             let local_mode = local_entry.as_ref().map(|entry| entry.filemode());
             let fetch_mode = fetch_entry.as_ref().map(|entry| entry.filemode());
-            if std::fs::symlink_metadata(workdir.join(path)).is_err() {
+            if matches!(
+                std::fs::symlink_metadata(workdir.join(path)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound
+            ) {
                 if local_id.is_some() && fetch_id.is_some() {
-                    preserved.push(path.clone());
+                    if self._index_path_is_skip_worktree(path) {
+                        Logger::info(format!(
+                            "{} in {} is absent under skip-worktree or sparse checkout, so it is not a local deletion: the path is left absent and is not written",
+                            path.display(),
+                            self.config.name
+                        ));
+                        absent.push(path.clone());
+                    } else {
+                        preserved.push(path.clone());
+                    }
                 } else {
                     safe.push(path.clone());
                 }
                 continue;
             }
-            if self._rollback_disk_matches(&workdir, path, local_id, local_mode)
-                || self._rollback_disk_matches(&workdir, path, fetch_id, fetch_mode)
+            let local_recheck =
+                self._rollback_disk_recheck(&workdir, path, local_id, local_mode);
+            if local_recheck == CleanRecheck::Match {
+                safe.push(path.clone());
+                continue;
+            }
+            let fetch_recheck = if (local_id, local_mode) == (fetch_id, fetch_mode) {
+                local_recheck
+            } else {
+                self._rollback_disk_recheck(&workdir, path, fetch_id, fetch_mode)
+            };
+            if fetch_recheck == CleanRecheck::Match
                 || self._rollback_structured_matches(
-                    &workdir, path, local_id, local_mode, fetch_id, fetch_mode,
+                    &workdir,
+                    path,
+                    local_id,
+                    local_mode,
+                    fetch_id,
+                    fetch_mode,
+                    gitlink_ignored_blocks,
                 )
             {
                 safe.push(path.clone());
+            } else if local_recheck == CleanRecheck::Unverifiable
+                || fetch_recheck == CleanRecheck::Unverifiable
+            {
+                unverifiable.push(path.clone());
             } else {
                 preserved.push(path.clone());
             }
         }
-        (safe, preserved)
+        (safe, preserved, absent, unverifiable, false)
+    }
+
+    fn _path_is_skip_worktree_absent(&self, path: &Path) -> bool {
+        let Some(workdir) = self.repo.workdir() else {
+            return false;
+        };
+        matches!(
+            std::fs::symlink_metadata(workdir.join(path)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        ) && self._index_path_is_skip_worktree(path)
+    }
+
+    fn _advance_index_entries_to_tree(
+        &self,
+        oid: Oid,
+        paths: &[PathBuf],
+    ) -> Result<(), ZlorbError> {
+        let commit = self.repo.find_commit(oid).map_err(ZlorbError::Git)?;
+        let tree = commit.tree().map_err(ZlorbError::Git)?;
+        let mut index = self.repo.index().map_err(ZlorbError::Git)?;
+        for path in paths {
+            let Some(existing) = index.get_path(path, 0) else {
+                continue;
+            };
+            let mut entry = git2::IndexEntry {
+                ctime: existing.ctime,
+                mtime: existing.mtime,
+                dev: existing.dev,
+                ino: existing.ino,
+                mode: existing.mode,
+                uid: existing.uid,
+                gid: existing.gid,
+                file_size: existing.file_size,
+                id: existing.id,
+                flags: existing.flags,
+                flags_extended: existing.flags_extended,
+                path: existing.path.clone(),
+            };
+            match tree.get_path(path) {
+                Ok(tree_entry) => {
+                    entry.id = tree_entry.id();
+                    entry.mode = tree_entry.filemode() as u32;
+                    index.add(&entry).map_err(ZlorbError::Git)?;
+                }
+                Err(_) => {
+                    index.remove_path(path).map_err(ZlorbError::Git)?;
+                }
+            }
+        }
+        index.write().map_err(ZlorbError::Git)?;
+        Ok(())
+    }
+
+    fn _index_path_is_skip_worktree(&self, path: &Path) -> bool {
+        let Ok(mut index) = self.repo.index() else {
+            return false;
+        };
+        if index.read(true).is_err() {
+            return false;
+        }
+        let Some(entry) = index.get_path(path, 0) else {
+            return false;
+        };
+        git2::IndexEntryExtendedFlag::from_bits_truncate(entry.flags_extended)
+            .is_skip_worktree()
     }
 
     fn _rollback_scoped_fallback_paths(
         &self,
         local_oid: Oid,
         fetch_oid: Oid,
-    ) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
+    ) -> Option<(Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>)> {
         let workdir = self.repo.workdir()?.to_path_buf();
         let local_tree = self.repo.find_commit(local_oid).ok()?.tree().ok()?;
         let fetch_tree = self.repo.find_commit(fetch_oid).ok()?.tree().ok()?;
@@ -1738,6 +2420,7 @@ impl RepoProcessor {
         }
         let mut safe = Vec::new();
         let mut preserved = Vec::new();
+        let mut unverifiable = Vec::new();
         for path in paths {
             if self._rollback_has_symlinked_ancestor(&workdir, &path) {
                 preserved.push(path);
@@ -1749,7 +2432,10 @@ impl RepoProcessor {
             let fetch_id = fetch_entry.as_ref().map(|entry| entry.id());
             let local_mode = local_entry.as_ref().map(|entry| entry.filemode());
             let fetch_mode = fetch_entry.as_ref().map(|entry| entry.filemode());
-            if std::fs::symlink_metadata(workdir.join(&path)).is_err() {
+            if matches!(
+                std::fs::symlink_metadata(workdir.join(&path)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound
+            ) {
                 if local_id.is_some() && fetch_id.is_some() {
                     preserved.push(path);
                 } else {
@@ -1757,18 +2443,29 @@ impl RepoProcessor {
                 }
                 continue;
             }
-            if self._rollback_disk_matches(&workdir, &path, local_id, local_mode)
-                || self._rollback_disk_matches(&workdir, &path, fetch_id, fetch_mode)
+            let local_recheck =
+                self._rollback_disk_recheck(&workdir, &path, local_id, local_mode);
+            if local_recheck == CleanRecheck::Match {
+                safe.push(path);
+                continue;
+            }
+            let fetch_recheck =
+                self._rollback_disk_recheck(&workdir, &path, fetch_id, fetch_mode);
+            if fetch_recheck == CleanRecheck::Match
                 || self._rollback_structured_matches(
-                    &workdir, &path, local_id, local_mode, fetch_id, fetch_mode,
+                    &workdir, &path, local_id, local_mode, fetch_id, fetch_mode, true,
                 )
             {
                 safe.push(path);
+            } else if local_recheck == CleanRecheck::Unverifiable
+                || fetch_recheck == CleanRecheck::Unverifiable
+            {
+                unverifiable.push(path);
             } else {
                 preserved.push(path);
             }
         }
-        Some((safe, preserved))
+        Some((safe, preserved, unverifiable))
     }
 
     fn _rollback_has_symlinked_ancestor(&self, workdir: &Path, path: &Path) -> bool {
@@ -1793,33 +2490,48 @@ impl RepoProcessor {
         entry_id: Option<Oid>,
         entry_mode: Option<i32>,
     ) -> bool {
+        self._rollback_disk_recheck(workdir, path, entry_id, entry_mode) == CleanRecheck::Match
+    }
+
+    fn _rollback_disk_recheck(
+        &self,
+        workdir: &Path,
+        path: &Path,
+        entry_id: Option<Oid>,
+        entry_mode: Option<i32>,
+    ) -> CleanRecheck {
         let Some(expected) = entry_id else {
-            return false;
+            return CleanRecheck::Mismatch;
         };
         let full_path = workdir.join(path);
         let Ok(metadata) = std::fs::symlink_metadata(&full_path) else {
-            return false;
+            return CleanRecheck::Mismatch;
         };
         let file_type = metadata.file_type();
         if file_type.is_symlink() {
             if entry_mode != Some(0o120000) {
-                return false;
+                return CleanRecheck::Mismatch;
             }
             let Ok(target) = std::fs::read_link(&full_path) else {
-                return false;
+                return CleanRecheck::Mismatch;
             };
             let target_bytes = {
                 use std::os::unix::ffi::OsStrExt;
                 target.as_os_str().as_bytes().to_vec()
             };
-            return Oid::hash_object(git2::ObjectType::Blob, &target_bytes).ok()
-                == Some(expected);
+            return if Oid::hash_object(git2::ObjectType::Blob, &target_bytes).ok()
+                == Some(expected)
+            {
+                CleanRecheck::Match
+            } else {
+                CleanRecheck::Mismatch
+            };
         }
         if !file_type.is_file() {
-            return false;
+            return CleanRecheck::Mismatch;
         }
         if !matches!(entry_mode, Some(0o100644) | Some(0o100755)) {
-            return false;
+            return CleanRecheck::Mismatch;
         }
         let file_mode = self
             .repo
@@ -1834,19 +2546,28 @@ impl RepoProcessor {
                 0o100644
             };
             if Some(disk_mode) != entry_mode {
-                return false;
+                return CleanRecheck::Mismatch;
             }
         }
         if let Ok(contents) = std::fs::read(&full_path) {
             if Oid::hash_object(git2::ObjectType::Blob, &contents).ok() == Some(expected)
             {
-                return true;
+                return CleanRecheck::Match;
             }
         }
         if self._rollback_filtered_disk_id(path, &full_path) == Some(expected) {
-            return true;
+            return CleanRecheck::Match;
         }
-        self._matches_after_external_clean_filter(workdir, path, &full_path, expected)
+        if self._external_clean_filter_name(path).is_none() {
+            return CleanRecheck::Mismatch;
+        }
+        self._recheck_after_external_clean_filter_with_timeout(
+            workdir,
+            path,
+            &full_path,
+            expected,
+            std::time::Duration::from_secs(30),
+        )
     }
 
     fn _rollback_structured_matches(
@@ -1857,6 +2578,7 @@ impl RepoProcessor {
         local_mode: Option<i32>,
         fetch_id: Option<Oid>,
         fetch_mode: Option<i32>,
+        gitlink_ignored_blocks: bool,
     ) -> bool {
         let full_path = workdir.join(path);
         let Ok(metadata) = std::fs::symlink_metadata(&full_path) else {
@@ -1865,16 +2587,22 @@ impl RepoProcessor {
         if !metadata.file_type().is_dir() {
             return false;
         }
-        for (entry_id, entry_mode) in [(local_id, local_mode), (fetch_id, fetch_mode)] {
+        for (entry_id, entry_mode, other_mode) in [
+            (local_id, local_mode, fetch_mode),
+            (fetch_id, fetch_mode, local_mode),
+        ] {
             let Some(expected) = entry_id else {
                 continue;
             };
-            let both_gitlinks =
-                local_mode == Some(0o160000) && fetch_mode == Some(0o160000);
+            let include_ignored = other_mode != Some(0o160000)
+                && (gitlink_ignored_blocks || other_mode.is_some());
             let matches = match entry_mode {
-                Some(0o160000) => {
-                    self._rollback_gitlink_matches(&full_path, expected, !both_gitlinks)
-                }
+                Some(0o160000) => self._rollback_gitlink_matches(
+                    &full_path,
+                    expected,
+                    include_ignored,
+                    !gitlink_ignored_blocks && !include_ignored,
+                ),
                 Some(0o40000) => match self.repo.find_tree(expected) {
                     Ok(tree) => self._rollback_dir_matches_tree(workdir, path, &tree),
                     Err(_) => false,
@@ -1888,17 +2616,323 @@ impl RepoProcessor {
         false
     }
 
+    fn _precloned_gitlink_matches(&self, path: &Path, expected: Oid) -> bool {
+        let Some(workdir) = self.repo.workdir().map(|workdir| workdir.to_path_buf()) else {
+            return false;
+        };
+        let full_path = workdir.join(path);
+        if self._rollback_has_symlinked_ancestor(&workdir, path) {
+            return false;
+        }
+        if !std::fs::symlink_metadata(&full_path)
+            .map(|metadata| metadata.file_type().is_dir())
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        let Ok(sub_repo) = git2::Repository::open_ext(
+            &full_path,
+            git2::RepositoryOpenFlags::NO_SEARCH,
+            Vec::<&Path>::new(),
+        ) else {
+            return false;
+        };
+        if sub_repo.is_bare() {
+            return false;
+        }
+        let workdir_matches = match (sub_repo.workdir(), std::fs::canonicalize(&full_path)) {
+            (Some(sub_workdir), Ok(path)) => std::fs::canonicalize(sub_workdir)
+                .map(|dir| dir == path)
+                .unwrap_or(false),
+            _ => false,
+        };
+        if !workdir_matches {
+            return false;
+        }
+        if sub_repo.head().ok().and_then(|head| head.target()) != Some(expected) {
+            return false;
+        }
+        let Ok(sub_index) = sub_repo.index() else {
+            return false;
+        };
+        let Some(sub_workdir) = sub_repo.workdir().map(|dir| dir.to_path_buf()) else {
+            return false;
+        };
+        let sub_file_mode = sub_repo
+            .config()
+            .and_then(|config| config.get_bool("core.fileMode"))
+            .unwrap_or(true);
+        let mut skip_worktree_absent: Vec<PathBuf> = Vec::new();
+        for entry in sub_index.iter() {
+            let skip_worktree = entry.flags & 0x4000 != 0
+                && git2::IndexEntryExtendedFlag::from_bits_truncate(entry.flags_extended)
+                    .is_skip_worktree();
+            let assume_unchanged = entry.flags & 0x8000 != 0;
+            if !skip_worktree && !assume_unchanged {
+                continue;
+            }
+            let rel_path = path_from_bytes(&entry.path);
+            let flagged_full = sub_workdir.join(&rel_path);
+            let flagged_metadata = match std::fs::symlink_metadata(&flagged_full) {
+                Ok(metadata) => metadata,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        && skip_worktree
+                        && !assume_unchanged =>
+                {
+                    skip_worktree_absent.push(rel_path);
+                    continue;
+                }
+                Err(_) => return false,
+            };
+            let flagged_type = flagged_metadata.file_type();
+            let verified = match entry.mode {
+                0o120000 => {
+                    flagged_type.is_symlink()
+                        && std::fs::read_link(&flagged_full)
+                            .ok()
+                            .and_then(|target| {
+                                use std::os::unix::ffi::OsStrExt;
+                                Oid::hash_object(
+                                    git2::ObjectType::Blob,
+                                    target.as_os_str().as_bytes(),
+                                )
+                                .ok()
+                            })
+                            == Some(entry.id)
+                }
+                0o100644 | 0o100755 => {
+                    if !flagged_type.is_file() {
+                        return false;
+                    }
+                    if sub_file_mode {
+                        use std::os::unix::fs::PermissionsExt;
+                        let disk_mode =
+                            if flagged_metadata.permissions().mode() & 0o111 != 0 {
+                                0o100755
+                            } else {
+                                0o100644
+                            };
+                        if disk_mode != entry.mode {
+                            return false;
+                        }
+                    }
+                    std::fs::read(&flagged_full)
+                        .ok()
+                        .and_then(|contents| {
+                            Oid::hash_object(git2::ObjectType::Blob, &contents).ok()
+                        })
+                        == Some(entry.id)
+                        || sub_repo
+                            .blob_writer(Some(&rel_path))
+                            .ok()
+                            .and_then(|mut writer| {
+                                let mut file = std::fs::File::open(&flagged_full).ok()?;
+                                std::io::copy(&mut file, &mut writer).ok()?;
+                                writer.commit().ok()
+                            })
+                            == Some(entry.id)
+                }
+                0o160000 => {
+                    if !flagged_type.is_dir() {
+                        return false;
+                    }
+                    match git2::Repository::open_ext(
+                        &flagged_full,
+                        git2::RepositoryOpenFlags::NO_SEARCH,
+                        Vec::<&Path>::new(),
+                    ) {
+                        Ok(nested) => {
+                            !nested.is_bare()
+                                && match (
+                                    nested.workdir(),
+                                    std::fs::canonicalize(&flagged_full),
+                                ) {
+                                    (Some(nested_workdir), Ok(flagged_path)) => {
+                                        std::fs::canonicalize(nested_workdir)
+                                            .map(|dir| dir == flagged_path)
+                                            .unwrap_or(false)
+                                    }
+                                    _ => false,
+                                }
+                                && nested.head().ok().and_then(|head| head.target())
+                                    == Some(entry.id)
+                        }
+                        Err(_) => false,
+                    }
+                }
+                _ => return false,
+            };
+            if !verified {
+                return false;
+            }
+        }
+        let mut status_options = git2::StatusOptions::new();
+        status_options.include_untracked(true);
+        status_options.include_ignored(false);
+        status_options.recurse_untracked_dirs(true);
+        match sub_repo.statuses(Some(&mut status_options)) {
+            Ok(statuses) => statuses.iter().all(|status_entry| {
+                status_entry.status() == git2::Status::WT_DELETED
+                    && skip_worktree_absent
+                        .contains(&path_from_bytes(status_entry.path_bytes()))
+                    && matches!(
+                        std::fs::symlink_metadata(
+                            sub_workdir.join(path_from_bytes(status_entry.path_bytes()))
+                        ),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+                    )
+            }),
+            Err(_) => false,
+        }
+    }
+
+    fn _seed_added_gitlink_preclones(
+        &self,
+        local_oid: Oid,
+        fetch_oid: Oid,
+        changed_paths: &[PathBuf],
+    ) -> Result<Vec<PathBuf>, ZlorbError> {
+        let local_commit = self.repo.find_commit(local_oid).map_err(|e| {
+            ZlorbError::Other(format!(
+                "Refusing to fast-forward {}: the current commit {} could not be loaded to seed the pre-cloned submodule gitlinks ({}), so no path is being handed to the checkout unseeded",
+                self.config.name, local_oid, e
+            ))
+        })?;
+        let fetch_commit = self.repo.find_commit(fetch_oid).map_err(|e| {
+            ZlorbError::Other(format!(
+                "Refusing to fast-forward {}: the fetched commit {} could not be loaded to seed the pre-cloned submodule gitlinks ({}), so no path is being handed to the checkout unseeded",
+                self.config.name, fetch_oid, e
+            ))
+        })?;
+        let local_tree = local_commit.tree().map_err(|e| {
+            ZlorbError::Other(format!(
+                "Refusing to fast-forward {}: the tree of the current commit {} could not be loaded to seed the pre-cloned submodule gitlinks ({}), so no path is being handed to the checkout unseeded",
+                self.config.name, local_oid, e
+            ))
+        })?;
+        let fetch_tree = fetch_commit.tree().map_err(|e| {
+            ZlorbError::Other(format!(
+                "Refusing to fast-forward {}: the tree of the fetched commit {} could not be loaded to seed the pre-cloned submodule gitlinks ({}), so no path is being handed to the checkout unseeded",
+                self.config.name, fetch_oid, e
+            ))
+        })?;
+        let mut index = self.repo.index().map_err(ZlorbError::Git)?;
+        let mut seeded: Vec<PathBuf> = Vec::new();
+        for path in changed_paths {
+            if local_tree.get_path(path).is_ok() {
+                continue;
+            }
+            let Ok(fetch_entry) = fetch_tree.get_path(path) else {
+                continue;
+            };
+            if fetch_entry.filemode() != 0o160000 {
+                continue;
+            }
+            if !self._precloned_gitlink_matches(path, fetch_entry.id()) {
+                continue;
+            }
+            use std::os::unix::ffi::OsStrExt;
+            let path_bytes = path.as_os_str().as_bytes().to_vec();
+            let entry = git2::IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode: 0o160000,
+                uid: 0,
+                gid: 0,
+                file_size: 0,
+                id: fetch_entry.id(),
+                flags: path_bytes.len().min(0x0FFF) as u16,
+                flags_extended: 0,
+                path: path_bytes,
+            };
+            if let Err(e) = index.add(&entry) {
+                for seeded_path in &seeded {
+                    let _ = index.remove_path(seeded_path);
+                }
+                return Err(ZlorbError::Other(format!(
+                    "Refusing to fast-forward {}: the gitlink entry for the pre-cloned submodule at {} could not be seeded into the index ({}), so the path is not being handed to the checkout, which would delete the clone",
+                    self.config.name,
+                    path.display(),
+                    e
+                )));
+            }
+            seeded.push(path.clone());
+        }
+        if !seeded.is_empty() {
+            if let Err(e) = index.write() {
+                for seeded_path in &seeded {
+                    let _ = index.remove_path(seeded_path);
+                }
+                return Err(ZlorbError::Other(format!(
+                    "Refusing to fast-forward {}: the seeded gitlink entries ({}) could not be written to the index ({}), so those paths are not being handed to the checkout, which would delete the pre-cloned submodules",
+                    self.config.name,
+                    display_paths(&seeded),
+                    e
+                )));
+            }
+        }
+        Ok(seeded)
+    }
+
+    fn _seeded_preclone_paths(
+        &self,
+        local_oid: Oid,
+        fetch_oid: Oid,
+        changed_paths: &[PathBuf],
+    ) -> Vec<PathBuf> {
+        let (Ok(local_commit), Ok(fetch_commit)) = (
+            self.repo.find_commit(local_oid),
+            self.repo.find_commit(fetch_oid),
+        ) else {
+            return Vec::new();
+        };
+        let (Ok(local_tree), Ok(fetch_tree)) = (local_commit.tree(), fetch_commit.tree())
+        else {
+            return Vec::new();
+        };
+        let Ok(index) = self.repo.index() else {
+            return Vec::new();
+        };
+        let mut paths = Vec::new();
+        for path in changed_paths {
+            if local_tree.get_path(path).is_ok() {
+                continue;
+            }
+            let Ok(fetch_entry) = fetch_tree.get_path(path) else {
+                continue;
+            };
+            if fetch_entry.filemode() != 0o160000 {
+                continue;
+            }
+            let seeded = matches!(
+                index.get_path(path, 0),
+                Some(entry) if entry.mode == 0o160000 && entry.id == fetch_entry.id()
+            );
+            if seeded && self._precloned_gitlink_matches(path, fetch_entry.id()) {
+                paths.push(path.clone());
+            }
+        }
+        paths
+    }
+
     fn _rollback_gitlink_matches(
         &self,
         full_path: &Path,
         expected: Oid,
         include_ignored: bool,
+        loose_fallbacks: bool,
     ) -> bool {
         match git2::Repository::open(full_path) {
             Ok(sub_repo) => {
                 let Some(head) = sub_repo.head().ok().and_then(|head| head.target()) else {
-                    return self
-                        ._rollback_gitlink_is_submodule_placeholder(&sub_repo, full_path);
+                    return self._rollback_gitlink_is_submodule_placeholder(
+                        &sub_repo,
+                        full_path,
+                        loose_fallbacks,
+                    );
                 };
                 if head != expected {
                     return false;
@@ -1906,18 +2940,194 @@ impl RepoProcessor {
                 if sub_repo.is_bare() {
                     return false;
                 }
+                let Some(sub_workdir) = sub_repo.workdir().map(|dir| dir.to_path_buf()) else {
+                    return false;
+                };
+                let Ok(mut sub_index) = sub_repo.index() else {
+                    return false;
+                };
+                if sub_index.read(true).is_err() {
+                    return false;
+                }
+                let Ok(head_tree) = sub_repo
+                    .find_commit(expected)
+                    .and_then(|commit| commit.tree())
+                else {
+                    return false;
+                };
+                let sub_file_mode = sub_repo
+                    .config()
+                    .and_then(|config| config.get_bool("core.fileMode"))
+                    .unwrap_or(true);
+                let mut skip_worktree_absent: Vec<PathBuf> = Vec::new();
+                for entry in sub_index.iter() {
+                    let skip_worktree = entry.flags & 0x4000 != 0
+                        && git2::IndexEntryExtendedFlag::from_bits_truncate(
+                            entry.flags_extended,
+                        )
+                        .is_skip_worktree();
+                    let assume_unchanged = entry.flags & 0x8000 != 0;
+                    if !skip_worktree && !assume_unchanged {
+                        continue;
+                    }
+                    let rel_path = path_from_bytes(&entry.path);
+                    if self._rollback_has_symlinked_ancestor(&sub_workdir, &rel_path) {
+                        return false;
+                    }
+                    match head_tree.get_path(&rel_path) {
+                        Ok(tree_entry)
+                            if tree_entry.id() == entry.id
+                                && tree_entry.filemode() as u32 == entry.mode => {}
+                        _ => return false,
+                    }
+                    let flagged_full = sub_workdir.join(&rel_path);
+                    let flagged_metadata = match std::fs::symlink_metadata(&flagged_full) {
+                        Ok(metadata) => metadata,
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::NotFound
+                                && skip_worktree
+                                && !assume_unchanged =>
+                        {
+                            skip_worktree_absent.push(rel_path);
+                            continue;
+                        }
+                        Err(_) => return false,
+                    };
+                    let flagged_type = flagged_metadata.file_type();
+                    let verified = match entry.mode {
+                        0o120000 => {
+                            flagged_type.is_symlink()
+                                && std::fs::read_link(&flagged_full)
+                                    .ok()
+                                    .and_then(|target| {
+                                        use std::os::unix::ffi::OsStrExt;
+                                        Oid::hash_object(
+                                            git2::ObjectType::Blob,
+                                            target.as_os_str().as_bytes(),
+                                        )
+                                        .ok()
+                                    })
+                                    == Some(entry.id)
+                        }
+                        0o100644 | 0o100755 => {
+                            if !flagged_type.is_file() {
+                                return false;
+                            }
+                            if sub_file_mode {
+                                use std::os::unix::fs::PermissionsExt;
+                                let disk_mode =
+                                    if flagged_metadata.permissions().mode() & 0o111 != 0 {
+                                        0o100755
+                                    } else {
+                                        0o100644
+                                    };
+                                if disk_mode != entry.mode {
+                                    return false;
+                                }
+                            }
+                            std::fs::read(&flagged_full)
+                                .ok()
+                                .and_then(|contents| {
+                                    Oid::hash_object(git2::ObjectType::Blob, &contents)
+                                        .ok()
+                                })
+                                == Some(entry.id)
+                                || sub_repo
+                                    .blob_writer(Some(&rel_path))
+                                    .ok()
+                                    .and_then(|mut writer| {
+                                        let mut file =
+                                            std::fs::File::open(&flagged_full).ok()?;
+                                        std::io::copy(&mut file, &mut writer).ok()?;
+                                        writer.commit().ok()
+                                    })
+                                    == Some(entry.id)
+                        }
+                        0o160000 => {
+                            if !flagged_type.is_dir() {
+                                return false;
+                            }
+                            match git2::Repository::open_ext(
+                                &flagged_full,
+                                git2::RepositoryOpenFlags::NO_SEARCH,
+                                Vec::<&Path>::new(),
+                            ) {
+                                Ok(nested) => {
+                                    !nested.is_bare()
+                                        && match (
+                                            nested.workdir(),
+                                            std::fs::canonicalize(&flagged_full),
+                                        ) {
+                                            (Some(nested_workdir), Ok(flagged_path)) => {
+                                                std::fs::canonicalize(nested_workdir)
+                                                    .map(|dir| dir == flagged_path)
+                                                    .unwrap_or(false)
+                                            }
+                                            _ => false,
+                                        }
+                                        && nested.head().ok().and_then(|head| head.target())
+                                            == Some(entry.id)
+                                        && self._rollback_gitlink_matches(
+                                            &flagged_full,
+                                            entry.id,
+                                            include_ignored,
+                                            false,
+                                        )
+                                }
+                                Err(_) => false,
+                            }
+                        }
+                        _ => return false,
+                    };
+                    if !verified {
+                        return false;
+                    }
+                }
                 let mut status_options = git2::StatusOptions::new();
                 status_options.include_untracked(true);
                 status_options.include_ignored(include_ignored);
-                matches!(
-                    sub_repo.statuses(Some(&mut status_options)),
-                    Ok(statuses) if statuses.is_empty()
-                )
+                match sub_repo.statuses(Some(&mut status_options)) {
+                    Ok(statuses) => statuses.iter().all(|status_entry| {
+                        status_entry.status() == git2::Status::WT_DELETED
+                            && skip_worktree_absent
+                                .contains(&path_from_bytes(status_entry.path_bytes()))
+                            && matches!(
+                                std::fs::symlink_metadata(sub_workdir.join(
+                                    path_from_bytes(status_entry.path_bytes())
+                                )),
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound
+                            )
+                    }),
+                    Err(_) => false,
+                }
             }
-            Err(_) => match std::fs::read_dir(full_path) {
-                Ok(mut entries) => entries.next().is_none(),
-                Err(_) => false,
-            },
+            Err(_) => {
+                let Ok(entries) = std::fs::read_dir(full_path) else {
+                    return false;
+                };
+                let mut names = Vec::new();
+                for entry in entries {
+                    let Ok(entry) = entry else {
+                        return false;
+                    };
+                    names.push(entry.file_name());
+                }
+                if names.is_empty() {
+                    return true;
+                }
+                if !loose_fallbacks {
+                    return false;
+                }
+                let Some(workdir) = self.repo.workdir() else {
+                    return false;
+                };
+                let Ok(rel_path) = full_path.strip_prefix(workdir) else {
+                    return false;
+                };
+                names.iter().all(|name| {
+                    self._checkout_extra_entry_holds_only_ignored(&rel_path.join(name))
+                })
+            }
         }
     }
 
@@ -1925,6 +3135,7 @@ impl RepoProcessor {
         &self,
         sub_repo: &git2::Repository,
         full_path: &Path,
+        loose_fallbacks: bool,
     ) -> bool {
         if sub_repo.is_bare() {
             return false;
@@ -1965,16 +3176,81 @@ impl RepoProcessor {
         }
         let mut status_options = git2::StatusOptions::new();
         status_options.include_untracked(true);
-        status_options.include_ignored(true);
+        status_options.include_ignored(!loose_fallbacks);
         let Ok(statuses) = sub_repo.statuses(Some(&mut status_options)) else {
             return false;
         };
+        if loose_fallbacks {
+            return statuses.is_empty()
+                && Self::_rollback_placeholder_loose_holds_only_plain_ignored(
+                    sub_repo,
+                    full_path,
+                    Path::new(""),
+                );
+        }
         statuses.iter().all(|entry| {
             entry.status() == git2::Status::IGNORED
                 && entry
                     .path()
                     .is_some_and(|path| Self::_rollback_dir_holds_no_files(&full_path.join(path)))
         })
+    }
+
+    fn _rollback_placeholder_loose_holds_only_plain_ignored(
+        sub_repo: &git2::Repository,
+        root: &Path,
+        rel_path: &Path,
+    ) -> bool {
+        let Ok(entries) = std::fs::read_dir(root.join(rel_path)) else {
+            return false;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return false;
+            };
+            let name = entry.file_name();
+            let child_rel = rel_path.join(&name);
+            let child_full = root.join(&child_rel);
+            let Ok(metadata) = std::fs::symlink_metadata(&child_full) else {
+                return false;
+            };
+            let file_type = metadata.file_type();
+            if name == std::ffi::OsStr::new(".git") {
+                if rel_path.as_os_str().is_empty() && !file_type.is_dir() {
+                    continue;
+                }
+                return false;
+            }
+            if file_type.is_dir() {
+                if git2::Repository::open_ext(
+                    &child_full,
+                    git2::RepositoryOpenFlags::NO_SEARCH,
+                    Vec::<&Path>::new(),
+                )
+                .is_ok()
+                {
+                    return false;
+                }
+                if child_full.join("HEAD").is_file()
+                    && child_full.join("objects").is_dir()
+                    && child_full.join("refs").is_dir()
+                {
+                    return false;
+                }
+                if !Self::_rollback_placeholder_loose_holds_only_plain_ignored(
+                    sub_repo, root, &child_rel,
+                ) {
+                    return false;
+                }
+            } else if file_type.is_file() {
+                if !sub_repo.is_path_ignored(&child_rel).unwrap_or(false) {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+        true
     }
 
     fn _rollback_dir_holds_no_files(dir: &Path) -> bool {
@@ -2054,7 +3330,7 @@ impl RepoProcessor {
                 }
                 Some(git2::ObjectType::Commit) => {
                     child_is_real_dir
-                        && self._rollback_gitlink_matches(&child_full, entry.id(), true)
+                        && self._rollback_gitlink_matches(&child_full, entry.id(), true, false)
                 }
                 _ => self._rollback_disk_matches(
                     workdir,
@@ -2274,6 +3550,179 @@ impl RepoProcessor {
         Ok(())
     }
 
+    fn _post_checkout_shadowed_by_typechange(
+        &self,
+        workdir: &Path,
+        fetch_tree: &git2::Tree,
+        path: &Path,
+    ) -> bool {
+        let mut ancestor = path.parent();
+        while let Some(current) = ancestor {
+            if current.as_os_str().is_empty() {
+                return false;
+            }
+            match std::fs::symlink_metadata(workdir.join(current)) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_dir() {
+                        return false;
+                    }
+                    let entry = fetch_tree.get_path(current).ok();
+                    let entry_id = entry.as_ref().map(|entry| entry.id());
+                    let entry_mode = entry.as_ref().map(|entry| entry.filemode());
+                    return self._rollback_disk_recheck(workdir, current, entry_id, entry_mode)
+                        == CleanRecheck::Match;
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        || e.kind() == std::io::ErrorKind::NotADirectory =>
+                {
+                    ancestor = current.parent();
+                }
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+
+    fn _verify_checked_out_paths(
+        &self,
+        local_oid: Oid,
+        fetch_oid: Oid,
+        changed_paths: &[PathBuf],
+    ) -> Result<(), ZlorbError> {
+        let workdir = self.repo.workdir().map(|workdir| workdir.to_path_buf());
+        let fetch_tree = self
+            .repo
+            .find_commit(fetch_oid)
+            .and_then(|commit| commit.tree())
+            .ok();
+        let local_tree = self
+            .repo
+            .find_commit(local_oid)
+            .and_then(|commit| commit.tree())
+            .ok();
+        let mut regular: Vec<PathBuf> = Vec::new();
+        let mut gitlinks: Vec<PathBuf> = Vec::new();
+        for path in changed_paths {
+            let shadowed = match (&workdir, &fetch_tree) {
+                (Some(workdir), Some(fetch_tree)) => {
+                    fetch_tree.get_path(path).is_err()
+                        && matches!(
+                            std::fs::symlink_metadata(workdir.join(path)),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotADirectory
+                        )
+                        && self._post_checkout_shadowed_by_typechange(
+                            workdir,
+                            fetch_tree,
+                            path,
+                        )
+                }
+                _ => false,
+            };
+            if shadowed {
+                continue;
+            }
+            let either_pointer = match (&local_tree, &fetch_tree) {
+                (Some(local_tree), Some(fetch_tree)) => {
+                    let local_entry = local_tree.get_path(path).ok();
+                    let fetch_entry = fetch_tree.get_path(path).ok();
+                    let local_gitlink = matches!(
+                        local_entry.as_ref(),
+                        Some(entry) if entry.filemode() == 0o160000
+                    );
+                    let fetch_gitlink = matches!(
+                        fetch_entry.as_ref(),
+                        Some(entry) if entry.filemode() == 0o160000
+                    );
+                    local_gitlink && (fetch_gitlink || fetch_entry.is_none())
+                }
+                _ => false,
+            };
+            if either_pointer {
+                gitlinks.push(path.clone());
+            } else {
+                regular.push(path.clone());
+            }
+        }
+        let mut classified: Vec<PathBuf> = Vec::new();
+        let mut unverifiable: Vec<PathBuf> = Vec::new();
+        let mut classification_failed = false;
+        if !regular.is_empty() {
+            let (_safe, paths, _absent, unverifiable_paths, failed) =
+                self._checkout_restore_paths(fetch_oid, fetch_oid, &regular);
+            classified.extend(paths);
+            unverifiable.extend(unverifiable_paths);
+            classification_failed |= failed;
+        }
+        if !gitlinks.is_empty() {
+            let (_safe, paths, _absent, unverifiable_paths, failed) =
+                self._checkout_restore_paths(local_oid, fetch_oid, &gitlinks);
+            classified.extend(paths);
+            unverifiable.extend(unverifiable_paths);
+            classification_failed |= failed;
+        }
+        let mut mismatched = Vec::new();
+        for path in classified {
+            if !classification_failed && self._checkout_dir_is_safe(fetch_oid, fetch_oid, &path) {
+                continue;
+            }
+            mismatched.push(path);
+        }
+        if mismatched.is_empty() && unverifiable.is_empty() {
+            return Ok(());
+        }
+        for path in &mismatched {
+            if classification_failed {
+                Logger::error(format!(
+                    "Could not verify {} in {} after the checkout: the changed paths could not be classified because a commit, tree, or the working directory could not be loaded, so the update is being rolled back rather than built from an unverified working tree",
+                    path.display(),
+                    self.config.name
+                ));
+            } else {
+                Logger::error(format!(
+                    "{} in {} does not match the fetched commit {} after the checkout: a change may have landed while the checkout was writing, so the update is being rolled back rather than built from a working tree that differs from the fetched commit",
+                    path.display(),
+                    self.config.name,
+                    fetch_oid
+                ));
+            }
+        }
+        for path in &unverifiable {
+            Logger::error(format!(
+                "Could not verify {} in {} after the checkout: the file could not be checked against its clean conversion in the daemon environment, so the update is being rolled back rather than built from an unverified working tree",
+                path.display(),
+                self.config.name
+            ));
+        }
+        if classification_failed {
+            return Err(ZlorbError::Other(format!(
+                "Refusing to keep the fast-forward of {}: the changed paths ({}) could not be classified after the checkout because a commit, tree, or the working directory could not be loaded, so the working tree cannot be verified against the fetched commit and the update is being rolled back",
+                self.config.name,
+                display_paths(&mismatched)
+            )));
+        }
+        if mismatched.is_empty() {
+            return Err(ZlorbError::Other(format!(
+                "Refusing to keep the fast-forward of {}: tracked files ({}) could not be checked against their clean conversion in the daemon environment after the checkout, so the working tree cannot be verified against the fetched commit and the update is being rolled back. The re-check errors above name the conversion that could not be applied; make it runnable by the daemon so these files can be verified",
+                self.config.name,
+                display_paths(&unverifiable)
+            )));
+        }
+        if unverifiable.is_empty() {
+            return Err(ZlorbError::Other(format!(
+                "Refusing to keep the fast-forward of {}: tracked files ({}) do not match the fetched commit after the checkout, so the update is being rolled back rather than built from a working tree that differs from the fetched commit; the rollback preserves any file holding a local change",
+                self.config.name,
+                display_paths(&mismatched)
+            )));
+        }
+        Err(ZlorbError::Other(format!(
+            "Refusing to keep the fast-forward of {}: tracked files ({}) do not match the fetched commit after the checkout, so the update is being rolled back rather than built from a working tree that differs from the fetched commit; the rollback preserves any file holding a local change; tracked files ({}) could not be checked against their clean conversion in the daemon environment, so they cannot be verified either",
+            self.config.name,
+            display_paths(&mismatched),
+            display_paths(&unverifiable)
+        )))
+    }
+
     fn _checkout_and_get_ref(
         &self,
         local_oid: Option<Oid>,
@@ -2282,34 +3731,86 @@ impl RepoProcessor {
     ) -> Result<Reference<'_>, ZlorbError> {
         let skip_checkout = matches!(changed_paths, Some(paths) if paths.is_empty());
         if !skip_checkout {
+            if changed_paths.is_none() {
+                Logger::error(format!(
+                    "Refusing the checkout for {}: the paths changed by the update could not be computed, so no path can be checked against the current or the fetched commit and no path is being overwritten",
+                    self.config.name
+                ));
+                return Err(ZlorbError::Other(format!(
+                    "Refusing to fast-forward {}: the paths changed by the update could not be computed, so the checkout cannot be checked and no path is being overwritten",
+                    self.config.name
+                )));
+            }
             let mut checkout = git2::build::CheckoutBuilder::default();
             checkout.force();
             checkout.disable_pathspec_match(true);
+            let mut absent_paths: Vec<PathBuf> = Vec::new();
+            let mut seeded_only_checkout = false;
             if let Some(paths) = changed_paths {
                 let paths = match local_oid {
                     Some(local_oid) => {
-                        let (mut safe, classified) =
-                            self._rollback_restore_paths(local_oid, fetch_oid, paths);
+                        let (mut safe, classified, absent, unverifiable, classification_failed) =
+                            self._checkout_restore_paths(local_oid, fetch_oid, paths);
+                        absent_paths = absent;
                         let mut preserved = Vec::new();
                         for path in classified {
-                            if self._checkout_dir_is_safe(local_oid, fetch_oid, &path) {
+                            if !classification_failed
+                                && self._checkout_dir_is_safe(local_oid, fetch_oid, &path)
+                            {
                                 safe.push(path);
                             } else {
                                 preserved.push(path);
                             }
                         }
-                        if !preserved.is_empty() {
+                        if !preserved.is_empty() || !unverifiable.is_empty() {
                             for path in &preserved {
+                                if classification_failed {
+                                    Logger::error(format!(
+                                        "Preserving {} in {} at checkout: the changed paths could not be classified because a commit, tree, or the working directory could not be loaded, so it is not being overwritten and the update is refused",
+                                        path.display(),
+                                        self.config.name
+                                    ));
+                                } else {
+                                    Logger::error(format!(
+                                        "Preserving local changes to {} in {} at checkout: the file changed after the update was checked and matches neither the current commit nor the fetched commit, so it is not being overwritten and the update is refused",
+                                        path.display(),
+                                        self.config.name
+                                    ));
+                                }
+                            }
+                            for path in &unverifiable {
                                 Logger::error(format!(
-                                    "Preserving local changes to {} in {} at checkout: the file changed after the update was checked and matches neither the current commit nor the fetched commit, so it is not being overwritten and the update is refused",
+                                    "Preserving {} in {} at checkout: the file could not be checked against its clean conversion in the daemon environment, so it is not being overwritten and the update is refused",
                                     path.display(),
                                     self.config.name
                                 ));
                             }
+                            if classification_failed {
+                                return Err(ZlorbError::Other(format!(
+                                    "Refusing to fast-forward {}: the changed paths ({}) could not be classified because a commit, tree, or the working directory could not be loaded, so no path is being overwritten by the checkout",
+                                    self.config.name,
+                                    display_paths(&preserved)
+                                )));
+                            }
+                            if preserved.is_empty() {
+                                return Err(ZlorbError::Other(format!(
+                                    "Refusing to fast-forward {}: {}. The re-check errors above name the conversion that could not be applied; make it runnable by the daemon so these files can be verified",
+                                    self.config.name,
+                                    unverifiable_clause(&unverifiable)
+                                )));
+                            }
+                            if unverifiable.is_empty() {
+                                return Err(ZlorbError::Other(format!(
+                                    "Refusing to fast-forward {}: local changes to tracked files ({}) would be overwritten by the checkout. Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch",
+                                    self.config.name,
+                                    display_paths(&preserved)
+                                )));
+                            }
                             return Err(ZlorbError::Other(format!(
-                                "Refusing to fast-forward {}: local changes to tracked files ({}) would be overwritten by the checkout. Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch",
+                                "Refusing to fast-forward {}: local changes to tracked files ({}) would be overwritten by the checkout; {}. Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch; make the conversion named in the re-check errors above runnable by the daemon so the unverifiable files can be verified",
                                 self.config.name,
-                                display_paths(&preserved)
+                                display_paths(&preserved),
+                                unverifiable_clause(&unverifiable)
                             )));
                         }
                         safe
@@ -2321,13 +3822,42 @@ impl RepoProcessor {
                         )));
                     }
                 };
+                let seeded_preclones = match local_oid {
+                    Some(local_oid) => {
+                        self._seed_added_gitlink_preclones(local_oid, fetch_oid, &paths)?
+                    }
+                    None => Vec::new(),
+                };
+                seeded_only_checkout = !paths.is_empty()
+                    && paths
+                        .iter()
+                        .all(|path| seeded_preclones.contains(path));
                 for path in &paths {
-                    checkout.path(path);
+                    if !seeded_preclones.contains(path) {
+                        checkout.path(path);
+                    }
                 }
             }
-            self.repo
-                .checkout_head(Some(&mut checkout))
-                .map_err(ZlorbError::Git)?;
+            if !seeded_only_checkout {
+                self.repo
+                    .checkout_head(Some(&mut checkout))
+                    .map_err(ZlorbError::Git)?;
+            }
+            if let (Some(local_oid), Some(paths)) = (local_oid, changed_paths) {
+                self._verify_checked_out_paths(local_oid, fetch_oid, paths)?;
+            }
+            if !absent_paths.is_empty() {
+                if let Err(e) = self._advance_index_entries_to_tree(fetch_oid, &absent_paths) {
+                    Logger::error(format!(
+                        "Could not advance the index entries of the absent skip-worktree paths ({}) in {} to the fetched commit {}: {}",
+                        display_paths(&absent_paths),
+                        self.config.name,
+                        fetch_oid,
+                        e
+                    ));
+                    return Err(e);
+                }
+            }
         }
 
         let remote_ref = self
@@ -2728,7 +4258,7 @@ mod tests {
 
         let processor = processor_for(&watched_path);
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("src/main.rs")]
         );
         let err = processor.update_from_remote().unwrap_err();
@@ -2753,7 +4283,7 @@ mod tests {
 
         let processor = processor_for(&watched_path);
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("src/main.rs")]
         );
         let err = processor.update_from_remote().unwrap_err();
@@ -2800,7 +4330,7 @@ mod tests {
         set_index_flag(&watched_path, "--skip-worktree", "src/main.rs");
 
         let processor = processor_for(&watched_path);
-        assert!(processor._tracked_local_changes().unwrap().is_empty());
+        assert!(processor._tracked_local_changes().unwrap().changes.is_empty());
         processor.update_from_remote().unwrap();
         drop(processor);
 
@@ -2811,6 +4341,356 @@ mod tests {
             std::fs::read_to_string(watched_path.join("src/main.rs"))
                 .unwrap()
                 .contains("fixture-version-two")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn skip_worktree_absent_file_does_not_block_fast_forward_and_stays_absent() {
+        let root = temp_dir("skip-worktree-absent");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        std::fs::write(upstream_path.join("data.txt"), "data-version-one\n").unwrap();
+        let v1 = commit_all(&upstream, "v1");
+        write_fixture_crate(&upstream_path, "fixture-version-two");
+        std::fs::write(upstream_path.join("data.txt"), "data-version-two\n").unwrap();
+        let v2 = commit_all(&upstream, "v2");
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v1).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        set_index_flag(&watched_path, "--skip-worktree", "data.txt");
+        std::fs::remove_file(watched_path.join("data.txt")).unwrap();
+
+        let processor = processor_for(&watched_path);
+        processor.update_from_remote().unwrap();
+        drop(processor);
+
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        let v2_data_id = watched
+            .find_commit(v2)
+            .unwrap()
+            .tree()
+            .unwrap()
+            .get_path(Path::new("data.txt"))
+            .unwrap()
+            .id();
+        let index = watched.index().unwrap();
+        let entry = index.get_path(Path::new("data.txt"), 0).unwrap();
+        assert_eq!(entry.id, v2_data_id);
+        assert!(
+            git2::IndexEntryExtendedFlag::from_bits_truncate(entry.flags_extended)
+                .is_skip_worktree()
+        );
+        drop(index);
+        let status = watched.status_file(Path::new("data.txt")).unwrap();
+        assert!(!status.contains(git2::Status::INDEX_MODIFIED));
+        assert!(!status.contains(git2::Status::INDEX_NEW));
+        drop(watched);
+        assert!(!watched_path.join("data.txt").exists());
+        assert!(
+            std::fs::read_to_string(watched_path.join("src/main.rs"))
+                .unwrap()
+                .contains("fixture-version-two")
+        );
+
+        write_fixture_crate(&upstream_path, "fixture-version-three");
+        std::fs::write(upstream_path.join("data.txt"), "data-version-three\n").unwrap();
+        let v3 = commit_all(&upstream, "v3");
+        drop(upstream);
+
+        processor_for(&watched_path).update_from_remote().unwrap();
+
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v3);
+        drop(watched);
+        assert!(!watched_path.join("data.txt").exists());
+        assert!(
+            std::fs::read_to_string(watched_path.join("src/main.rs"))
+                .unwrap()
+                .contains("fixture-version-three")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_leaves_a_skip_worktree_absent_file_absent() {
+        let (root, watched_path, v1, v2) =
+            two_file_repo("rollback-skip-worktree-absent");
+        set_index_flag(&watched_path, "--skip-worktree", "b.txt");
+        std::fs::remove_file(watched_path.join("b.txt")).unwrap();
+        let v1_b_id = {
+            let watched = git2::Repository::open(&watched_path).unwrap();
+            let v2_b_id = watched
+                .find_commit(v2)
+                .unwrap()
+                .tree()
+                .unwrap()
+                .get_path(Path::new("b.txt"))
+                .unwrap()
+                .id();
+            let v1_b_id = watched
+                .find_commit(v1)
+                .unwrap()
+                .tree()
+                .unwrap()
+                .get_path(Path::new("b.txt"))
+                .unwrap()
+                .id();
+            let mut index = watched.index().unwrap();
+            let existing = index.get_path(Path::new("b.txt"), 0).unwrap();
+            let entry = git2::IndexEntry {
+                ctime: existing.ctime,
+                mtime: existing.mtime,
+                dev: existing.dev,
+                ino: existing.ino,
+                mode: existing.mode,
+                uid: existing.uid,
+                gid: existing.gid,
+                file_size: existing.file_size,
+                id: v2_b_id,
+                flags: existing.flags,
+                flags_extended: existing.flags_extended,
+                path: existing.path.clone(),
+            };
+            index.add(&entry).unwrap();
+            index.write().unwrap();
+            v1_b_id
+        };
+
+        let processor = processor_for(&watched_path);
+        assert!(processor._rollback_fast_forward(v1, v2));
+        let index = processor.repo.index().unwrap();
+        let entry = index.get_path(Path::new("b.txt"), 0).unwrap();
+        assert_eq!(entry.id, v1_b_id);
+        assert!(
+            git2::IndexEntryExtendedFlag::from_bits_truncate(entry.flags_extended)
+                .is_skip_worktree()
+        );
+        drop(index);
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert!(!watched_path.join("b.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("a.txt")).unwrap(),
+            "one-a\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_restore_paths_classifies_skip_worktree_absence_as_absent() {
+        let (root, watched_path, v1, v2) =
+            two_file_repo("rollback-restore-paths-skip-worktree-absent");
+        set_index_flag(&watched_path, "--skip-worktree", "b.txt");
+        std::fs::remove_file(watched_path.join("b.txt")).unwrap();
+
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        let (safe, preserved, absent, _, failed) =
+            processor._rollback_restore_paths(v1, v2, &changed);
+        assert!(!failed);
+        assert_eq!(absent, vec![PathBuf::from("b.txt")]);
+        assert!(preserved.is_empty());
+        assert!(safe.contains(&PathBuf::from("a.txt")));
+        assert!(!safe.contains(&PathBuf::from("b.txt")));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_restore_paths_preserves_a_skip_worktree_path_whose_metadata_cannot_be_read() {
+        let root = temp_dir("rollback-restore-paths-skip-worktree-metadata-error");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        std::fs::create_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::write(watched_path.join("sub").join("b.txt"), "one-b\n").unwrap();
+        let v1 = commit_all(&watched, "v1");
+        write_fixture_crate(&watched_path, "fixture-version-two");
+        std::fs::write(watched_path.join("sub").join("b.txt"), "two-b\n").unwrap();
+        let v2 = commit_all(&watched, "v2");
+        drop(watched);
+        set_index_flag(&watched_path, "--skip-worktree", "sub/b.txt");
+        std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::write(watched_path.join("sub"), "blocker\n").unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(watched_path.join("sub").join("b.txt"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotADirectory
+        );
+
+        let processor = processor_for(&watched_path);
+        assert!(processor._index_path_is_skip_worktree(Path::new("sub/b.txt")));
+        let paths = vec![PathBuf::from("sub").join("b.txt")];
+        let (safe, preserved, absent, unverifiable, failed) =
+            processor._rollback_restore_paths(v1, v2, &paths);
+        assert!(!failed);
+        assert!(absent.is_empty());
+        assert!(safe.is_empty());
+        assert!(unverifiable.is_empty());
+        assert_eq!(preserved, paths);
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_restore_paths_preserves_a_plain_deletion() {
+        let (root, watched_path, v1, v2) =
+            two_file_repo("rollback-restore-paths-plain-deletion");
+        std::fs::remove_file(watched_path.join("b.txt")).unwrap();
+
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        let (safe, preserved, absent, _, failed) =
+            processor._rollback_restore_paths(v1, v2, &changed);
+        assert!(!failed);
+        assert!(absent.is_empty());
+        assert_eq!(preserved, vec![PathBuf::from("b.txt")]);
+        assert!(safe.contains(&PathBuf::from("a.txt")));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_restore_paths_classifies_a_file_whose_external_clean_filter_fails_as_unverifiable() {
+        let (root, watched_path, v1, v2) =
+            external_filter_repo("classifier-unverifiable", "version two\n");
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        let (safe, preserved, absent, unverifiable, failed) =
+            processor._rollback_restore_paths(v1, v2, &changed);
+        assert!(!failed);
+        assert!(absent.is_empty());
+        assert!(preserved.is_empty());
+        assert_eq!(unverifiable, vec![PathBuf::from("data.txt")]);
+        assert!(safe.contains(&PathBuf::from("src/main.rs")));
+        assert!(!safe.contains(&PathBuf::from("data.txt")));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_restore_paths_classifies_a_file_changed_after_an_external_clean_filter_as_preserved() {
+        let (root, watched_path, v1, v2) =
+            external_filter_repo("classifier-preserved-on-mismatch", "version two\n");
+        std::fs::write(watched_path.join("data.txt"), "Xgoodbye\n").unwrap();
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        let (safe, preserved, _, unverifiable, failed) =
+            processor._rollback_restore_paths(v1, v2, &changed);
+        assert!(!failed);
+        assert_eq!(preserved, vec![PathBuf::from("data.txt")]);
+        assert!(unverifiable.is_empty());
+        assert!(safe.contains(&PathBuf::from("src/main.rs")));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_names_a_file_whose_external_clean_filter_fails_as_unverifiable() {
+        let (root, watched_path, v1, v2) =
+            external_filter_repo("checkout-unverifiable", "version two\n");
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        let processor = processor_for(&watched_path);
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        match processor._checkout_and_get_ref(Some(v1), v2, Some(&changed)) {
+            Ok(_) => panic!("checkout must refuse when a changed file cannot be verified"),
+            Err(e) => {
+                let message = format!("{:?}", e);
+                assert!(
+                    message.contains("could not be checked against their clean conversion"),
+                    "{}",
+                    message
+                );
+                assert!(message.contains("data.txt"), "{}", message);
+                assert!(
+                    !message.contains("local changes to tracked files"),
+                    "{}",
+                    message
+                );
+                assert!(!message.contains("Stash the work"), "{}", message);
+            }
+        }
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"Xhello\n"
+        );
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_names_preserved_and_unverifiable_files_separately() {
+        let (root, watched_path, v1, v2) =
+            external_filter_repo("checkout-mixed-preserved-unverifiable", "version two\n");
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        std::fs::write(
+            watched_path.join("src/main.rs"),
+            "fn main() { println!(\"edited\"); }\n",
+        )
+        .unwrap();
+        let processor = processor_for(&watched_path);
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        match processor._checkout_and_get_ref(Some(v1), v2, Some(&changed)) {
+            Ok(_) => panic!("checkout must refuse when a changed file cannot be verified"),
+            Err(e) => {
+                let message = format!("{:?}", e);
+                assert!(
+                    message.contains("local changes to tracked files (src/main.rs)"),
+                    "{}",
+                    message
+                );
+                assert!(
+                    message.contains("could not be checked against their clean conversion"),
+                    "{}",
+                    message
+                );
+                assert!(message.contains("data.txt"), "{}", message);
+                assert!(message.contains("Stash the work"), "{}", message);
+                assert!(message.contains("can be verified"), "{}", message);
+            }
+        }
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"Xhello\n"
+        );
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_a_file_whose_external_clean_filter_fails() {
+        let (root, watched_path, v1, v2) =
+            external_filter_repo("rollback-unverifiable", "version two\n");
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"Xhello\n"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2842,7 +4722,7 @@ mod tests {
         }
 
         let processor = processor_for(&watched_path);
-        assert!(processor._tracked_local_changes().unwrap().is_empty());
+        assert!(processor._tracked_local_changes().unwrap().changes.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2859,7 +4739,7 @@ mod tests {
 
         let processor = processor_for(&watched_path);
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("src/main.rs")]
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -2888,7 +4768,7 @@ mod tests {
 
         let processor = processor_for(&watched_path);
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("src/main.rs")]
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -2924,7 +4804,7 @@ mod tests {
 
         let processor = processor_for(&watched_path);
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("link.txt")]
         );
         let err = processor.update_from_remote().unwrap_err();
@@ -2965,7 +4845,7 @@ mod tests {
         set_index_flag(&watched_path, "--skip-worktree", "data.txt");
 
         let processor = processor_for(&watched_path);
-        assert!(processor._tracked_local_changes().unwrap().is_empty());
+        assert!(processor._tracked_local_changes().unwrap().changes.is_empty());
         processor.update_from_remote().unwrap();
         drop(processor);
 
@@ -3008,7 +4888,7 @@ mod tests {
         set_index_flag(&watched_path, "--skip-worktree", "data.txt");
 
         let processor = processor_for(&watched_path);
-        assert!(processor._tracked_local_changes().unwrap().is_empty());
+        assert!(processor._tracked_local_changes().unwrap().changes.is_empty());
         processor.update_from_remote().unwrap();
         drop(processor);
 
@@ -3052,7 +4932,7 @@ mod tests {
 
         let processor = processor_for(&watched_path);
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("data.txt")]
         );
         let err = processor.update_from_remote().unwrap_err();
@@ -3067,6 +4947,1010 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
     }
+
+
+
+    #[test]
+    fn skip_worktree_file_whose_external_clean_filter_fails_is_unverifiable_not_a_local_change() {
+        let (root, watched_path, v1, _v2) =
+            external_filter_repo("skip-worktree-external-filter-broken", "version two\n");
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        set_index_flag(&watched_path, "--skip-worktree", "data.txt");
+        let processor = processor_for(&watched_path);
+        let tracked = processor._tracked_local_changes().unwrap();
+        assert!(tracked.changes.is_empty());
+        assert_eq!(tracked.unverifiable, vec![PathBuf::from("data.txt")]);
+        let err = processor.update_from_remote().unwrap_err();
+        let message = format!("{:?}", err);
+        assert!(
+            message.contains("could not be checked against their clean conversion"),
+            "{}",
+            message
+        );
+        assert!(message.contains("data.txt"), "{}", message);
+        assert!(
+            !message.contains("local changes to tracked files"),
+            "{}",
+            message
+        );
+        assert!(!message.contains("Stash the work"), "{}", message);
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"Xhello\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn assume_unchanged_file_whose_external_clean_filter_fails_is_unverifiable_not_a_local_change() {
+        let (root, watched_path, _v1, _v2) =
+            external_filter_repo("assume-unchanged-external-filter-broken", "version two\n");
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        set_index_flag(&watched_path, "--assume-unchanged", "data.txt");
+        let processor = processor_for(&watched_path);
+        let tracked = processor._tracked_local_changes().unwrap();
+        assert!(tracked.changes.is_empty());
+        assert_eq!(tracked.unverifiable, vec![PathBuf::from("data.txt")]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn skip_worktree_file_changed_without_a_filter_is_a_local_change_not_unverifiable() {
+        let (root, watched_path, _v1, _v2) = two_file_repo("skip-worktree-no-filter-changed");
+        std::fs::write(watched_path.join("b.txt"), "edited-b\n").unwrap();
+        set_index_flag(&watched_path, "--skip-worktree", "b.txt");
+        let processor = processor_for(&watched_path);
+        let tracked = processor._tracked_local_changes().unwrap();
+        assert_eq!(tracked.changes, vec![PathBuf::from("b.txt")]);
+        assert!(tracked.unverifiable.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn skip_worktree_file_that_cannot_be_hashed_is_unverifiable_not_a_local_change() {
+        let (root, watched_path, _v1, _v2) = two_file_repo("skip-worktree-blob-writer-fails");
+        std::fs::write(watched_path.join("b.txt"), "edited-b\n").unwrap();
+        set_index_flag(&watched_path, "--skip-worktree", "b.txt");
+        let processor = processor_for(&watched_path);
+        std::fs::rename(
+            watched_path.join(".git").join("objects"),
+            root.join("objects-away"),
+        )
+        .unwrap();
+        let hidden = processor._hidden_local_changes(&[]).unwrap();
+        assert!(hidden.changes.is_empty());
+        assert_eq!(hidden.unverifiable, vec![PathBuf::from("b.txt")]);
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hidden_changes_check_errors_when_the_repo_has_no_working_directory() {
+        let root = temp_dir("hidden-check-no-workdir");
+        let bare_path = root.join("bare");
+        git2::Repository::init_bare(&bare_path).unwrap();
+        let processor = processor_for(&bare_path);
+        assert!(processor._hidden_local_changes(&[]).is_err());
+        assert!(processor._tracked_local_changes().is_err());
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hidden_changes_check_errors_when_the_index_cannot_be_read() {
+        let (root, watched_path, _v1, _v2) = two_file_repo("hidden-check-index-unreadable");
+        set_index_flag(&watched_path, "--skip-worktree", "b.txt");
+        std::fs::write(
+            watched_path.join(".git").join("index"),
+            b"not a valid index",
+        )
+        .unwrap();
+        let processor = processor_for(&watched_path);
+        assert!(processor._hidden_local_changes(&[]).is_err());
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn hidden_metadata_loop_repo(label: &str, flag: &str) -> (PathBuf, PathBuf) {
+        let root = temp_dir(label);
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        std::fs::create_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::write(watched_path.join("sub").join("b.txt"), "one-b\n").unwrap();
+        commit_all(&watched, "v1");
+        drop(watched);
+        set_index_flag(&watched_path, flag, "sub/b.txt");
+        std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
+        std::os::unix::fs::symlink("sub", watched_path.join("sub")).unwrap();
+        (root, watched_path)
+    }
+
+    #[test]
+    fn skip_worktree_file_whose_metadata_cannot_be_read_is_unverifiable_not_cleared() {
+        let (root, watched_path) =
+            hidden_metadata_loop_repo("skip-worktree-metadata-loop", "--skip-worktree");
+        let processor = processor_for(&watched_path);
+        let hidden = processor._hidden_local_changes(&[]).unwrap();
+        assert!(hidden.changes.is_empty());
+        assert_eq!(
+            hidden.unverifiable,
+            vec![PathBuf::from("sub").join("b.txt")]
+        );
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn assume_unchanged_file_whose_metadata_cannot_be_read_is_unverifiable_not_a_local_change() {
+        let (root, watched_path) =
+            hidden_metadata_loop_repo("assume-unchanged-metadata-loop", "--assume-unchanged");
+        let processor = processor_for(&watched_path);
+        let hidden = processor._hidden_local_changes(&[]).unwrap();
+        assert!(hidden.changes.is_empty());
+        assert_eq!(
+            hidden.unverifiable,
+            vec![PathBuf::from("sub").join("b.txt")]
+        );
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn skip_worktree_absent_check_requires_the_file_to_be_absent_not_unreadable() {
+        let (root, watched_path) =
+            hidden_metadata_loop_repo("skip-worktree-absent-check-loop", "--skip-worktree");
+        let processor = processor_for(&watched_path);
+        assert!(!processor
+            ._path_is_skip_worktree_absent(&PathBuf::from("sub").join("b.txt")));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+
+        let (root, watched_path, _v1, _v2) = two_file_repo("skip-worktree-absent-check-deleted");
+        set_index_flag(&watched_path, "--skip-worktree", "b.txt");
+        std::fs::remove_file(watched_path.join("b.txt")).unwrap();
+        let processor = processor_for(&watched_path);
+        assert!(processor._path_is_skip_worktree_absent(Path::new("b.txt")));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn nested_upstream_repo(label: &str) -> (PathBuf, PathBuf, Oid, Oid) {
+        let root = temp_dir(label);
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        std::fs::create_dir_all(upstream_path.join("sub")).unwrap();
+        std::fs::write(upstream_path.join("sub").join("b.txt"), "one-b\n").unwrap();
+        let v1 = commit_all(&upstream, "v1");
+        write_fixture_crate(&upstream_path, "fixture-version-two");
+        std::fs::write(upstream_path.join("sub").join("b.txt"), "two-b\n").unwrap();
+        let v2 = commit_all(&upstream, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        (root, watched_path, v1, v2)
+    }
+
+    fn loop_the_sub_parent(watched_path: &Path) {
+        std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
+        std::os::unix::fs::symlink("sub", watched_path.join("sub")).unwrap();
+    }
+
+    #[test]
+    fn build_refusal_names_a_skip_worktree_file_whose_metadata_cannot_be_read() {
+        let (root, watched_path, _v1, v2) = nested_upstream_repo("build-refusal-metadata-loop");
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v2).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        set_index_flag(&watched_path, "--skip-worktree", "sub/b.txt");
+        loop_the_sub_parent(&watched_path);
+        let mut processor = processor_for(&watched_path);
+        processor.config.out_dir = Some("dist-out".to_string());
+        let err = processor.update_from_remote().unwrap_err();
+        let message = format!("{:?}", err);
+        assert!(message.contains("Refusing to build"), "{}", message);
+        assert!(
+            message.contains("local changes to tracked files (sub/b.txt)"),
+            "{}",
+            message
+        );
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fast_forward_guard_refuses_a_skip_worktree_file_whose_metadata_cannot_be_read() {
+        let (root, watched_path, v1, v2) = nested_upstream_repo("ff-guard-metadata-loop");
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v1).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        set_index_flag(&watched_path, "--skip-worktree", "sub/b.txt");
+        loop_the_sub_parent(&watched_path);
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        assert!(changed.contains(&PathBuf::from("sub").join("b.txt")));
+        let err = {
+            let fetch_ref = processor
+                .repo
+                .find_reference("refs/remotes/origin/master")
+                .unwrap();
+            let fetch_commit = processor
+                .repo
+                .reference_to_annotated_commit(&fetch_ref)
+                .unwrap();
+            processor
+                ._refuse_if_update_would_overwrite(&fetch_commit, Some(&changed))
+                .unwrap_err()
+        };
+        let message = format!("{:?}", err);
+        assert!(
+            message.contains("local changes to tracked files (sub/b.txt) would be overwritten"),
+            "{}",
+            message
+        );
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn skip_worktree_file_whose_filter_fails_on_an_untouched_file_survives_fast_forward() {
+        let (root, watched_path, _v1, v2) =
+            external_filter_repo("skip-worktree-external-filter-broken-untouched", "hello\n");
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        set_index_flag(&watched_path, "--skip-worktree", "data.txt");
+        let processor = processor_for(&watched_path);
+        let tracked = processor._tracked_local_changes().unwrap();
+        assert!(tracked.changes.is_empty());
+        assert_eq!(tracked.unverifiable, vec![PathBuf::from("data.txt")]);
+        processor.update_from_remote().unwrap();
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"Xhello\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_refusal_names_a_hidden_unverifiable_file_without_calling_it_a_local_change() {
+        let (root, watched_path, _v1, v2) =
+            external_filter_repo("skip-worktree-external-filter-build-refusal", "version two\n");
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v2).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        std::fs::write(watched_path.join("data.txt"), "Xversion two\n").unwrap();
+        set_index_flag(&watched_path, "--skip-worktree", "data.txt");
+        let mut processor = processor_for(&watched_path);
+        processor.config.out_dir = Some("dist-out".to_string());
+        let tracked = processor._tracked_local_changes().unwrap();
+        assert!(tracked.changes.is_empty());
+        assert_eq!(tracked.unverifiable, vec![PathBuf::from("data.txt")]);
+        let err = processor.update_from_remote().unwrap_err();
+        let message = format!("{:?}", err);
+        assert!(message.contains("Refusing to build"), "{}", message);
+        assert!(
+            message.contains("could not be checked against their clean conversion"),
+            "{}",
+            message
+        );
+        assert!(
+            !message.contains("local changes to tracked files"),
+            "{}",
+            message
+        );
+        assert!(!message.contains("Stash the work"), "{}", message);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_refusal_with_a_change_and_a_hidden_unverifiable_file_carries_both_advices() {
+        let (root, watched_path, _v1, v2) =
+            external_filter_repo("skip-worktree-external-filter-build-mixed", "version two\n");
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v2).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        std::fs::write(watched_path.join("data.txt"), "Xversion two\n").unwrap();
+        set_index_flag(&watched_path, "--skip-worktree", "data.txt");
+        std::fs::write(
+            watched_path.join("src/main.rs"),
+            "fn main() { println!(\"edited\"); }\n",
+        )
+        .unwrap();
+        let mut processor = processor_for(&watched_path);
+        processor.config.out_dir = Some("dist-out".to_string());
+        let tracked = processor._tracked_local_changes().unwrap();
+        assert_eq!(tracked.changes, vec![PathBuf::from("src/main.rs")]);
+        assert_eq!(tracked.unverifiable, vec![PathBuf::from("data.txt")]);
+        let err = processor.update_from_remote().unwrap_err();
+        let message = format!("{:?}", err);
+        assert!(message.contains("Refusing to build"), "{}", message);
+        assert!(
+            message.contains("local changes to tracked files (src/main.rs)"),
+            "{}",
+            message
+        );
+        assert!(
+            message.contains("could not be checked against their clean conversion"),
+            "{}",
+            message
+        );
+        assert!(message.contains("Stash the work"), "{}", message);
+        assert!(
+            message.contains("make the conversion named in the re-check errors above runnable by the daemon so the unverifiable files can be verified"),
+            "{}",
+            message
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn external_filter_repo(label: &str, v2_data: &str) -> (PathBuf, PathBuf, Oid, Oid) {
+        let root = temp_dir(label);
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        std::fs::write(upstream_path.join(".gitattributes"), "*.txt filter=strip\n").unwrap();
+        std::fs::write(upstream_path.join("data.txt"), "hello\n").unwrap();
+        let v1 = commit_all(&upstream, "v1");
+        write_fixture_crate(&upstream_path, "fixture-version-two");
+        std::fs::write(upstream_path.join("data.txt"), v2_data).unwrap();
+        let v2 = commit_all(&upstream, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v1).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        set_repo_config(&watched_path, "filter.strip.clean", "sed 's/^X//'");
+        (root, watched_path, v1, v2)
+    }
+
+    #[test]
+    fn file_matching_its_blob_after_an_external_clean_filter_does_not_block_fast_forward() {
+        let (root, watched_path, _v1, v2) =
+            external_filter_repo("external-filter-clean", "version two\n");
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert!(processor._tracked_local_changes().unwrap().changes.is_empty());
+        processor.update_from_remote().unwrap();
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"version two\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn file_changed_after_an_external_clean_filter_still_refuses_fast_forward() {
+        let (root, watched_path, v1, _v2) =
+            external_filter_repo("external-filter-changed", "version two\n");
+        std::fs::write(watched_path.join("data.txt"), "Xgoodbye\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert_eq!(
+            processor._tracked_local_changes().unwrap().changes,
+            vec![PathBuf::from("data.txt")]
+        );
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(format!("{:?}", err).contains("local changes to tracked files"));
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"Xgoodbye\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn external_clean_filter_recheck_distinguishes_mismatch_from_unverifiable() {
+        let (root, watched_path, _v1, _v2) =
+            external_filter_repo("external-filter-tristate", "version two\n");
+        let repo = git2::Repository::open(&watched_path).unwrap();
+        let mut index = repo.index().unwrap();
+        index.read(true).unwrap();
+        let entry_id = index.get_path(Path::new("data.txt"), 0).unwrap().id;
+        drop(index);
+        drop(repo);
+        let processor = processor_for(&watched_path);
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        assert_eq!(
+            processor._recheck_after_external_clean_filter_with_timeout(
+                &watched_path,
+                Path::new("data.txt"),
+                &watched_path.join("data.txt"),
+                entry_id,
+                std::time::Duration::from_secs(30)
+            ),
+            CleanRecheck::Match
+        );
+        std::fs::write(watched_path.join("data.txt"), "Xgoodbye\n").unwrap();
+        assert_eq!(
+            processor._recheck_after_external_clean_filter_with_timeout(
+                &watched_path,
+                Path::new("data.txt"),
+                &watched_path.join("data.txt"),
+                entry_id,
+                std::time::Duration::from_secs(30)
+            ),
+            CleanRecheck::Mismatch
+        );
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        assert_eq!(
+            processor._recheck_after_external_clean_filter_with_timeout(
+                &watched_path,
+                Path::new("data.txt"),
+                &watched_path.join("data.txt"),
+                entry_id,
+                std::time::Duration::from_secs(30)
+            ),
+            CleanRecheck::Unverifiable
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn unset_repo_config(watched: &Path, key: &str) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(watched)
+            .args(["config", "--unset", key])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    fn process_filter_entry_id(watched: &Path) -> Oid {
+        let repo = git2::Repository::open(watched).unwrap();
+        let mut index = repo.index().unwrap();
+        index.read(true).unwrap();
+        index.get_path(Path::new("data.txt"), 0).unwrap().id
+    }
+
+    #[test]
+    fn missing_process_filter_is_unverifiable_not_a_local_change() {
+        let (root, watched_path, v1, _v2) =
+            external_filter_repo("process-filter-missing", "version two\n");
+        unset_repo_config(&watched_path, "filter.strip.clean");
+        set_repo_config(
+            &watched_path,
+            "filter.strip.process",
+            "zlorb-nonexistent-filter-command",
+        );
+        let entry_id = process_filter_entry_id(&watched_path);
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert_eq!(
+            processor._recheck_after_external_clean_filter_with_timeout(
+                &watched_path,
+                Path::new("data.txt"),
+                &watched_path.join("data.txt"),
+                entry_id,
+                std::time::Duration::from_secs(30)
+            ),
+            CleanRecheck::Unverifiable
+        );
+        let tracked = processor._tracked_local_changes().unwrap();
+        assert!(tracked.changes.is_empty());
+        assert_eq!(tracked.unverifiable, vec![PathBuf::from("data.txt")]);
+        let err = processor.update_from_remote().unwrap_err();
+        let message = format!("{:?}", err);
+        assert!(
+            message.contains("could not be checked against their clean conversion"),
+            "{}",
+            message
+        );
+        assert!(
+            !message.contains("local changes to tracked files"),
+            "{}",
+            message
+        );
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"Xhello\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn process_filter_failing_its_handshake_is_unverifiable_not_a_local_change() {
+        let (root, watched_path, _v1, _v2) =
+            external_filter_repo("process-filter-handshake", "version two\n");
+        let script = root.join("bad-handshake.py");
+        std::fs::write(
+            &script,
+            "import sys\ndef pkt_read():\n    hdr = sys.stdin.buffer.read(4)\n    if not hdr:\n        return None\n    n = int(hdr, 16)\n    if n == 0:\n        return b''\n    return sys.stdin.buffer.read(n - 4)\ndef pkt_write(data):\n    sys.stdout.buffer.write(b'%04x' % (len(data) + 4))\n    sys.stdout.buffer.write(data)\n    sys.stdout.buffer.flush()\nwhile True:\n    line = pkt_read()\n    if line in (b'', None):\n        break\npkt_write(b'welcome\\n')\npkt_write(b'version=2\\n')\npkt_write(b'capability=clean\\n')\nsys.stdout.buffer.write(b'0000')\nsys.stdout.buffer.flush()\nimport time\ntime.sleep(1)\n",
+        )
+        .unwrap();
+        unset_repo_config(&watched_path, "filter.strip.clean");
+        set_repo_config(
+            &watched_path,
+            "filter.strip.process",
+            &format!("python3 {}", script.to_string_lossy()),
+        );
+        let entry_id = process_filter_entry_id(&watched_path);
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert_eq!(
+            processor._recheck_after_external_clean_filter_with_timeout(
+                &watched_path,
+                Path::new("data.txt"),
+                &watched_path.join("data.txt"),
+                entry_id,
+                std::time::Duration::from_secs(30)
+            ),
+            CleanRecheck::Unverifiable
+        );
+        let tracked = processor._tracked_local_changes().unwrap();
+        assert!(tracked.changes.is_empty());
+        assert_eq!(tracked.unverifiable, vec![PathBuf::from("data.txt")]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn file_whose_external_clean_filter_fails_is_unverifiable_not_a_local_change() {
+        let (root, watched_path, v1, _v2) =
+            external_filter_repo("external-filter-broken", "version two\n");
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        let processor = processor_for(&watched_path);
+        let tracked = processor._tracked_local_changes().unwrap();
+        assert!(tracked.changes.is_empty());
+        assert_eq!(tracked.unverifiable, vec![PathBuf::from("data.txt")]);
+        let err = processor.update_from_remote().unwrap_err();
+        let message = format!("{:?}", err);
+        assert!(
+            message.contains("could not be checked against their clean conversion"),
+            "{}",
+            message
+        );
+        assert!(message.contains("data.txt"), "{}", message);
+        assert!(
+            !message.contains("local changes to tracked files"),
+            "{}",
+            message
+        );
+        assert!(
+            !message.contains("Stash the work"),
+            "{}",
+            message
+        );
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"Xhello\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unverifiable_and_changed_files_are_named_separately_in_the_refusal() {
+        let (root, watched_path, v1, _v2) =
+            external_filter_repo("external-filter-mixed", "version two\n");
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        std::fs::write(
+            watched_path.join("src/main.rs"),
+            "fn main() { println!(\"edited\"); }\n",
+        )
+        .unwrap();
+        let processor = processor_for(&watched_path);
+        let tracked = processor._tracked_local_changes().unwrap();
+        assert_eq!(tracked.changes, vec![PathBuf::from("src/main.rs")]);
+        assert_eq!(tracked.unverifiable, vec![PathBuf::from("data.txt")]);
+        let err = processor.update_from_remote().unwrap_err();
+        let message = format!("{:?}", err);
+        assert!(
+            message.contains("local changes to tracked files (src/main.rs)"),
+            "{}",
+            message
+        );
+        assert!(
+            message.contains("could not be checked against their clean conversion"),
+            "{}",
+            message
+        );
+        assert!(message.contains("data.txt"), "{}", message);
+        assert!(message.contains("Stash the work"), "{}", message);
+        assert!(
+            message.contains("make the conversion named in the re-check errors above runnable by the daemon so the unverifiable files can be verified"),
+            "{}",
+            message
+        );
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_refusal_names_an_unverifiable_file_without_calling_it_a_local_change() {
+        let (root, watched_path, _v1, v2) =
+            external_filter_repo("external-filter-build-refusal", "version two\n");
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v2).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        std::fs::write(watched_path.join("data.txt"), "Xversion two\n").unwrap();
+        let mut processor = processor_for(&watched_path);
+        processor.config.out_dir = Some("dist-out".to_string());
+        let err = processor.update_from_remote().unwrap_err();
+        let message = format!("{:?}", err);
+        assert!(message.contains("Refusing to build"), "{}", message);
+        assert!(
+            message.contains("could not be checked against their clean conversion"),
+            "{}",
+            message
+        );
+        assert!(
+            !message.contains("local changes to tracked files"),
+            "{}",
+            message
+        );
+        assert!(!message.contains("Stash the work"), "{}", message);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn file_with_a_mode_change_after_an_external_clean_filter_still_refuses_fast_forward() {
+        let (root, watched_path, v1, _v2) =
+            external_filter_repo("external-filter-mode", "version two\n");
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            watched_path.join("data.txt"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let processor = processor_for(&watched_path);
+        assert_eq!(
+            processor._tracked_local_changes().unwrap().changes,
+            vec![PathBuf::from("data.txt")]
+        );
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(format!("{:?}", err).contains("local changes to tracked files"));
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn staged_change_to_a_filtered_file_still_refuses_fast_forward() {
+        let (root, watched_path, v1, _v2) =
+            external_filter_repo("external-filter-staged", "version two\n");
+        std::fs::write(watched_path.join("data.txt"), "Xgoodbye\n").unwrap();
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&watched_path)
+            .args(["add", "data.txt"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let processor = processor_for(&watched_path);
+        assert_eq!(
+            processor._tracked_local_changes().unwrap().changes,
+            vec![PathBuf::from("data.txt")]
+        );
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(format!("{:?}", err).contains("local changes to tracked files"));
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"Xgoodbye\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+
+    fn conversion_repo(label: &str, attrs: &str, v1_data: &[u8], v2_data: &[u8]) -> (PathBuf, PathBuf, Oid, Oid) {
+        let root = temp_dir(label);
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        if !attrs.is_empty() {
+            std::fs::write(upstream_path.join(".gitattributes"), attrs).unwrap();
+        }
+        std::fs::write(upstream_path.join("data.txt"), v1_data).unwrap();
+        let v1 = commit_all(&upstream, "v1");
+        write_fixture_crate(&upstream_path, "fixture-version-two");
+        std::fs::write(upstream_path.join("data.txt"), v2_data).unwrap();
+        let v2 = commit_all(&upstream, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v1).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        (root, watched_path, v1, v2)
+    }
+
+    #[test]
+    fn crlf_only_difference_with_autocrlf_does_not_block_fast_forward() {
+        let (root, watched_path, _v1, v2) =
+            conversion_repo("autocrlf-clean", "", b"hello\n", b"version two\n");
+        set_repo_config(&watched_path, "core.autocrlf", "true");
+        std::fs::write(watched_path.join("data.txt"), b"hello\r\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert!(processor._tracked_local_changes().unwrap().changes.is_empty());
+        processor.update_from_remote().unwrap();
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"version two\r\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn crlf_only_difference_with_bare_text_attribute_does_not_block_fast_forward() {
+        let (root, watched_path, _v1, v2) = conversion_repo(
+            "bare-text-clean",
+            "*.txt text\n",
+            b"hello\n",
+            b"version two\n",
+        );
+        std::fs::write(watched_path.join("data.txt"), b"hello\r\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert!(processor._tracked_local_changes().unwrap().changes.is_empty());
+        processor.update_from_remote().unwrap();
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"version two\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn crlf_only_difference_with_autocrlf_input_does_not_block_fast_forward() {
+        let (root, watched_path, _v1, v2) =
+            conversion_repo("autocrlf-input-clean", "", b"hello\n", b"version two\n");
+        set_repo_config(&watched_path, "core.autocrlf", "input");
+        std::fs::write(watched_path.join("data.txt"), b"hello\r\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert!(processor._tracked_local_changes().unwrap().changes.is_empty());
+        processor.update_from_remote().unwrap();
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"version two\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn crlf_only_difference_with_eol_lf_does_not_block_fast_forward() {
+        let (root, watched_path, _v1, v2) = conversion_repo(
+            "eol-lf-clean",
+            "*.txt text eol=lf\n",
+            b"hello\n",
+            b"version two\n",
+        );
+        std::fs::write(watched_path.join("data.txt"), b"hello\r\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert!(processor._tracked_local_changes().unwrap().changes.is_empty());
+        processor.update_from_remote().unwrap();
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"version two\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn changed_content_with_autocrlf_still_refuses_fast_forward() {
+        let (root, watched_path, v1, _v2) =
+            conversion_repo("autocrlf-changed", "", b"hello\n", b"version two\n");
+        set_repo_config(&watched_path, "core.autocrlf", "true");
+        std::fs::write(watched_path.join("data.txt"), b"goodbye\r\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert_eq!(
+            processor._tracked_local_changes().unwrap().changes,
+            vec![PathBuf::from("data.txt")]
+        );
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(format!("{:?}", err).contains("local changes to tracked files"));
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"goodbye\r\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lf_only_difference_with_eol_crlf_does_not_block_fast_forward() {
+        let (root, watched_path, _v1, v2) = conversion_repo(
+            "eol-crlf-clean",
+            "*.txt text eol=crlf\n",
+            b"hello\n",
+            b"version two\n",
+        );
+        std::fs::write(watched_path.join("data.txt"), b"hello\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert!(processor._tracked_local_changes().unwrap().changes.is_empty());
+        processor.update_from_remote().unwrap();
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"version two\r\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn builtin_recheck_matches_an_ident_only_difference_and_rejects_a_real_one() {
+        let (root, watched_path, _v1, _v2) = conversion_repo(
+            "ident-recheck",
+            "*.txt ident\n",
+            b"rev $Id$\n",
+            b"version two\n",
+        );
+        std::fs::write(
+            watched_path.join("data.txt"),
+            b"rev $Id: 0123456789abcdef0123456789abcdef01234567 $\n",
+        )
+        .unwrap();
+        let repo = git2::Repository::open(&watched_path).unwrap();
+        let mut index = repo.index().unwrap();
+        index.read(true).unwrap();
+        let entry_id = index.get_path(Path::new("data.txt"), 0).unwrap().id;
+        drop(index);
+        drop(repo);
+        let processor = processor_for(&watched_path);
+        assert!(processor._builtin_conversion_may_apply(Path::new("data.txt")));
+        assert!(processor._matches_after_builtin_conversion(
+            &watched_path,
+            Path::new("data.txt"),
+            &watched_path.join("data.txt"),
+            entry_id
+        ));
+        std::fs::write(watched_path.join("data.txt"), b"rev changed\n").unwrap();
+        assert!(!processor._matches_after_builtin_conversion(
+            &watched_path,
+            Path::new("data.txt"),
+            &watched_path.join("data.txt"),
+            entry_id
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn intent_to_add_file_that_cleans_to_the_empty_blob_is_a_change() {
+        let root = temp_dir("intent-to-add-empty");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        std::fs::write(upstream_path.join(".gitattributes"), "*.txt filter=strip\n").unwrap();
+        std::fs::write(upstream_path.join("data.txt"), "hello\n").unwrap();
+        let v1 = commit_all(&upstream, "v1");
+        write_fixture_crate(&upstream_path, "fixture-version-two");
+        let _v2 = commit_all(&upstream, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v1).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        set_repo_config(&watched_path, "filter.strip.clean", "head -c 0");
+        std::fs::write(watched_path.join("new.txt"), "anything\n").unwrap();
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&watched_path)
+            .args(["add", "-N", "new.txt"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let processor = processor_for(&watched_path);
+        assert_eq!(
+            processor._tracked_local_changes().unwrap().changes,
+            vec![PathBuf::from("new.txt")]
+        );
+        processor.update_from_remote().unwrap();
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), _v2);
+        drop(watched);
+        assert_eq!(
+            std::fs::read(watched_path.join("new.txt")).unwrap(),
+            b"anything\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
 
     fn pipe_pair() -> (std::fs::File, std::fs::File) {
         use std::os::unix::io::FromRawFd;
@@ -3730,7 +6614,7 @@ mod tests {
 
         let processor = processor_for(&watched_path);
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("src/main.rs")]
         );
         let err = processor.update_from_remote().unwrap_err();
@@ -3752,7 +6636,7 @@ mod tests {
 
         let processor = processor_for(&watched_path);
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("keep.txt")]
         );
         processor.update_from_remote().unwrap();
@@ -3780,7 +6664,7 @@ mod tests {
 
         let processor = processor_for(&watched_path);
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("src/main.rs")]
         );
         let err = processor.update_from_remote().unwrap_err();
@@ -3803,7 +6687,7 @@ mod tests {
 
         let processor = processor_for(&watched_path);
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("src/main.rs")]
         );
         let err = processor.update_from_remote().unwrap_err();
@@ -3830,7 +6714,7 @@ mod tests {
 
         let processor = processor_for(&watched_path);
         assert_eq!(
-            processor._tracked_local_changes().unwrap(),
+            processor._tracked_local_changes().unwrap().changes,
             vec![PathBuf::from("src/main.rs")]
         );
         let err = processor.update_from_remote().unwrap_err();
@@ -4059,6 +6943,490 @@ mod tests {
             std::fs::read_to_string(watched_path.join("b.txt")).unwrap(),
             "two-b\n"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_accepts_a_tree_matching_the_fetched_commit() {
+        let (root, watched_path, v1, v2) =
+            two_file_repo("post-checkout-verify-accepts-fetched");
+        std::fs::write(watched_path.join("a.txt"), "two-a\n").unwrap();
+        std::fs::write(watched_path.join("b.txt"), "two-b\n").unwrap();
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        processor._verify_checked_out_paths(v1, v2, &changed).unwrap();
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_refuses_content_matching_only_the_old_commit() {
+        let (root, watched_path, v1, v2) =
+            two_file_repo("post-checkout-verify-refuses-old-content");
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        match processor._verify_checked_out_paths(v1, v2, &changed) {
+            Ok(()) => panic!("post-checkout verification must refuse old-commit content"),
+            Err(e) => {
+                let message = format!("{:?}", e);
+                assert!(
+                    message.contains("do not match the fetched commit after the checkout"),
+                    "{}",
+                    message
+                );
+                assert!(message.contains("a.txt"), "{}", message);
+                assert!(message.contains("b.txt"), "{}", message);
+            }
+        }
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_refuses_a_third_content_and_a_missing_file() {
+        let (root, watched_path, v1, v2) =
+            two_file_repo("post-checkout-verify-refuses-third-and-missing");
+        std::fs::write(watched_path.join("a.txt"), "race edit\n").unwrap();
+        std::fs::remove_file(watched_path.join("b.txt")).unwrap();
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        match processor._verify_checked_out_paths(v1, v2, &changed) {
+            Ok(()) => panic!("post-checkout verification must refuse diverged paths"),
+            Err(e) => {
+                let message = format!("{:?}", e);
+                assert!(message.contains("a.txt"), "{}", message);
+                assert!(message.contains("b.txt"), "{}", message);
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("a.txt")).unwrap(),
+            "race edit\n"
+        );
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_accepts_a_deleted_path_only_when_it_is_absent() {
+        let root = temp_dir("post-checkout-verify-deleted-path");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        std::fs::write(watched_path.join("a.txt"), "one-a\n").unwrap();
+        std::fs::write(watched_path.join("b.txt"), "one-b\n").unwrap();
+        let v1 = commit_all(&watched, "v1");
+        std::fs::write(watched_path.join("a.txt"), "two-a\n").unwrap();
+        std::fs::remove_file(watched_path.join("b.txt")).unwrap();
+        let v2 = commit_all(&watched, "v2");
+        drop(watched);
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        processor._verify_checked_out_paths(v1, v2, &changed).unwrap();
+        std::fs::write(watched_path.join("b.txt"), "one-b\n").unwrap();
+        match processor._verify_checked_out_paths(v1, v2, &changed) {
+            Ok(()) => panic!("a recreated deleted path must refuse verification"),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("b.txt"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_accepts_paths_shadowed_by_a_dir_to_file_typechange() {
+        let root = temp_dir("post-checkout-verify-typechange-shadow");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        std::fs::create_dir_all(watched_path.join("thing")).unwrap();
+        std::fs::write(watched_path.join("thing/inner.txt"), "inner\n").unwrap();
+        let v1 = commit_all(&watched, "v1");
+        std::fs::remove_dir_all(watched_path.join("thing")).unwrap();
+        std::fs::write(watched_path.join("thing"), "now a file\n").unwrap();
+        let v2 = commit_all(&watched, "v2");
+        drop(watched);
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        processor._verify_checked_out_paths(v1, v2, &changed).unwrap();
+        std::fs::write(watched_path.join("thing"), "third content\n").unwrap();
+        match processor._verify_checked_out_paths(v1, v2, &changed) {
+            Ok(()) => panic!("a typechange ancestor holding a third content must refuse"),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("thing"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_accepts_paths_shadowed_two_levels_below_a_typechange() {
+        let root = temp_dir("post-checkout-verify-typechange-shadow-deep");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        std::fs::create_dir_all(watched_path.join("thing/sub")).unwrap();
+        std::fs::write(watched_path.join("thing/sub/inner.txt"), "inner\n").unwrap();
+        let v1 = commit_all(&watched, "v1");
+        std::fs::remove_dir_all(watched_path.join("thing")).unwrap();
+        std::fs::write(watched_path.join("thing"), "now a file\n").unwrap();
+        let v2 = commit_all(&watched, "v2");
+        drop(watched);
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        processor._verify_checked_out_paths(v1, v2, &changed).unwrap();
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_accepts_a_gitlink_bump_with_the_submodule_at_the_old_pointer() {
+        let (root, watched_path, v1, v2, sub_a, _sub_b) =
+            gitlink_fixture("post-checkout-verify-gitlink-old-pointer");
+        let sub_path = watched_path.join("sub");
+        let sub = git2::Repository::open(&sub_path).unwrap();
+        let a_commit = sub.find_commit(sub_a).unwrap();
+        sub.reset(a_commit.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(a_commit);
+        drop(sub);
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        processor._verify_checked_out_paths(v1, v2, &changed).unwrap();
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_refuses_a_gitlink_matching_neither_pointer() {
+        let (root, watched_path, v1, v2, _sub_a, _sub_b) =
+            gitlink_fixture("post-checkout-verify-gitlink-diverged");
+        let sub_path = watched_path.join("sub");
+        let sub = git2::Repository::open(&sub_path).unwrap();
+        std::fs::write(sub_path.join("sub.txt"), "sub three\n").unwrap();
+        commit_all(&sub, "sub c");
+        drop(sub);
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        match processor._verify_checked_out_paths(v1, v2, &changed) {
+            Ok(()) => panic!("a gitlink matching neither pointer must refuse verification"),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("sub"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_refuses_a_file_retained_through_a_file_to_gitlink_typechange() {
+        let root = temp_dir("post-checkout-verify-file-to-gitlink");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        std::fs::write(watched_path.join("sub"), "plain\n").unwrap();
+        let v1 = commit_all(&watched, "v1");
+        std::fs::remove_file(watched_path.join("sub")).unwrap();
+        let sub_path = watched_path.join("sub");
+        let sub = git2::Repository::init_opts(&sub_path, &init_opts).unwrap();
+        std::fs::write(sub_path.join("sub.txt"), "sub one\n").unwrap();
+        let sub_a = commit_all(&sub, "sub a");
+        drop(sub);
+        let v2 = commit_with_gitlink(&watched, sub_a, "v2");
+        drop(watched);
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        processor._verify_checked_out_paths(v1, v2, &changed).unwrap();
+        std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::write(watched_path.join("sub"), "plain\n").unwrap();
+        match processor._verify_checked_out_paths(v1, v2, &changed) {
+            Ok(()) => panic!("the retained plain file must refuse verification"),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("sub"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_refuses_a_submodule_retained_through_a_gitlink_to_file_typechange()
+    {
+        let (root, watched_path, v1, v2, sub_a, _sub_b) =
+            gitlink_fixture("post-checkout-verify-gitlink-to-file");
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let blob_id = watched.blob(b"now a file\n").unwrap();
+        let mut index = watched.index().unwrap();
+        index.clear().unwrap();
+        index.add_path(Path::new("Cargo.toml")).unwrap();
+        index.add_path(Path::new("src/main.rs")).unwrap();
+        let entry = git2::IndexEntry {
+            ctime: git2::IndexTime::new(0, 0),
+            mtime: git2::IndexTime::new(0, 0),
+            dev: 0,
+            ino: 0,
+            mode: 0o100644,
+            uid: 0,
+            gid: 0,
+            file_size: 0,
+            id: blob_id,
+            flags: 0,
+            flags_extended: 0,
+            path: b"sub".to_vec(),
+        };
+        index.add(&entry).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        drop(index);
+        let tree = watched.find_tree(tree_oid).unwrap();
+        let sig = Signature::now("zlorb-test", "zlorb-test@example.com").unwrap();
+        let parent = watched.find_commit(v2).unwrap();
+        let v3 = watched
+            .commit(Some("HEAD"), &sig, &sig, "v3", &tree, &[&parent])
+            .unwrap();
+        drop(parent);
+        drop(tree);
+        drop(watched);
+        let sub_path = watched_path.join("sub");
+        let sub = git2::Repository::open(&sub_path).unwrap();
+        let a_commit = sub.find_commit(sub_a).unwrap();
+        sub.reset(a_commit.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(a_commit);
+        drop(sub);
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v3).unwrap();
+        match processor._verify_checked_out_paths(v1, v3, &changed) {
+            Ok(()) => panic!("the retained submodule must refuse verification"),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("sub"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::write(watched_path.join("sub"), "now a file\n").unwrap();
+        processor._verify_checked_out_paths(v1, v3, &changed).unwrap();
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_accepts_a_removed_gitlink_left_on_disk() {
+        let root = temp_dir("post-checkout-verify-gitlink-removed");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        let sub_path = watched_path.join("sub");
+        let sub = git2::Repository::init_opts(&sub_path, &init_opts).unwrap();
+        std::fs::write(sub_path.join("sub.txt"), "sub one\n").unwrap();
+        let sub_a = commit_all(&sub, "sub a");
+        drop(sub);
+        let v1 = commit_with_gitlink(&watched, sub_a, "v1");
+        write_fixture_crate(&watched_path, "fixture-version-two");
+        let mut index = watched.index().unwrap();
+        index.clear().unwrap();
+        index.add_path(Path::new("Cargo.toml")).unwrap();
+        index.add_path(Path::new("src/main.rs")).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        drop(index);
+        let tree = watched.find_tree(tree_oid).unwrap();
+        let sig = Signature::now("zlorb-test", "zlorb-test@example.com").unwrap();
+        let parent = watched.find_commit(v1).unwrap();
+        let v2 = watched
+            .commit(Some("HEAD"), &sig, &sig, "v2", &tree, &[&parent])
+            .unwrap();
+        drop(parent);
+        drop(tree);
+        drop(watched);
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        processor._verify_checked_out_paths(v1, v2, &changed).unwrap();
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gitlink_bump_fast_forwards_with_the_submodule_at_the_old_pointer() {
+        let root = temp_dir("post-checkout-verify-gitlink-full-flow");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        let up_sub_path = upstream_path.join("sub");
+        let up_sub = git2::Repository::init_opts(&up_sub_path, &init_opts).unwrap();
+        std::fs::write(up_sub_path.join("sub.txt"), "sub one\n").unwrap();
+        let sub_a = commit_all(&up_sub, "sub a");
+        std::fs::write(up_sub_path.join("sub.txt"), "sub two\n").unwrap();
+        let sub_b = commit_all(&up_sub, "sub b");
+        let a_commit = up_sub.find_commit(sub_a).unwrap();
+        up_sub
+            .reset(a_commit.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(a_commit);
+        drop(up_sub);
+        let v1 = commit_with_gitlink(&upstream, sub_a, "v1");
+        write_fixture_crate(&upstream_path, "fixture-version-two");
+        commit_with_gitlink(&upstream, sub_b, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v1).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        std::fs::remove_dir_all(watched_path.join("sub")).ok();
+        let sub_path = watched_path.join("sub");
+        let sub = git2::Repository::clone(
+            up_sub_path.to_string_lossy().as_ref(),
+            &sub_path,
+        )
+        .unwrap();
+        assert_eq!(head_oid(&sub), sub_a);
+        drop(sub);
+
+        processor_for(&watched_path).update_from_remote().unwrap();
+
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let v2 = watched
+            .find_reference("refs/remotes/origin/master")
+            .unwrap()
+            .target()
+            .unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        let sub = git2::Repository::open(&sub_path).unwrap();
+        assert_eq!(head_oid(&sub), sub_a);
+        drop(sub);
+        assert!(
+            std::fs::read_to_string(watched_path.join("src/main.rs"))
+                .unwrap()
+                .contains("fixture-version-two")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_names_mismatched_and_unverifiable_files_separately() {
+        let (root, watched_path, _v1, v2) = external_filter_repo(
+            "post-checkout-verify-mixed",
+            "version two\n",
+        );
+        std::fs::write(watched_path.join("data.txt"), "Xversion two\n").unwrap();
+        std::fs::write(
+            watched_path.join("src/main.rs"),
+            "fn main() { println!(\"edited\"); }\n",
+        )
+        .unwrap();
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(_v1, v2).unwrap();
+        match processor._verify_checked_out_paths(_v1, v2, &changed) {
+            Ok(()) => panic!("post-checkout verification must refuse diverged files"),
+            Err(e) => {
+                let message = format!("{:?}", e);
+                assert!(
+                    message.contains("tracked files (src/main.rs) do not match"),
+                    "{}",
+                    message
+                );
+                assert!(
+                    message.contains("tracked files (data.txt) could not be checked"),
+                    "{}",
+                    message
+                );
+            }
+        }
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_accepts_a_file_matching_through_its_clean_filter() {
+        let (root, watched_path, _v1, v2) =
+            external_filter_repo("post-checkout-verify-clean-filter", "version two\n");
+        std::fs::write(watched_path.join("data.txt"), "Xversion two\n").unwrap();
+        std::fs::write(
+            watched_path.join("src/main.rs"),
+            "fn main() { println!(\"fixture-version-two\"); }\n",
+        )
+        .unwrap();
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(_v1, v2).unwrap();
+        processor._verify_checked_out_paths(_v1, v2, &changed).unwrap();
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_names_a_file_whose_clean_filter_fails_as_unverifiable() {
+        let (root, watched_path, _v1, v2) = external_filter_repo(
+            "post-checkout-verify-unverifiable",
+            "version two\n",
+        );
+        std::fs::write(watched_path.join("data.txt"), "Xversion two\n").unwrap();
+        std::fs::write(
+            watched_path.join("src/main.rs"),
+            "fn main() { println!(\"fixture-version-two\"); }\n",
+        )
+        .unwrap();
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(_v1, v2).unwrap();
+        match processor._verify_checked_out_paths(_v1, v2, &changed) {
+            Ok(()) => panic!("post-checkout verification must refuse unverifiable files"),
+            Err(e) => {
+                let message = format!("{:?}", e);
+                assert!(
+                    message.contains("could not be checked against their clean conversion"),
+                    "{}",
+                    message
+                );
+                assert!(message.contains("data.txt"), "{}", message);
+                assert!(
+                    !message.contains("do not match the fetched commit"),
+                    "{}",
+                    message
+                );
+            }
+        }
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_accepts_an_absent_skip_worktree_path() {
+        let (root, watched_path, v1, v2) =
+            two_file_repo("post-checkout-verify-skip-worktree-absent");
+        std::fs::write(watched_path.join("a.txt"), "two-a\n").unwrap();
+        set_index_flag(&watched_path, "--skip-worktree", "b.txt");
+        std::fs::remove_file(watched_path.join("b.txt")).unwrap();
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        processor._verify_checked_out_paths(v1, v2, &changed).unwrap();
+        drop(processor);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4567,6 +7935,70 @@ mod tests {
     }
 
     #[test]
+    fn checkout_step_refuses_when_changed_paths_are_unknown() {
+        let (root, watched_path, v1, v2) = two_file_repo("checkout-unknown-changed-paths");
+        let processor = processor_for(&watched_path);
+        move_ref_to_v2(&processor, v2);
+        std::fs::write(watched_path.join("b.txt"), "race edit\n").unwrap();
+        match processor._checkout_and_get_ref(Some(v1), v2, None) {
+            Ok(_) => panic!("checkout must refuse when the changed paths are unknown"),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("could not be computed"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("a.txt")).unwrap(),
+            "one-a\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("b.txt")).unwrap(),
+            "race edit\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn apply_step_refuses_when_changed_paths_are_unknown() {
+        let (root, watched_path, v1, v2) = two_file_repo("apply-unknown-changed-paths");
+        let processor = processor_for(&watched_path);
+        processor
+            .repo
+            .reference("refs/remotes/origin/master", v2, true, "test")
+            .unwrap();
+        {
+            let fetch_ref = processor
+                .repo
+                .find_reference("refs/remotes/origin/master")
+                .unwrap();
+            let fetch_commit = processor
+                .repo
+                .reference_to_annotated_commit(&fetch_ref)
+                .unwrap();
+            match processor._apply_fast_forward(fetch_commit, v1, None) {
+                Ok(_) => panic!("apply must refuse when the changed paths are unknown"),
+                Err(e) => assert!(
+                    format!("{:?}", e).contains("could not be computed"),
+                    "unexpected error: {:?}",
+                    e
+                ),
+            }
+        }
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("a.txt")).unwrap(),
+            "one-a\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("b.txt")).unwrap(),
+            "one-b\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn checkout_step_refuses_dir_only_typechange_under_a_symlinked_ancestor() {
         let root = temp_dir("checkout-symlink-ancestor-dir-only");
         let watched_path = root.join("watched");
@@ -4918,6 +8350,1451 @@ mod tests {
         (root, watched_path, v1, v2, sub_a, sub_b)
     }
 
+    fn commit_without_gitlink(repo: &git2::Repository, parent: Oid, message: &str) -> Oid {
+        let mut index = repo.index().unwrap();
+        index.clear().unwrap();
+        index.add_path(Path::new("Cargo.toml")).unwrap();
+        index.add_path(Path::new("src/main.rs")).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig = Signature::now("zlorb-test", "zlorb-test@example.com").unwrap();
+        let parent_commit = repo.find_commit(parent).unwrap();
+        repo.commit(None, &sig, &sig, message, &tree, &[&parent_commit])
+            .unwrap()
+    }
+
+    fn reset_sub_to(watched_path: &Path, oid: Oid) {
+        let sub_path = watched_path.join("sub");
+        let sub = git2::Repository::open(&sub_path).unwrap();
+        let commit = sub.find_commit(oid).unwrap();
+        sub.reset(commit.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+    }
+
+    fn removed_gitlink_fixture(
+        label: &str,
+    ) -> (PathBuf, PathBuf, Oid, Oid, Oid) {
+        let (root, watched_path, v1, _v2, sub_a, _sub_b) = gitlink_fixture(label);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let v2 = commit_without_gitlink(&watched, v1, "v2-removed");
+        drop(watched);
+        reset_sub_to(&watched_path, sub_a);
+        (root, watched_path, v1, v2, sub_a)
+    }
+
+    fn added_gitlink_fixture(label: &str) -> (PathBuf, PathBuf, Oid, Oid, Oid) {
+        let root = temp_dir(label);
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        let v1 = commit_all(&watched, "v1");
+        let sub_path = watched_path.join("sub");
+        let sub = git2::Repository::init_opts(&sub_path, &init_opts).unwrap();
+        std::fs::write(sub_path.join(".gitignore"), "data.db\n").unwrap();
+        std::fs::write(sub_path.join("sub.txt"), "sub one\n").unwrap();
+        let sub_a = commit_all(&sub, "sub a");
+        drop(sub);
+        let v2 = commit_with_gitlink(&watched, sub_a, "v2");
+        drop(watched);
+        (root, watched_path, v1, v2, sub_a)
+    }
+
+    #[test]
+    fn checkout_step_accepts_a_removed_gitlink_holding_only_an_ignored_file() {
+        let (root, watched_path, v1, v2, _sub_a) =
+            removed_gitlink_fixture("checkout-removed-gitlink-ignored");
+        std::fs::write(watched_path.join("sub/data.db"), "build output\n").unwrap();
+        let processor = processor_for(&watched_path);
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        let remote_ref = processor
+            ._checkout_and_get_ref(Some(v1), v2, Some(&changed))
+            .unwrap();
+        assert_eq!(remote_ref.target(), Some(v2));
+        drop(remote_ref);
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_accepts_an_added_gitlink_precloned_at_the_fetched_pointer_holding_only_an_ignored_file(
+    ) {
+        let (root, watched_path, v1, v2, _sub_a) =
+            added_gitlink_fixture("checkout-added-gitlink-ignored");
+        std::fs::write(watched_path.join("sub/data.db"), "build output\n").unwrap();
+        let processor = processor_for(&watched_path);
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        let remote_ref = processor
+            ._checkout_and_get_ref(Some(v1), v2, Some(&changed))
+            .unwrap();
+        assert_eq!(remote_ref.target(), Some(v2));
+        drop(remote_ref);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
+            "sub one\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/data.db")).unwrap(),
+            "build output\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_refuses_a_removed_gitlink_holding_an_untracked_file() {
+        let (root, watched_path, v1, v2, _sub_a) =
+            removed_gitlink_fixture("checkout-removed-gitlink-untracked");
+        std::fs::write(watched_path.join("sub/notes.txt"), "user notes\n").unwrap();
+        let processor = processor_for(&watched_path);
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        match processor._checkout_and_get_ref(Some(v1), v2, Some(&changed)) {
+            Ok(_) => panic!("a removed gitlink holding an untracked file must refuse the checkout"),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("sub"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/notes.txt")).unwrap(),
+            "user notes\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_accepts_a_removed_gitlink_holding_only_an_ignored_file() {
+        let (root, watched_path, v1, v2, _sub_a) =
+            removed_gitlink_fixture("post-checkout-verify-removed-gitlink-ignored");
+        std::fs::write(watched_path.join("sub/data.db"), "build output\n").unwrap();
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        processor._verify_checked_out_paths(v1, v2, &changed).unwrap();
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_a_removed_gitlink_holding_only_an_ignored_file() {
+        let (root, watched_path, v1, v2, _sub_a) =
+            removed_gitlink_fixture("rollback-removed-gitlink-ignored");
+        std::fs::write(watched_path.join("sub/data.db"), "precious\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/data.db")).unwrap(),
+            "precious\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_drops_the_index_entry_of_an_added_gitlink_preclone_holding_only_an_ignored_file()
+    {
+        let (root, watched_path, v1, v2, _sub_a) =
+            added_gitlink_fixture("rollback-added-gitlink-ignored");
+        std::fs::write(watched_path.join("sub/data.db"), "precious\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert!(processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        let index = processor.repo.index().unwrap();
+        assert!(index.get_path(Path::new("sub"), 0).is_none());
+        drop(index);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/data.db")).unwrap(),
+            "precious\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_classification_accepts_a_removed_gitlink_placeholder_holding_only_an_ignored_file()
+    {
+        let (root, watched_path, v1, v2, _sub_a) =
+            removed_gitlink_fixture("checkout-placeholder-removed-gitlink-ignored");
+        submodule_placeholder(&watched_path);
+        std::fs::write(
+            watched_path.join(".git/modules/sub/info/exclude"),
+            "data.db\n",
+        )
+        .unwrap();
+        std::fs::write(watched_path.join("sub/data.db"), "build output\n").unwrap();
+        let processor = processor_for(&watched_path);
+        let (safe, preserved, _absent, _unverifiable, failed) =
+            processor._checkout_restore_paths(v1, v2, &[PathBuf::from("sub")]);
+        assert!(!failed);
+        assert_eq!(safe, vec![PathBuf::from("sub")]);
+        assert!(preserved.is_empty());
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_accepts_a_removed_gitlink_placeholder_holding_only_an_ignored_file() {
+        let (root, watched_path, v1, v2, _sub_a) =
+            removed_gitlink_fixture("checkout-step-placeholder-removed-gitlink-ignored");
+        submodule_placeholder(&watched_path);
+        std::fs::write(
+            watched_path.join(".git/modules/sub/info/exclude"),
+            "data.db\n",
+        )
+        .unwrap();
+        std::fs::write(watched_path.join("sub/data.db"), "build output\n").unwrap();
+        let processor = processor_for(&watched_path);
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        let remote_ref = processor
+            ._checkout_and_get_ref(Some(v1), v2, Some(&changed))
+            .unwrap();
+        assert_eq!(remote_ref.target(), Some(v2));
+        drop(remote_ref);
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_classification_accepts_a_removed_gitlink_placeholder_with_a_plain_file_in_an_ignored_directory(
+    ) {
+        let (root, watched_path, v1, v2, _sub_a) = removed_gitlink_fixture(
+            "checkout-placeholder-removed-gitlink-ignored-dir-plain-file",
+        );
+        submodule_placeholder(&watched_path);
+        std::fs::write(
+            watched_path.join(".git/modules/sub/info/exclude"),
+            "logs/\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(watched_path.join("sub/logs")).unwrap();
+        std::fs::write(watched_path.join("sub/logs/x.txt"), "build log\n").unwrap();
+        let processor = processor_for(&watched_path);
+        let (safe, preserved, _absent, _unverifiable, failed) =
+            processor._checkout_restore_paths(v1, v2, &[PathBuf::from("sub")]);
+        assert!(!failed);
+        assert_eq!(safe, vec![PathBuf::from("sub")]);
+        assert!(preserved.is_empty());
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_classification_refuses_a_removed_gitlink_placeholder_with_a_nested_repo_in_an_ignored_directory(
+    ) {
+        let (root, watched_path, v1, v2, _sub_a) = removed_gitlink_fixture(
+            "checkout-placeholder-removed-gitlink-ignored-dir-nested-repo",
+        );
+        submodule_placeholder(&watched_path);
+        std::fs::write(
+            watched_path.join(".git/modules/sub/info/exclude"),
+            "cache/\n",
+        )
+        .unwrap();
+        let nested_path = watched_path.join("sub/cache/nested");
+        std::fs::create_dir_all(&nested_path).unwrap();
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let nested = git2::Repository::init_opts(&nested_path, &init_opts).unwrap();
+        std::fs::write(nested_path.join("inner.txt"), "inner\n").unwrap();
+        drop(nested);
+        let processor = processor_for(&watched_path);
+        let (safe, preserved, _absent, _unverifiable, failed) =
+            processor._checkout_restore_paths(v1, v2, &[PathBuf::from("sub")]);
+        assert!(!failed);
+        assert!(safe.is_empty());
+        assert_eq!(preserved, vec![PathBuf::from("sub")]);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(nested_path.join("inner.txt")).unwrap(),
+            "inner\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_classification_refuses_a_removed_gitlink_placeholder_with_a_symlink_in_an_ignored_directory(
+    ) {
+        let (root, watched_path, v1, v2, _sub_a) = removed_gitlink_fixture(
+            "checkout-placeholder-removed-gitlink-ignored-dir-symlink",
+        );
+        submodule_placeholder(&watched_path);
+        std::fs::write(
+            watched_path.join(".git/modules/sub/info/exclude"),
+            "cache/\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(watched_path.join("sub/cache")).unwrap();
+        std::fs::write(watched_path.join("sub/cache/target.txt"), "target\n").unwrap();
+        std::os::unix::fs::symlink("target.txt", watched_path.join("sub/cache/link"))
+            .unwrap();
+        let processor = processor_for(&watched_path);
+        let (safe, preserved, _absent, _unverifiable, failed) =
+            processor._checkout_restore_paths(v1, v2, &[PathBuf::from("sub")]);
+        assert!(!failed);
+        assert!(safe.is_empty());
+        assert_eq!(preserved, vec![PathBuf::from("sub")]);
+        drop(processor);
+        assert!(std::fs::symlink_metadata(watched_path.join("sub/cache/link"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_classification_refuses_a_removed_gitlink_placeholder_with_a_bogus_dot_git_file_in_an_ignored_directory(
+    ) {
+        let (root, watched_path, v1, v2, _sub_a) = removed_gitlink_fixture(
+            "checkout-placeholder-removed-gitlink-ignored-dir-bogus-dot-git",
+        );
+        submodule_placeholder(&watched_path);
+        std::fs::write(
+            watched_path.join(".git/modules/sub/info/exclude"),
+            "cache/\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(watched_path.join("sub/cache/nested")).unwrap();
+        std::fs::write(
+            watched_path.join("sub/cache/nested/.git"),
+            "gitdir: /nonexistent\n",
+        )
+        .unwrap();
+        std::fs::write(watched_path.join("sub/cache/nested/inner.txt"), "inner\n").unwrap();
+        let processor = processor_for(&watched_path);
+        let (safe, preserved, _absent, _unverifiable, failed) =
+            processor._checkout_restore_paths(v1, v2, &[PathBuf::from("sub")]);
+        assert!(!failed);
+        assert!(safe.is_empty());
+        assert_eq!(preserved, vec![PathBuf::from("sub")]);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/cache/nested/.git")).unwrap(),
+            "gitdir: /nonexistent\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_classification_refuses_a_removed_gitlink_placeholder_with_a_partial_dot_git_directory_in_an_ignored_directory(
+    ) {
+        let (root, watched_path, v1, v2, _sub_a) = removed_gitlink_fixture(
+            "checkout-placeholder-removed-gitlink-ignored-dir-partial-dot-git",
+        );
+        submodule_placeholder(&watched_path);
+        std::fs::write(
+            watched_path.join(".git/modules/sub/info/exclude"),
+            "cache/\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(watched_path.join("sub/cache/nested/.git")).unwrap();
+        std::fs::write(
+            watched_path.join("sub/cache/nested/.git/HEAD"),
+            "ref: refs/heads/master\n",
+        )
+        .unwrap();
+        let processor = processor_for(&watched_path);
+        let (safe, preserved, _absent, _unverifiable, failed) =
+            processor._checkout_restore_paths(v1, v2, &[PathBuf::from("sub")]);
+        assert!(!failed);
+        assert!(safe.is_empty());
+        assert_eq!(preserved, vec![PathBuf::from("sub")]);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/cache/nested/.git/HEAD"))
+                .unwrap(),
+            "ref: refs/heads/master\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_refuses_a_removed_gitlink_placeholder_with_a_nested_repo_in_an_ignored_directory(
+    ) {
+        let (root, watched_path, v1, v2, _sub_a) = removed_gitlink_fixture(
+            "checkout-step-placeholder-removed-gitlink-ignored-dir-nested-repo",
+        );
+        submodule_placeholder(&watched_path);
+        std::fs::write(
+            watched_path.join(".git/modules/sub/info/exclude"),
+            "cache/\n",
+        )
+        .unwrap();
+        let nested_path = watched_path.join("sub/cache/nested");
+        std::fs::create_dir_all(&nested_path).unwrap();
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let nested = git2::Repository::init_opts(&nested_path, &init_opts).unwrap();
+        std::fs::write(nested_path.join("inner.txt"), "inner\n").unwrap();
+        drop(nested);
+        let processor = processor_for(&watched_path);
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        match processor._checkout_and_get_ref(Some(v1), v2, Some(&changed)) {
+            Ok(_) => panic!(
+                "a removed gitlink placeholder holding a nested repo inside an ignored directory must refuse the checkout"
+            ),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("sub"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(nested_path.join("inner.txt")).unwrap(),
+            "inner\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_classification_accepts_a_removed_gitlink_plain_directory_holding_only_an_ignored_file(
+    ) {
+        let (root, watched_path, v1, v2, _sub_a) =
+            removed_gitlink_fixture("checkout-plain-removed-gitlink-ignored");
+        std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::create_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::write(watched_path.join(".git/info/exclude"), "sub/data.db\n").unwrap();
+        std::fs::write(watched_path.join("sub/data.db"), "build output\n").unwrap();
+        let processor = processor_for(&watched_path);
+        let (safe, preserved, _absent, _unverifiable, failed) =
+            processor._checkout_restore_paths(v1, v2, &[PathBuf::from("sub")]);
+        assert!(!failed);
+        assert_eq!(safe, vec![PathBuf::from("sub")]);
+        assert!(preserved.is_empty());
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_classification_refuses_a_removed_gitlink_plain_directory_holding_an_untracked_file(
+    ) {
+        let (root, watched_path, v1, v2, _sub_a) =
+            removed_gitlink_fixture("checkout-plain-removed-gitlink-untracked");
+        std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::create_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::write(watched_path.join(".git/info/exclude"), "sub/data.db\n").unwrap();
+        std::fs::write(watched_path.join("sub/notes.txt"), "user notes\n").unwrap();
+        let processor = processor_for(&watched_path);
+        let (safe, preserved, _absent, _unverifiable, failed) =
+            processor._checkout_restore_paths(v1, v2, &[PathBuf::from("sub")]);
+        assert!(!failed);
+        assert!(safe.is_empty());
+        assert_eq!(preserved, vec![PathBuf::from("sub")]);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/notes.txt")).unwrap(),
+            "user notes\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_a_removed_gitlink_plain_directory_holding_only_an_ignored_file() {
+        let (root, watched_path, v1, v2, _sub_a) =
+            removed_gitlink_fixture("rollback-plain-removed-gitlink-ignored");
+        std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::create_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::write(watched_path.join(".git/info/exclude"), "sub/data.db\n").unwrap();
+        std::fs::write(watched_path.join("sub/data.db"), "precious\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/data.db")).unwrap(),
+            "precious\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_a_bumped_gitlink_plain_directory_holding_only_an_ignored_file() {
+        let (root, watched_path, v1, v2, _sub_a, _sub_b) =
+            gitlink_fixture("rollback-plain-bumped-gitlink-ignored");
+        std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::create_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::write(watched_path.join(".git/info/exclude"), "sub/data.db\n").unwrap();
+        std::fs::write(watched_path.join("sub/data.db"), "precious\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/data.db")).unwrap(),
+            "precious\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn removed_gitlink_holding_only_an_ignored_file_fast_forwards() {
+        let root = temp_dir("full-flow-removed-gitlink-ignored");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        let up_sub_path = upstream_path.join("sub");
+        let up_sub = git2::Repository::init_opts(&up_sub_path, &init_opts).unwrap();
+        std::fs::write(up_sub_path.join(".gitignore"), "data.db\n").unwrap();
+        std::fs::write(up_sub_path.join("sub.txt"), "sub one\n").unwrap();
+        let sub_a = commit_all(&up_sub, "sub a");
+        drop(up_sub);
+        let v1 = commit_with_gitlink(&upstream, sub_a, "v1");
+        write_fixture_crate(&upstream_path, "fixture-version-two");
+        let v2 = commit_without_gitlink(&upstream, v1, "v2");
+        upstream
+            .reference("refs/heads/master", v2, true, "test")
+            .unwrap();
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v1).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        std::fs::remove_dir_all(watched_path.join("sub")).ok();
+        git2::Repository::clone(
+            up_sub_path.to_string_lossy().as_ref(),
+            watched_path.join("sub"),
+        )
+        .unwrap();
+        std::fs::write(watched_path.join("sub/data.db"), "build output\n").unwrap();
+
+        processor_for(&watched_path).update_from_remote().unwrap();
+
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert!(
+            std::fs::read_to_string(watched_path.join("src/main.rs"))
+                .unwrap()
+                .contains("fixture-version-two")
+        );
+        assert!(!watched_path.join("sub").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn added_gitlink_preclone_fixture(
+        label: &str,
+    ) -> (PathBuf, PathBuf, Oid, Oid, Oid, Oid) {
+        let root = temp_dir(label);
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        let v1 = commit_all(&upstream, "v1");
+        let up_sub_path = upstream_path.join("sub");
+        let up_sub = git2::Repository::init_opts(&up_sub_path, &init_opts).unwrap();
+        std::fs::write(up_sub_path.join(".gitignore"), "data.db\n").unwrap();
+        std::fs::write(up_sub_path.join("sub.txt"), "sub one\n").unwrap();
+        let sub_a = commit_all(&up_sub, "sub a");
+        std::fs::write(up_sub_path.join("sub.txt"), "sub two\n").unwrap();
+        let sub_b = commit_all(&up_sub, "sub b");
+        drop(up_sub);
+        write_fixture_crate(&upstream_path, "fixture-version-two");
+        let v2 = commit_with_gitlink(&upstream, sub_a, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v1).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        let sub_clone = git2::Repository::clone(
+            up_sub_path.to_string_lossy().as_ref(),
+            watched_path.join("sub"),
+        )
+        .unwrap();
+        let a_commit = sub_clone.find_commit(sub_a).unwrap();
+        sub_clone
+            .reset(a_commit.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(a_commit);
+        drop(sub_clone);
+        (root, watched_path, v1, v2, sub_a, sub_b)
+    }
+
+    #[test]
+    fn fast_forward_accepts_an_added_gitlink_whose_precloned_submodule_holds_an_ignored_file()
+    {
+        let (root, watched_path, _v1, v2, sub_a, _sub_b) =
+            added_gitlink_preclone_fixture("full-flow-added-gitlink-precloned-ignored");
+        std::fs::write(watched_path.join("sub/data.db"), "build output\n").unwrap();
+
+        processor_for(&watched_path).update_from_remote().unwrap();
+
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        let index = watched.index().unwrap();
+        assert_eq!(index.get_path(Path::new("sub"), 0).unwrap().id, sub_a);
+        drop(index);
+        drop(watched);
+        assert!(
+            std::fs::read_to_string(watched_path.join("src/main.rs"))
+                .unwrap()
+                .contains("fixture-version-two")
+        );
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
+            "sub one\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/data.db")).unwrap(),
+            "build output\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fast_forward_refuses_an_added_gitlink_whose_preclone_is_at_the_wrong_pointer() {
+        let (root, watched_path, v1, _v2, _sub_a, sub_b) =
+            added_gitlink_preclone_fixture("full-flow-added-gitlink-precloned-wrong-pointer");
+        let sub_path = watched_path.join("sub");
+        let sub = git2::Repository::open(&sub_path).unwrap();
+        let b_commit = sub.find_commit(sub_b).unwrap();
+        sub.reset(b_commit.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(b_commit);
+        drop(sub);
+
+        let processor = processor_for(&watched_path);
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("sub"),
+            "unexpected error: {:?}",
+            err
+        );
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
+            "sub two\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fast_forward_refuses_an_added_gitlink_whose_preclone_holds_an_untracked_file() {
+        let (root, watched_path, v1, _v2, _sub_a, _sub_b) =
+            added_gitlink_preclone_fixture("full-flow-added-gitlink-precloned-untracked");
+        std::fs::write(watched_path.join("sub/notes.txt"), "user notes\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("sub"),
+            "unexpected error: {:?}",
+            err
+        );
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
+            "sub one\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/notes.txt")).unwrap(),
+            "user notes\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fast_forward_refuses_an_added_gitlink_whose_preclone_holds_a_tracked_edit() {
+        let (root, watched_path, v1, _v2, _sub_a, _sub_b) =
+            added_gitlink_preclone_fixture("full-flow-added-gitlink-precloned-dirty");
+        std::fs::write(watched_path.join("sub/sub.txt"), "user edit\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("sub"),
+            "unexpected error: {:?}",
+            err
+        );
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
+            "user edit\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_after_a_seeded_acceptance_restores_the_preclone_state() {
+        let (root, watched_path, v1, v2, _sub_a, _sub_b) =
+            added_gitlink_preclone_fixture("rollback-seeded-preclone");
+        std::fs::write(watched_path.join("sub/data.db"), "build output\n").unwrap();
+        let processor = processor_for(&watched_path);
+        let fetch_ref = processor
+            .repo
+            .find_reference("refs/remotes/origin/master")
+            .unwrap();
+        let fetch_commit = processor
+            .repo
+            .reference_to_annotated_commit(&fetch_ref)
+            .unwrap();
+        drop(fetch_ref);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        processor
+            ._apply_fast_forward(fetch_commit, v1, Some(&changed))
+            .unwrap();
+        {
+            let index = processor.repo.index().unwrap();
+            assert!(index.get_path(Path::new("sub"), 0).is_some());
+        }
+        assert!(processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        let index = processor.repo.index().unwrap();
+        assert!(index.get_path(Path::new("sub"), 0).is_none());
+        drop(index);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
+            "sub one\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/data.db")).unwrap(),
+            "build output\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_after_a_seeded_acceptance_preserves_a_clean_preclone() {
+        let (root, watched_path, v1, v2, _sub_a, _sub_b) =
+            added_gitlink_preclone_fixture("rollback-seeded-preclone-clean");
+        let processor = processor_for(&watched_path);
+        let fetch_ref = processor
+            .repo
+            .find_reference("refs/remotes/origin/master")
+            .unwrap();
+        let fetch_commit = processor
+            .repo
+            .reference_to_annotated_commit(&fetch_ref)
+            .unwrap();
+        drop(fetch_ref);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        processor
+            ._apply_fast_forward(fetch_commit, v1, Some(&changed))
+            .unwrap();
+        assert!(processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        let index = processor.repo.index().unwrap();
+        assert!(index.get_path(Path::new("sub"), 0).is_none());
+        drop(index);
+        drop(processor);
+        let sub = git2::Repository::open(watched_path.join("sub")).unwrap();
+        assert_eq!(head_oid(&sub), _sub_a);
+        drop(sub);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
+            "sub one\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_aborts_when_seeding_an_added_gitlink_preclone_cannot_be_written() {
+        let (root, watched_path, v1, v2, _sub_a, _sub_b) =
+            added_gitlink_preclone_fixture("checkout-seed-write-fails");
+        std::fs::write(watched_path.join("sub/data.db"), "build output\n").unwrap();
+        let processor = processor_for(&watched_path);
+        let fetch_ref = processor
+            .repo
+            .find_reference("refs/remotes/origin/master")
+            .unwrap();
+        let fetch_commit = processor
+            .repo
+            .reference_to_annotated_commit(&fetch_ref)
+            .unwrap();
+        drop(fetch_ref);
+        processor._setup_repo_for_checkout(fetch_commit).unwrap();
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        let lock_path = watched_path.join(".git/index.lock");
+        std::fs::write(&lock_path, "").unwrap();
+        let result = processor
+            ._checkout_and_get_ref(Some(v1), v2, Some(&changed))
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e));
+        std::fs::remove_file(&lock_path).unwrap();
+        match result {
+            Ok(_) => panic!(
+                "a seeding write failure must abort the checkout instead of handing the pre-clone to the force checkout"
+            ),
+            Err(e) => assert!(
+                e.contains("could not be seeded")
+                    || e.contains("could not be written to the index"),
+                "unexpected error: {}",
+                e
+            ),
+        }
+        let index = processor.repo.index().unwrap();
+        assert!(index.get_path(Path::new("sub"), 0).is_none());
+        drop(index);
+        drop(processor);
+        assert!(
+            std::fs::read_to_string(watched_path.join("src/main.rs"))
+                .unwrap()
+                .contains("fixture-version-one")
+        );
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
+            "sub one\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/data.db")).unwrap(),
+            "build output\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_reports_failure_when_the_seeded_gitlink_entry_cannot_be_dropped() {
+        let root = temp_dir("rollback-seeded-unseed-fails");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        let v1 = commit_all(&upstream, "v1");
+        let up_sub_path = upstream_path.join("sub");
+        let up_sub = git2::Repository::init_opts(&up_sub_path, &init_opts).unwrap();
+        std::fs::write(up_sub_path.join(".gitignore"), "data.db\n").unwrap();
+        std::fs::write(up_sub_path.join("sub.txt"), "sub one\n").unwrap();
+        let sub_a = commit_all(&up_sub, "sub a");
+        drop(up_sub);
+        let v2 = commit_with_gitlink(&upstream, sub_a, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v1).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        git2::Repository::clone(
+            up_sub_path.to_string_lossy().as_ref(),
+            watched_path.join("sub"),
+        )
+        .unwrap();
+
+        let processor = processor_for(&watched_path);
+        let fetch_ref = processor
+            .repo
+            .find_reference("refs/remotes/origin/master")
+            .unwrap();
+        let fetch_commit = processor
+            .repo
+            .reference_to_annotated_commit(&fetch_ref)
+            .unwrap();
+        drop(fetch_ref);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        assert_eq!(changed, vec![PathBuf::from("sub")]);
+        processor
+            ._apply_fast_forward(fetch_commit, v1, Some(&changed))
+            .unwrap();
+        let lock_path = watched_path.join(".git/index.lock");
+        std::fs::write(&lock_path, "").unwrap();
+        let rolled_back = processor._rollback_fast_forward(v1, v2);
+        std::fs::remove_file(&lock_path).unwrap();
+        assert!(!rolled_back);
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
+            "sub one\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn set_entry_flags(watched_path: &Path, flags_mask: u16, extended_mask: u16) {
+        let sub_path = watched_path.join("sub");
+        let sub = git2::Repository::open(&sub_path).unwrap();
+        let mut index = sub.index().unwrap();
+        let existing = index.get_path(Path::new("sub.txt"), 0).unwrap();
+        let entry = git2::IndexEntry {
+            ctime: existing.ctime,
+            mtime: existing.mtime,
+            dev: existing.dev,
+            ino: existing.ino,
+            mode: existing.mode,
+            uid: existing.uid,
+            gid: existing.gid,
+            file_size: existing.file_size,
+            id: existing.id,
+            flags: existing.flags | flags_mask,
+            flags_extended: existing.flags_extended | extended_mask,
+            path: existing.path.clone(),
+        };
+        index.add(&entry).unwrap();
+        index.write().unwrap();
+    }
+
+    #[test]
+    fn fast_forward_accepts_an_added_gitlink_whose_preclone_has_a_flagged_but_unmodified_entry()
+    {
+        let (root, watched_path, _v1, v2, _sub_a, _sub_b) =
+            added_gitlink_preclone_fixture("full-flow-added-gitlink-precloned-fsmonitor-flag");
+        set_entry_flags(&watched_path, 0x8000, 0);
+
+        processor_for(&watched_path).update_from_remote().unwrap();
+
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
+            "sub one\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fast_forward_accepts_an_added_gitlink_whose_preclone_has_a_flagged_crlf_converted_entry()
+    {
+        let (root, watched_path, _v1, v2, _sub_a, _sub_b) =
+            added_gitlink_preclone_fixture("full-flow-added-gitlink-precloned-flagged-crlf");
+        {
+            let sub = git2::Repository::open(watched_path.join("sub")).unwrap();
+            let mut config = sub.config().unwrap();
+            config.set_bool("core.autocrlf", true).unwrap();
+        }
+        set_entry_flags(&watched_path, 0x8000, 0);
+        std::fs::write(watched_path.join("sub/sub.txt"), "sub one\r\n").unwrap();
+
+        processor_for(&watched_path).update_from_remote().unwrap();
+
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
+            "sub one\r\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn preclone_check_accepts_a_flagged_file_whose_blob_and_disk_bytes_are_identical_crlf()
+    {
+        let root = temp_dir("precloned-flagged-raw-crlf");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        let v1 = commit_all(&upstream, "v1");
+        let up_sub_path = upstream_path.join("sub");
+        let up_sub = git2::Repository::init_opts(&up_sub_path, &init_opts).unwrap();
+        std::fs::write(up_sub_path.join("sub.txt"), b"sub one\r\n").unwrap();
+        let sub_a = commit_all(&up_sub, "sub a");
+        drop(up_sub);
+        write_fixture_crate(&upstream_path, "fixture-version-two");
+        commit_with_gitlink(&upstream, sub_a, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v1).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        git2::Repository::clone(
+            up_sub_path.to_string_lossy().as_ref(),
+            watched_path.join("sub"),
+        )
+        .unwrap();
+        {
+            let info_dir = watched_path.join("sub/.git/info");
+            std::fs::create_dir_all(&info_dir).unwrap();
+            std::fs::write(info_dir.join("attributes"), "sub.txt text\n").unwrap();
+        }
+        {
+            let sub = git2::Repository::open(watched_path.join("sub")).unwrap();
+            let index = sub.index().unwrap();
+            let entry = index.get_path(Path::new("sub.txt"), 0).unwrap();
+            let blob = sub.find_blob(entry.id).unwrap();
+            assert_eq!(blob.content(), b"sub one\r\n");
+        }
+        set_index_flag(&watched_path.join("sub"), "--assume-unchanged", "sub.txt");
+
+        let processor = processor_for(&watched_path);
+        assert!(processor._precloned_gitlink_matches(Path::new("sub"), sub_a));
+        std::fs::write(watched_path.join("sub/sub.txt"), b"sub two\r\n").unwrap();
+        assert!(!processor._precloned_gitlink_matches(Path::new("sub"), sub_a));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_gitlink_check_accepts_a_flagged_file_whose_blob_and_disk_bytes_are_identical_crlf(
+    ) {
+        let root = temp_dir("rollback-flagged-raw-crlf");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        commit_all(&watched, "v1");
+        drop(watched);
+        let sub_path = watched_path.join("sub");
+        let sub = git2::Repository::init_opts(&sub_path, &init_opts).unwrap();
+        std::fs::write(sub_path.join("sub.txt"), b"sub one\r\n").unwrap();
+        let sub_a = commit_all(&sub, "sub a");
+        {
+            let info_dir = sub_path.join(".git/info");
+            std::fs::create_dir_all(&info_dir).unwrap();
+            std::fs::write(info_dir.join("attributes"), "sub.txt text\n").unwrap();
+        }
+        {
+            let index = sub.index().unwrap();
+            let entry = index.get_path(Path::new("sub.txt"), 0).unwrap();
+            let blob = sub.find_blob(entry.id).unwrap();
+            assert_eq!(blob.content(), b"sub one\r\n");
+        }
+        drop(sub);
+        set_index_flag(&sub_path, "--assume-unchanged", "sub.txt");
+
+        let processor = processor_for(&watched_path);
+        assert!(processor._rollback_gitlink_matches(&sub_path, sub_a, false, false));
+        std::fs::write(sub_path.join("sub.txt"), b"sub two\r\n").unwrap();
+        assert!(!processor._rollback_gitlink_matches(&sub_path, sub_a, false, false));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fast_forward_refuses_an_added_gitlink_whose_preclone_hides_an_edit_behind_assume_unchanged()
+    {
+        let (root, watched_path, v1, _v2, _sub_a, _sub_b) =
+            added_gitlink_preclone_fixture(
+                "full-flow-added-gitlink-precloned-assume-unchanged",
+            );
+        set_entry_flags(&watched_path, 0x8000, 0);
+        std::fs::write(watched_path.join("sub/sub.txt"), "hidden edit\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("sub"),
+            "unexpected error: {:?}",
+            err
+        );
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
+            "hidden edit\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fast_forward_refuses_an_added_gitlink_whose_preclone_hides_an_edit_behind_skip_worktree()
+    {
+        let (root, watched_path, v1, _v2, _sub_a, _sub_b) =
+            added_gitlink_preclone_fixture("full-flow-added-gitlink-precloned-skip-worktree");
+        let sub_path = watched_path.join("sub");
+        {
+            let sub = git2::Repository::open(&sub_path).unwrap();
+            let mut index = sub.index().unwrap();
+            let existing = index.get_path(Path::new("sub.txt"), 0).unwrap();
+            let entry = git2::IndexEntry {
+                ctime: existing.ctime,
+                mtime: existing.mtime,
+                dev: existing.dev,
+                ino: existing.ino,
+                mode: existing.mode,
+                uid: existing.uid,
+                gid: existing.gid,
+                file_size: existing.file_size,
+                id: existing.id,
+                flags: existing.flags,
+                flags_extended: existing.flags_extended
+                    | git2::IndexEntryExtendedFlag::SKIP_WORKTREE.bits(),
+                path: existing.path.clone(),
+            };
+            index.add(&entry).unwrap();
+            index.write().unwrap();
+        }
+        std::fs::write(sub_path.join("sub.txt"), "hidden edit\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("sub"),
+            "unexpected error: {:?}",
+            err
+        );
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        assert_eq!(
+            std::fs::read_to_string(sub_path.join("sub.txt")).unwrap(),
+            "hidden edit\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+
+    #[test]
+    fn fast_forward_refuses_an_added_gitlink_whose_preclone_hides_a_deletion_behind_assume_unchanged()
+    {
+        let (root, watched_path, v1, _v2, _sub_a, _sub_b) =
+            added_gitlink_preclone_fixture(
+                "full-flow-added-gitlink-precloned-assume-unchanged-absent",
+            );
+        set_entry_flags(&watched_path, 0x8000, 0);
+        std::fs::remove_file(watched_path.join("sub/sub.txt")).unwrap();
+
+        let processor = processor_for(&watched_path);
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("sub"),
+            "unexpected error: {:?}",
+            err
+        );
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        assert!(!watched_path.join("sub/sub.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn preclone_check_accepts_a_skip_worktree_absent_flagged_entry() {
+        let (root, watched_path, _v1, _v2, sub_a, _sub_b) =
+            added_gitlink_preclone_fixture("precloned-skip-worktree-absent");
+        set_index_flag(&watched_path.join("sub"), "--skip-worktree", "sub.txt");
+        std::fs::remove_file(watched_path.join("sub/sub.txt")).unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(processor._precloned_gitlink_matches(Path::new("sub"), sub_a));
+        drop(processor);
+        assert!(!watched_path.join("sub/sub.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fast_forward_accepts_an_added_gitlink_whose_preclone_holds_a_skip_worktree_absent_entry()
+    {
+        let (root, watched_path, _v1, v2, _sub_a, _sub_b) =
+            added_gitlink_preclone_fixture("full-flow-added-gitlink-precloned-sw-absent");
+        set_index_flag(&watched_path.join("sub"), "--skip-worktree", "sub.txt");
+        std::fs::remove_file(watched_path.join("sub/sub.txt")).unwrap();
+
+        processor_for(&watched_path).update_from_remote().unwrap();
+
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert!(!watched_path.join("sub/sub.txt").exists());
+        assert!(
+            std::fs::read_to_string(watched_path.join("src/main.rs"))
+                .unwrap()
+                .contains("fixture-version-two")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fast_forward_refuses_an_added_gitlink_whose_preclone_holds_a_skip_worktree_entry_edited_on_disk()
+    {
+        let (root, watched_path, v1, _v2, _sub_a, _sub_b) =
+            added_gitlink_preclone_fixture("full-flow-added-gitlink-precloned-sw-edited");
+        set_index_flag(&watched_path.join("sub"), "--skip-worktree", "sub.txt");
+        std::fs::write(watched_path.join("sub/sub.txt"), "hidden edit\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("sub"),
+            "unexpected error: {:?}",
+            err
+        );
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
+            "hidden edit\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_accepts_a_gitlink_whose_submodule_holds_a_skip_worktree_absent_entry() {
+        let (root, watched_path, v1, v2, _sub_a, _sub_b) =
+            gitlink_fixture("rollback-gitlink-sw-absent");
+        set_index_flag(&watched_path.join("sub"), "--skip-worktree", "sub.txt");
+        std::fs::remove_file(watched_path.join("sub/sub.txt")).unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert!(!watched_path.join("sub/sub.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_gitlink_whose_submodule_hides_an_edit_behind_skip_worktree() {
+        let (root, watched_path, v1, v2, _sub_a, _sub_b) =
+            gitlink_fixture("rollback-gitlink-sw-edited");
+        set_index_flag(&watched_path.join("sub"), "--skip-worktree", "sub.txt");
+        std::fs::write(watched_path.join("sub/sub.txt"), "hidden edit\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
+            "hidden edit\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_gitlink_whose_submodule_holds_an_assume_unchanged_absent_entry() {
+        let (root, watched_path, v1, v2, _sub_a, _sub_b) =
+            gitlink_fixture("rollback-gitlink-au-absent");
+        set_index_flag(&watched_path.join("sub"), "--assume-unchanged", "sub.txt");
+        std::fs::remove_file(watched_path.join("sub/sub.txt")).unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert!(!watched_path.join("sub/sub.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_gitlink_with_a_skip_worktree_absent_entry_and_a_flagged_edit() {
+        let (root, watched_path, v1, v2, _sub_a, _sub_b) =
+            gitlink_fixture("rollback-gitlink-sw-absent-plus-edit");
+        set_index_flag(&watched_path.join("sub"), "--skip-worktree", "sub.txt");
+        std::fs::remove_file(watched_path.join("sub/sub.txt")).unwrap();
+        set_index_flag(&watched_path.join("sub"), "--assume-unchanged", ".gitignore");
+        std::fs::write(watched_path.join("sub/.gitignore"), "other.db\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert!(!watched_path.join("sub/sub.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/.gitignore")).unwrap(),
+            "other.db\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_gitlink_check_rejects_dirt_inside_a_flagged_nested_gitlink() {
+        let root = temp_dir("rollback-gitlink-flagged-nested-dirty");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        commit_all(&watched, "v1");
+        drop(watched);
+        let sub_path = watched_path.join("sub");
+        let sub = git2::Repository::init_opts(&sub_path, &init_opts).unwrap();
+        std::fs::write(sub_path.join("sub.txt"), "sub one\n").unwrap();
+        let nested_path = sub_path.join("nested");
+        let nested = git2::Repository::init_opts(&nested_path, &init_opts).unwrap();
+        std::fs::write(nested_path.join("inner.txt"), "inner one\n").unwrap();
+        let nested_a = commit_all(&nested, "nested a");
+        drop(nested);
+        let sub_a = {
+            let mut index = sub.index().unwrap();
+            index.clear().unwrap();
+            index.add_path(Path::new("sub.txt")).unwrap();
+            let entry = git2::IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode: 0o160000,
+                uid: 0,
+                gid: 0,
+                file_size: 0,
+                id: nested_a,
+                flags: 6,
+                flags_extended: 0,
+                path: b"nested".to_vec(),
+            };
+            index.add(&entry).unwrap();
+            index.write().unwrap();
+            let tree_oid = index.write_tree().unwrap();
+            let tree = sub.find_tree(tree_oid).unwrap();
+            let sig = Signature::now("zlorb-test", "zlorb-test@example.com").unwrap();
+            sub.commit(Some("HEAD"), &sig, &sig, "sub a", &tree, &[])
+                .unwrap()
+        };
+        {
+            let tree = sub.find_commit(sub_a).unwrap().tree().unwrap();
+            let nested_entry = tree.get_path(Path::new("nested")).unwrap();
+            assert_eq!(nested_entry.filemode(), 0o160000);
+        }
+        drop(sub);
+
+        let processor = processor_for(&watched_path);
+        assert!(processor._rollback_gitlink_matches(&sub_path, sub_a, false, false));
+
+        std::fs::write(nested_path.join("inner.txt"), "dirty\n").unwrap();
+        set_index_flag(&sub_path, "--assume-unchanged", "nested");
+        assert!(!processor._rollback_gitlink_matches(&sub_path, sub_a, false, false));
+
+        std::fs::write(nested_path.join("inner.txt"), "inner one\n").unwrap();
+        set_index_flag(&sub_path, "--no-assume-unchanged", "nested");
+        set_index_flag(&sub_path, "--skip-worktree", "nested");
+        std::fs::write(nested_path.join("inner.txt"), "dirty\n").unwrap();
+        assert!(!processor._rollback_gitlink_matches(&sub_path, sub_a, false, false));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fast_forward_refuses_an_added_gitlink_whose_preclone_hides_a_mode_change_behind_assume_unchanged()
+    {
+        let (root, watched_path, v1, _v2, _sub_a, _sub_b) =
+            added_gitlink_preclone_fixture(
+                "full-flow-added-gitlink-precloned-assume-unchanged-mode",
+            );
+        set_entry_flags(&watched_path, 0x8000, 0);
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let sub_txt = watched_path.join("sub/sub.txt");
+            let mut permissions = std::fs::metadata(&sub_txt).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&sub_txt, permissions).unwrap();
+        }
+
+        let processor = processor_for(&watched_path);
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("sub"),
+            "unexpected error: {:?}",
+            err
+        );
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fast_forward_refuses_an_added_gitlink_whose_preclone_hides_a_symlink_swap_behind_assume_unchanged()
+    {
+        let (root, watched_path, v1, _v2, _sub_a, _sub_b) =
+            added_gitlink_preclone_fixture(
+                "full-flow-added-gitlink-precloned-assume-unchanged-symlink",
+            );
+        set_entry_flags(&watched_path, 0x8000, 0);
+        let sub_txt = watched_path.join("sub/sub.txt");
+        std::fs::remove_file(&sub_txt).unwrap();
+        std::os::unix::fs::symlink("sub one\n", &sub_txt).unwrap();
+
+        let processor = processor_for(&watched_path);
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("sub"),
+            "unexpected error: {:?}",
+            err
+        );
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        assert!(std::fs::symlink_metadata(&sub_txt)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_drops_a_seeded_gitlink_entry_held_only_in_memory() {
+        let (root, watched_path, v1, v2, sub_a, _sub_b) =
+            added_gitlink_preclone_fixture("rollback-seeded-unseed-memory-only");
+        let processor = processor_for(&watched_path);
+        {
+            let mut index = processor.repo.index().unwrap();
+            let entry = git2::IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode: 0o160000,
+                uid: 0,
+                gid: 0,
+                file_size: 0,
+                id: sub_a,
+                flags: 3,
+                flags_extended: 0,
+                path: b"sub".to_vec(),
+            };
+            index.add(&entry).unwrap();
+        }
+        set_index_flag(&watched_path, "--skip-worktree", "src/main.rs");
+        std::fs::write(watched_path.join(".git/index"), b"not an index").unwrap();
+        assert!(processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        let index = processor.repo.index().unwrap();
+        assert!(index.get_path(Path::new("sub"), 0).is_none());
+        drop(index);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
+            "sub one\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+
     #[test]
     fn rollback_restores_gitlink_whose_head_matches_the_fetched_commit() {
         let (root, watched_path, v1, v2, sub_a, _sub_b) =
@@ -5182,7 +10059,7 @@ mod tests {
 
         let processor = processor_for(&watched_path);
         let changed = processor._changed_paths(v1, v2).unwrap();
-        let (safe, preserved) = processor._rollback_restore_paths(v1, v2, &changed);
+        let (safe, preserved, _, _, _) = processor._rollback_restore_paths(v1, v2, &changed);
         assert!(preserved.contains(&PathBuf::from("parent/thing")));
         assert!(preserved.contains(&PathBuf::from("parent/thing/a.txt")));
         assert!(!safe.contains(&PathBuf::from("parent/thing")));
@@ -5224,12 +10101,14 @@ mod tests {
         ];
 
         let processor = processor_for(&watched_path);
-        let (safe, preserved) = processor._rollback_restore_paths(v1, bogus, &changed);
+        let (safe, preserved, _, _, failed) = processor._rollback_restore_paths(v1, bogus, &changed);
         assert!(safe.is_empty());
         assert_eq!(preserved, changed);
-        let (safe, preserved) = processor._rollback_restore_paths(bogus, v2, &changed);
+        assert!(failed);
+        let (safe, preserved, _, _, failed) = processor._rollback_restore_paths(bogus, v2, &changed);
         assert!(safe.is_empty());
         assert_eq!(preserved, changed);
+        assert!(failed);
         drop(processor);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -5256,13 +10135,110 @@ mod tests {
         let processor = processor_for(&watched_path);
         assert!(processor.repo.find_commit(broken).is_ok());
         let changed = vec![PathBuf::from("src/main.rs")];
-        let (safe, preserved) = processor._rollback_restore_paths(broken, v1, &changed);
+        let (safe, preserved, _, _, failed) = processor._rollback_restore_paths(broken, v1, &changed);
         assert!(safe.is_empty());
         assert_eq!(preserved, changed);
-        let (safe, preserved) = processor._rollback_restore_paths(v1, broken, &changed);
+        assert!(failed);
+        let (safe, preserved, _, _, failed) = processor._rollback_restore_paths(v1, broken, &changed);
         assert!(safe.is_empty());
         assert_eq!(preserved, changed);
+        assert!(failed);
         drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_restore_paths_preserves_everything_when_the_repo_has_no_workdir() {
+        let root = temp_dir("rollback-restore-paths-no-workdir");
+        let source_path = root.join("source");
+        let bare_path = root.join("bare");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let source = git2::Repository::init_opts(&source_path, &init_opts).unwrap();
+        write_fixture_crate(&source_path, "fixture-version-one");
+        let v1 = commit_all(&source, "v1");
+        std::fs::write(source_path.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let v2 = commit_all(&source, "v2");
+        drop(source);
+        let status = std::process::Command::new("git")
+            .args(["clone", "--bare"])
+            .arg(&source_path)
+            .arg(&bare_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let bare = git2::Repository::open(&bare_path).unwrap();
+        assert!(bare.workdir().is_none());
+        assert!(bare.find_commit(v1).unwrap().tree().is_ok());
+        assert!(bare.find_commit(v2).unwrap().tree().is_ok());
+        drop(bare);
+
+        let processor = processor_for(&bare_path);
+        let changed = vec![PathBuf::from("src/main.rs")];
+        let (safe, preserved, _, _, failed) = processor._rollback_restore_paths(v1, v2, &changed);
+        assert!(safe.is_empty());
+        assert_eq!(preserved, changed);
+        assert!(failed);
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_refuses_with_a_classification_message_when_a_commit_cannot_be_loaded() {
+        let (root, watched_path, v1, v2) = two_file_repo("checkout-classification-failed");
+        let processor = processor_for(&watched_path);
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        let bogus = Oid::from_str("1111111111111111111111111111111111111111").unwrap();
+        match processor._checkout_and_get_ref(Some(v1), bogus, Some(&changed)) {
+            Ok(_) => panic!("checkout must refuse when classification cannot load a commit"),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("could not be classified"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("a.txt")).unwrap(),
+            "one-a\n"
+        );
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_does_not_promote_a_directory_when_classification_failed() {
+        let (root, watched_path, v1, v2) =
+            dir_to_file_repo_with_gitignore("checkout-dir-no-promotion-on-load-failure", "*.log\n");
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let odb = watched.odb().unwrap();
+        let broken = odb
+            .write(
+                git2::ObjectType::Commit,
+                b"tree 1111111111111111111111111111111111111111\nauthor A <a@a.invalid> 0 +0000\ncommitter A <a@a.invalid> 0 +0000\n\nbroken\n",
+            )
+            .unwrap();
+        drop(odb);
+        drop(watched);
+
+        let processor = processor_for(&watched_path);
+        assert!(processor._checkout_dir_is_safe(v1, broken, Path::new("thing")));
+        move_ref_to_v2(&processor, v2);
+        let changed = vec![PathBuf::from("thing")];
+        match processor._checkout_and_get_ref(Some(v1), broken, Some(&changed)) {
+            Ok(_) => panic!("checkout must refuse when classification cannot load a tree"),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("could not be classified"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        drop(processor);
+        assert!(watched_path.join("thing").is_dir());
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("thing/inner.txt")).unwrap(),
+            "inner\n"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -5282,11 +10258,11 @@ mod tests {
 
         let paths = vec![PathBuf::from("stable.txt")];
         let processor = processor_for(&watched_path);
-        let (safe, preserved) = processor._rollback_restore_paths(v1, v2, &paths);
+        let (safe, preserved, _, _, _) = processor._rollback_restore_paths(v1, v2, &paths);
         assert_eq!(safe, paths);
         assert!(preserved.is_empty());
         std::fs::write(watched_path.join("stable.txt"), "edited\n").unwrap();
-        let (safe, preserved) = processor._rollback_restore_paths(v1, v2, &paths);
+        let (safe, preserved, _, _, _) = processor._rollback_restore_paths(v1, v2, &paths);
         assert!(safe.is_empty());
         assert_eq!(preserved, paths);
         drop(processor);
@@ -5311,11 +10287,11 @@ mod tests {
 
         let paths = vec![PathBuf::from("sub")];
         let processor = processor_for(&watched_path);
-        let (safe, preserved) = processor._rollback_restore_paths(v1, v2, &paths);
+        let (safe, preserved, _, _, _) = processor._rollback_restore_paths(v1, v2, &paths);
         assert_eq!(safe, paths);
         assert!(preserved.is_empty());
         std::fs::write(watched_path.join("sub/extra.txt"), "extra\n").unwrap();
-        let (safe, preserved) = processor._rollback_restore_paths(v1, v2, &paths);
+        let (safe, preserved, _, _, _) = processor._rollback_restore_paths(v1, v2, &paths);
         assert!(safe.is_empty());
         assert_eq!(preserved, paths);
         drop(processor);
@@ -5342,11 +10318,11 @@ mod tests {
 
         let paths = vec![PathBuf::from("sub")];
         let processor = processor_for(&watched_path);
-        let (safe, preserved) = processor._rollback_restore_paths(v1, v2, &paths);
+        let (safe, preserved, _, _, _) = processor._rollback_restore_paths(v1, v2, &paths);
         assert_eq!(safe, paths);
         assert!(preserved.is_empty());
         std::fs::write(watched_path.join("sub/notes.txt"), "user notes\n").unwrap();
-        let (safe, preserved) = processor._rollback_restore_paths(v1, v2, &paths);
+        let (safe, preserved, _, _, _) = processor._rollback_restore_paths(v1, v2, &paths);
         assert!(safe.is_empty());
         assert_eq!(preserved, paths);
         drop(processor);
@@ -6639,9 +11615,10 @@ mod tests {
         drop(watched);
 
         let processor = processor_for(&watched_path);
-        let (safe, preserved) = processor
+        let (safe, preserved, unverifiable) = processor
             ._rollback_scoped_fallback_paths(v1, v2)
             .unwrap();
+        assert!(unverifiable.is_empty());
         assert!(safe.contains(&PathBuf::from("new.txt")));
         assert!(safe.contains(&PathBuf::from("src/main.rs")));
         assert!(preserved.is_empty());
@@ -6664,9 +11641,10 @@ mod tests {
         std::fs::write(watched_path.join("src/main.rs"), "user edit\n").unwrap();
 
         let processor = processor_for(&watched_path);
-        let (safe, preserved) = processor
+        let (safe, preserved, unverifiable) = processor
             ._rollback_scoped_fallback_paths(v1, v2)
             .unwrap();
+        assert!(unverifiable.is_empty());
         assert!(preserved.contains(&PathBuf::from("src/main.rs")));
         assert!(!safe.contains(&PathBuf::from("src/main.rs")));
         assert!(safe.contains(&PathBuf::from("Cargo.toml")));
@@ -6690,9 +11668,10 @@ mod tests {
         std::fs::write(watched_path.join("unchanged.txt"), "user edit\n").unwrap();
 
         let processor = processor_for(&watched_path);
-        let (safe, preserved) = processor
+        let (safe, preserved, unverifiable) = processor
             ._rollback_scoped_fallback_paths(v1, v2)
             .unwrap();
+        assert!(unverifiable.is_empty());
         assert!(preserved.contains(&PathBuf::from("unchanged.txt")));
         assert!(!safe.contains(&PathBuf::from("unchanged.txt")));
         drop(processor);
@@ -6710,9 +11689,10 @@ mod tests {
         drop(sub);
 
         let processor = processor_for(&watched_path);
-        let (safe, preserved) = processor
+        let (safe, preserved, unverifiable) = processor
             ._rollback_scoped_fallback_paths(v1, v2)
             .unwrap();
+        assert!(unverifiable.is_empty());
         assert!(preserved.contains(&PathBuf::from("sub")));
         assert!(!safe.contains(&PathBuf::from("sub")));
         drop(processor);
@@ -6737,9 +11717,10 @@ mod tests {
         std::fs::remove_file(watched_path.join("new.txt")).unwrap();
 
         let processor = processor_for(&watched_path);
-        let (safe, preserved) = processor
+        let (safe, preserved, unverifiable) = processor
             ._rollback_scoped_fallback_paths(v1, v2)
             .unwrap();
+        assert!(unverifiable.is_empty());
         assert!(preserved.contains(&PathBuf::from("unchanged.txt")));
         assert!(!safe.contains(&PathBuf::from("unchanged.txt")));
         assert!(safe.contains(&PathBuf::from("new.txt")));
@@ -6765,11 +11746,119 @@ mod tests {
         std::os::unix::fs::symlink("Cargo.toml", watched_path.join("link.txt")).unwrap();
 
         let processor = processor_for(&watched_path);
-        let (safe, preserved) = processor
+        let (safe, preserved, unverifiable) = processor
             ._rollback_scoped_fallback_paths(v1, v2)
             .unwrap();
+        assert!(unverifiable.is_empty());
         assert!(preserved.contains(&PathBuf::from("link.txt")));
         assert!(!safe.contains(&PathBuf::from("link.txt")));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_scoped_fallback_preserves_a_local_only_path_whose_metadata_cannot_be_read() {
+        let root = temp_dir("rollback-fallback-local-only-metadata-error");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        std::fs::create_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::write(watched_path.join("sub").join("b.txt"), "one-b\n").unwrap();
+        let v1 = commit_all(&watched, "v1");
+        write_fixture_crate(&watched_path, "fixture-version-two");
+        std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
+        let v2 = commit_all(&watched, "v2");
+        drop(watched);
+        std::fs::write(watched_path.join("sub"), "blocker\n").unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(watched_path.join("sub").join("b.txt"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotADirectory
+        );
+
+        let processor = processor_for(&watched_path);
+        let (safe, preserved, unverifiable) = processor
+            ._rollback_scoped_fallback_paths(v1, v2)
+            .unwrap();
+        assert!(unverifiable.is_empty());
+        assert_eq!(preserved, vec![PathBuf::from("sub").join("b.txt")]);
+        assert!(!safe.contains(&PathBuf::from("sub").join("b.txt")));
+        assert!(safe.contains(&PathBuf::from("src/main.rs")));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_scoped_fallback_preserves_a_fetch_only_path_whose_metadata_cannot_be_read() {
+        let root = temp_dir("rollback-fallback-fetch-only-metadata-error");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        let v1 = commit_all(&watched, "v1");
+        write_fixture_crate(&watched_path, "fixture-version-two");
+        std::fs::create_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::write(watched_path.join("sub").join("b.txt"), "two-b\n").unwrap();
+        let v2 = commit_all(&watched, "v2");
+        drop(watched);
+        std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::write(watched_path.join("sub"), "blocker\n").unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(watched_path.join("sub").join("b.txt"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotADirectory
+        );
+
+        let processor = processor_for(&watched_path);
+        let (safe, preserved, unverifiable) = processor
+            ._rollback_scoped_fallback_paths(v1, v2)
+            .unwrap();
+        assert!(unverifiable.is_empty());
+        assert_eq!(preserved, vec![PathBuf::from("sub").join("b.txt")]);
+        assert!(!safe.contains(&PathBuf::from("sub").join("b.txt")));
+        assert!(safe.contains(&PathBuf::from("src/main.rs")));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_scoped_fallback_classifies_a_file_whose_external_clean_filter_fails_as_unverifiable() {
+        let (root, watched_path, v1, v2) =
+            external_filter_repo("fallback-classifier-unverifiable", "version two\n");
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        let processor = processor_for(&watched_path);
+        let (safe, preserved, unverifiable) = processor
+            ._rollback_scoped_fallback_paths(v1, v2)
+            .unwrap();
+        assert!(preserved.is_empty());
+        assert_eq!(unverifiable, vec![PathBuf::from("data.txt")]);
+        assert!(safe.contains(&PathBuf::from("src/main.rs")));
+        assert!(!safe.contains(&PathBuf::from("data.txt")));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_scoped_fallback_classifies_a_file_changed_after_an_external_clean_filter_as_preserved() {
+        let (root, watched_path, v1, v2) = external_filter_repo(
+            "fallback-classifier-preserved-on-mismatch",
+            "version two\n",
+        );
+        std::fs::write(watched_path.join("data.txt"), "Xgoodbye\n").unwrap();
+        let processor = processor_for(&watched_path);
+        let (safe, preserved, unverifiable) = processor
+            ._rollback_scoped_fallback_paths(v1, v2)
+            .unwrap();
+        assert_eq!(preserved, vec![PathBuf::from("data.txt")]);
+        assert!(unverifiable.is_empty());
+        assert!(safe.contains(&PathBuf::from("src/main.rs")));
+        assert!(!safe.contains(&PathBuf::from("data.txt")));
         drop(processor);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -7117,6 +12206,155 @@ mod tests {
         processor_with_tracker(&watched_path, failed_builds.clone())
             .update_from_remote()
             .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_build_retry_is_not_blocked_by_a_skip_worktree_absent_file() {
+        let root = temp_dir("failed-build-retry-skip-worktree-absent");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        std::fs::write(upstream_path.join("keep.txt"), "keep\n").unwrap();
+        let v1 = commit_all(&upstream, "v1");
+        write_sentinel_fixture_crate(&upstream_path, "fixture-version-two");
+        let v2 = commit_all(&upstream, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v1).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        set_index_flag(&watched_path, "--skip-worktree", "keep.txt");
+        std::fs::remove_file(watched_path.join("keep.txt")).unwrap();
+
+        let failed_builds = new_failed_builds();
+        std::fs::write(watched_path.join("fail-build"), "").unwrap();
+
+        let err = processor_with_tracker(&watched_path, failed_builds.clone())
+            .update_from_remote()
+            .unwrap_err();
+        assert!(format!("{:?}", err).contains("Failed to build"));
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert!(!fixture_artifact(&watched_path).exists());
+
+        let processor = processor_with_tracker(&watched_path, failed_builds.clone());
+        assert_eq!(
+            processor._tracked_local_changes().unwrap().changes,
+            vec![PathBuf::from("keep.txt")]
+        );
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(format!("{:?}", err).contains("Failed to build"));
+        assert!(!fixture_artifact(&watched_path).exists());
+
+        std::fs::remove_file(watched_path.join("fail-build")).unwrap();
+        processor_with_tracker(&watched_path, failed_builds.clone())
+            .update_from_remote()
+            .unwrap();
+        let artifact = fixture_artifact(&watched_path);
+        assert!(artifact.exists());
+        let output = std::process::Command::new(&artifact).output().unwrap();
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("fixture-version-two")
+        );
+        assert!(!watched_path.join("keep.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_build_retry_is_refused_by_a_plain_deletion() {
+        let root = temp_dir("failed-build-retry-plain-deletion");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        std::fs::write(upstream_path.join("keep.txt"), "keep\n").unwrap();
+        let v1 = commit_all(&upstream, "v1");
+        write_sentinel_fixture_crate(&upstream_path, "fixture-version-two");
+        let v2 = commit_all(&upstream, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v1).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+
+        let failed_builds = new_failed_builds();
+        std::fs::write(watched_path.join("fail-build"), "").unwrap();
+
+        let err = processor_with_tracker(&watched_path, failed_builds.clone())
+            .update_from_remote()
+            .unwrap_err();
+        assert!(format!("{:?}", err).contains("Failed to build"));
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert!(!fixture_artifact(&watched_path).exists());
+
+        std::fs::remove_file(watched_path.join("keep.txt")).unwrap();
+        let err = processor_with_tracker(&watched_path, failed_builds.clone())
+            .update_from_remote()
+            .unwrap_err();
+        assert!(format!("{:?}", err).contains("local changes to tracked files"));
+        assert!(format!("{:?}", err).contains("keep.txt"));
+        assert!(!fixture_artifact(&watched_path).exists());
+
+        std::fs::write(watched_path.join("keep.txt"), "keep\n").unwrap();
+        std::fs::remove_file(watched_path.join("fail-build")).unwrap();
+        processor_with_tracker(&watched_path, failed_builds.clone())
+            .update_from_remote()
+            .unwrap();
+        assert!(fixture_artifact(&watched_path).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn out_dir_missing_build_is_not_blocked_by_a_skip_worktree_absent_file() {
+        let root = temp_dir("out-dir-build-skip-worktree-absent");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        std::fs::write(upstream_path.join("keep.txt"), "keep\n").unwrap();
+        commit_all(&upstream, "v1");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        set_index_flag(&watched_path, "--skip-worktree", "keep.txt");
+        std::fs::remove_file(watched_path.join("keep.txt")).unwrap();
+
+        let mut processor = processor_for(&watched_path);
+        assert_eq!(
+            processor._tracked_local_changes().unwrap().changes,
+            vec![PathBuf::from("keep.txt")]
+        );
+        processor.config.out_dir = Some("dist-out".to_string());
+        processor.update_from_remote().unwrap();
+        assert!(fixture_artifact(&watched_path).exists());
+        assert!(!watched_path.join("keep.txt").exists());
+
+        let mut processor = processor_for(&watched_path);
+        processor.config.out_dir = Some("dist-out".to_string());
+        processor.update_from_remote().unwrap();
+        assert!(!watched_path.join("keep.txt").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -7620,6 +12858,307 @@ mod tests {
                 .unwrap()
                 .contains_key(&tracker_key(&watched_path.to_string_lossy()))
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_restart_retry_is_not_blocked_by_a_skip_worktree_absent_file() {
+        let root = temp_dir("restart-retry-skip-worktree-absent");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        std::fs::write(upstream_path.join("keep.txt"), "keep\n").unwrap();
+        commit_all(&upstream, "v1");
+        write_fixture_crate(&upstream_path, "fixture-version-two");
+        std::fs::write(upstream_path.join("keep.txt"), "keep\n").unwrap();
+        let v2 = commit_all(&upstream, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched
+            .find_commit(watched.revparse_single("HEAD~1").unwrap().id())
+            .unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        set_index_flag(&watched_path, "--skip-worktree", "keep.txt");
+        std::fs::remove_file(watched_path.join("keep.txt")).unwrap();
+
+        let failed_restarts = new_failed_restarts();
+        let err = processor_with_restart(
+            &watched_path,
+            Some("false".to_string()),
+            failed_restarts.clone(),
+        )
+        .update_from_remote()
+        .unwrap_err();
+        assert!(format!("{:?}", err).contains("Restart command"));
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert_eq!(
+            failed_restarts
+                .lock()
+                .unwrap()
+                .get(&tracker_key(&watched_path.to_string_lossy())),
+            Some(&v2)
+        );
+
+        let processor = processor_with_restart(
+            &watched_path,
+            Some("false".to_string()),
+            failed_restarts.clone(),
+        );
+        assert_eq!(
+            processor._tracked_local_changes().unwrap().changes,
+            vec![PathBuf::from("keep.txt")]
+        );
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(format!("{:?}", err).contains("Restart command"));
+
+        processor_with_restart(
+            &watched_path,
+            Some(serve_command(&watched_path)),
+            failed_restarts.clone(),
+        )
+        .update_from_remote()
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("served.txt")).unwrap(),
+            "fixture-version-two\n"
+        );
+        assert!(
+            !failed_restarts
+                .lock()
+                .unwrap()
+                .contains_key(&tracker_key(&watched_path.to_string_lossy()))
+        );
+        assert!(!watched_path.join("keep.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_restart_retry_is_refused_by_a_plain_deletion() {
+        let root = temp_dir("restart-retry-plain-deletion");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        std::fs::write(upstream_path.join("keep.txt"), "keep\n").unwrap();
+        commit_all(&upstream, "v1");
+        write_fixture_crate(&upstream_path, "fixture-version-two");
+        std::fs::write(upstream_path.join("keep.txt"), "keep\n").unwrap();
+        let v2 = commit_all(&upstream, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched
+            .find_commit(watched.revparse_single("HEAD~1").unwrap().id())
+            .unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+
+        let failed_restarts = new_failed_restarts();
+        let err = processor_with_restart(
+            &watched_path,
+            Some("false".to_string()),
+            failed_restarts.clone(),
+        )
+        .update_from_remote()
+        .unwrap_err();
+        assert!(format!("{:?}", err).contains("Restart command"));
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+
+        std::fs::remove_file(watched_path.join("keep.txt")).unwrap();
+        let err = processor_with_restart(
+            &watched_path,
+            Some(serve_command(&watched_path)),
+            failed_restarts.clone(),
+        )
+        .update_from_remote()
+        .unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("Refusing to run the restart command")
+        );
+        assert!(format!("{:?}", err).contains("keep.txt"));
+        assert!(!watched_path.join("served.txt").exists());
+
+        std::fs::write(watched_path.join("keep.txt"), "keep\n").unwrap();
+        processor_with_restart(
+            &watched_path,
+            Some(serve_command(&watched_path)),
+            failed_restarts.clone(),
+        )
+        .update_from_remote()
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("served.txt")).unwrap(),
+            "fixture-version-two\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_restart_retry_refusal_names_an_unverifiable_file_without_calling_it_a_local_change()
+    {
+        let (root, watched_path, _v1, v2) =
+            external_filter_repo("external-filter-restart-refusal", "version two\n");
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v2).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        std::fs::write(watched_path.join("data.txt"), "Xversion two\n").unwrap();
+
+        let failed_restarts = new_failed_restarts();
+        failed_restarts
+            .lock()
+            .unwrap()
+            .insert(tracker_key(&watched_path.to_string_lossy()), v2);
+
+        let processor = processor_with_restart(
+            &watched_path,
+            Some("echo ran > restart-ran.txt".to_string()),
+            failed_restarts.clone(),
+        );
+        let tracked = processor._tracked_local_changes().unwrap();
+        assert!(tracked.changes.is_empty());
+        assert_eq!(tracked.unverifiable, vec![PathBuf::from("data.txt")]);
+        let err = processor.update_from_remote().unwrap_err();
+        let message = format!("{:?}", err);
+        assert!(
+            message.contains("Refusing to run the restart command"),
+            "{}",
+            message
+        );
+        assert!(
+            message.contains("could not be checked against their clean conversion"),
+            "{}",
+            message
+        );
+        assert!(message.contains("data.txt"), "{}", message);
+        assert!(
+            message.contains("are not part of the commit being restarted on"),
+            "{}",
+            message
+        );
+        assert!(
+            message.contains("make it runnable by the daemon so these files can be verified"),
+            "{}",
+            message
+        );
+        assert!(
+            !message.contains("local changes to tracked files"),
+            "{}",
+            message
+        );
+        assert!(!message.contains("Stash the work"), "{}", message);
+        assert!(!watched_path.join("restart-ran.txt").exists());
+        assert_eq!(
+            failed_restarts
+                .lock()
+                .unwrap()
+                .get(&tracker_key(&watched_path.to_string_lossy())),
+            Some(&v2)
+        );
+        drop(processor);
+
+        set_repo_config(&watched_path, "filter.strip.clean", "sed 's/^X//'");
+        processor_with_restart(
+            &watched_path,
+            Some("echo ran > restart-ran.txt".to_string()),
+            failed_restarts.clone(),
+        )
+        .update_from_remote()
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("restart-ran.txt")).unwrap(),
+            "ran\n"
+        );
+        assert!(
+            !failed_restarts
+                .lock()
+                .unwrap()
+                .contains_key(&tracker_key(&watched_path.to_string_lossy()))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_restart_retry_refusal_with_a_change_and_an_unverifiable_file_carries_both_advices()
+    {
+        let (root, watched_path, _v1, v2) =
+            external_filter_repo("external-filter-restart-refusal-mixed", "version two\n");
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v2).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        std::fs::write(watched_path.join("data.txt"), "Xversion two\n").unwrap();
+        std::fs::write(
+            watched_path.join("src/main.rs"),
+            "fn main() { println!(\"edited\"); }\n",
+        )
+        .unwrap();
+
+        let failed_restarts = new_failed_restarts();
+        failed_restarts
+            .lock()
+            .unwrap()
+            .insert(tracker_key(&watched_path.to_string_lossy()), v2);
+
+        let processor = processor_with_restart(
+            &watched_path,
+            Some("echo ran > restart-ran.txt".to_string()),
+            failed_restarts.clone(),
+        );
+        let tracked = processor._tracked_local_changes().unwrap();
+        assert_eq!(tracked.changes, vec![PathBuf::from("src/main.rs")]);
+        assert_eq!(tracked.unverifiable, vec![PathBuf::from("data.txt")]);
+        let err = processor.update_from_remote().unwrap_err();
+        let message = format!("{:?}", err);
+        assert!(
+            message.contains("Refusing to run the restart command"),
+            "{}",
+            message
+        );
+        assert!(
+            message.contains("local changes to tracked files (src/main.rs)"),
+            "{}",
+            message
+        );
+        assert!(
+            message.contains("could not be checked against their clean conversion"),
+            "{}",
+            message
+        );
+        assert!(message.contains("Stash the work"), "{}", message);
+        assert!(
+            message.contains("make the conversion named in the re-check errors above runnable by the daemon so the unverifiable files can be verified"),
+            "{}",
+            message
+        );
+        assert!(!watched_path.join("restart-ran.txt").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
