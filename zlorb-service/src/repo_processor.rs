@@ -2161,8 +2161,11 @@ impl RepoProcessor {
                 safe.push(path.clone());
                 continue;
             }
-            let fetch_recheck =
-                self._rollback_disk_recheck(&workdir, path, fetch_id, fetch_mode);
+            let fetch_recheck = if (local_id, local_mode) == (fetch_id, fetch_mode) {
+                local_recheck
+            } else {
+                self._rollback_disk_recheck(&workdir, path, fetch_id, fetch_mode)
+            };
             if fetch_recheck == CleanRecheck::Match
                 || self._rollback_structured_matches(
                     &workdir, path, local_id, local_mode, fetch_id, fetch_mode,
@@ -2857,6 +2860,179 @@ impl RepoProcessor {
         Ok(())
     }
 
+    fn _post_checkout_shadowed_by_typechange(
+        &self,
+        workdir: &Path,
+        fetch_tree: &git2::Tree,
+        path: &Path,
+    ) -> bool {
+        let mut ancestor = path.parent();
+        while let Some(current) = ancestor {
+            if current.as_os_str().is_empty() {
+                return false;
+            }
+            match std::fs::symlink_metadata(workdir.join(current)) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_dir() {
+                        return false;
+                    }
+                    let entry = fetch_tree.get_path(current).ok();
+                    let entry_id = entry.as_ref().map(|entry| entry.id());
+                    let entry_mode = entry.as_ref().map(|entry| entry.filemode());
+                    return self._rollback_disk_recheck(workdir, current, entry_id, entry_mode)
+                        == CleanRecheck::Match;
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        || e.kind() == std::io::ErrorKind::NotADirectory =>
+                {
+                    ancestor = current.parent();
+                }
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+
+    fn _verify_checked_out_paths(
+        &self,
+        local_oid: Oid,
+        fetch_oid: Oid,
+        changed_paths: &[PathBuf],
+    ) -> Result<(), ZlorbError> {
+        let workdir = self.repo.workdir().map(|workdir| workdir.to_path_buf());
+        let fetch_tree = self
+            .repo
+            .find_commit(fetch_oid)
+            .and_then(|commit| commit.tree())
+            .ok();
+        let local_tree = self
+            .repo
+            .find_commit(local_oid)
+            .and_then(|commit| commit.tree())
+            .ok();
+        let mut regular: Vec<PathBuf> = Vec::new();
+        let mut gitlinks: Vec<PathBuf> = Vec::new();
+        for path in changed_paths {
+            let shadowed = match (&workdir, &fetch_tree) {
+                (Some(workdir), Some(fetch_tree)) => {
+                    fetch_tree.get_path(path).is_err()
+                        && matches!(
+                            std::fs::symlink_metadata(workdir.join(path)),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotADirectory
+                        )
+                        && self._post_checkout_shadowed_by_typechange(
+                            workdir,
+                            fetch_tree,
+                            path,
+                        )
+                }
+                _ => false,
+            };
+            if shadowed {
+                continue;
+            }
+            let either_pointer = match (&local_tree, &fetch_tree) {
+                (Some(local_tree), Some(fetch_tree)) => {
+                    let local_entry = local_tree.get_path(path).ok();
+                    let fetch_entry = fetch_tree.get_path(path).ok();
+                    let local_gitlink = matches!(
+                        local_entry.as_ref(),
+                        Some(entry) if entry.filemode() == 0o160000
+                    );
+                    let fetch_gitlink = matches!(
+                        fetch_entry.as_ref(),
+                        Some(entry) if entry.filemode() == 0o160000
+                    );
+                    local_gitlink && (fetch_gitlink || fetch_entry.is_none())
+                }
+                _ => false,
+            };
+            if either_pointer {
+                gitlinks.push(path.clone());
+            } else {
+                regular.push(path.clone());
+            }
+        }
+        let mut classified: Vec<PathBuf> = Vec::new();
+        let mut unverifiable: Vec<PathBuf> = Vec::new();
+        let mut classification_failed = false;
+        if !regular.is_empty() {
+            let (_safe, paths, _absent, unverifiable_paths, failed) =
+                self._rollback_restore_paths(fetch_oid, fetch_oid, &regular);
+            classified.extend(paths);
+            unverifiable.extend(unverifiable_paths);
+            classification_failed |= failed;
+        }
+        if !gitlinks.is_empty() {
+            let (_safe, paths, _absent, unverifiable_paths, failed) =
+                self._rollback_restore_paths(local_oid, fetch_oid, &gitlinks);
+            classified.extend(paths);
+            unverifiable.extend(unverifiable_paths);
+            classification_failed |= failed;
+        }
+        let mut mismatched = Vec::new();
+        for path in classified {
+            if !classification_failed && self._checkout_dir_is_safe(fetch_oid, fetch_oid, &path) {
+                continue;
+            }
+            mismatched.push(path);
+        }
+        if mismatched.is_empty() && unverifiable.is_empty() {
+            return Ok(());
+        }
+        for path in &mismatched {
+            if classification_failed {
+                Logger::error(format!(
+                    "Could not verify {} in {} after the checkout: the changed paths could not be classified because a commit, tree, or the working directory could not be loaded, so the update is being rolled back rather than built from an unverified working tree",
+                    path.display(),
+                    self.config.name
+                ));
+            } else {
+                Logger::error(format!(
+                    "{} in {} does not match the fetched commit {} after the checkout: a change may have landed while the checkout was writing, so the update is being rolled back rather than built from a working tree that differs from the fetched commit",
+                    path.display(),
+                    self.config.name,
+                    fetch_oid
+                ));
+            }
+        }
+        for path in &unverifiable {
+            Logger::error(format!(
+                "Could not verify {} in {} after the checkout: the file could not be checked against its clean conversion in the daemon environment, so the update is being rolled back rather than built from an unverified working tree",
+                path.display(),
+                self.config.name
+            ));
+        }
+        if classification_failed {
+            return Err(ZlorbError::Other(format!(
+                "Refusing to keep the fast-forward of {}: the changed paths ({}) could not be classified after the checkout because a commit, tree, or the working directory could not be loaded, so the working tree cannot be verified against the fetched commit and the update is being rolled back",
+                self.config.name,
+                display_paths(&mismatched)
+            )));
+        }
+        if mismatched.is_empty() {
+            return Err(ZlorbError::Other(format!(
+                "Refusing to keep the fast-forward of {}: tracked files ({}) could not be checked against their clean conversion in the daemon environment after the checkout, so the working tree cannot be verified against the fetched commit and the update is being rolled back. The re-check errors above name the conversion that could not be applied; make it runnable by the daemon so these files can be verified",
+                self.config.name,
+                display_paths(&unverifiable)
+            )));
+        }
+        if unverifiable.is_empty() {
+            return Err(ZlorbError::Other(format!(
+                "Refusing to keep the fast-forward of {}: tracked files ({}) do not match the fetched commit after the checkout, so the update is being rolled back rather than built from a working tree that differs from the fetched commit; the rollback preserves any file holding a local change",
+                self.config.name,
+                display_paths(&mismatched)
+            )));
+        }
+        Err(ZlorbError::Other(format!(
+            "Refusing to keep the fast-forward of {}: tracked files ({}) do not match the fetched commit after the checkout, so the update is being rolled back rather than built from a working tree that differs from the fetched commit; the rollback preserves any file holding a local change; tracked files ({}) could not be checked against their clean conversion in the daemon environment, so they cannot be verified either",
+            self.config.name,
+            display_paths(&mismatched),
+            display_paths(&unverifiable)
+        )))
+    }
+
     fn _checkout_and_get_ref(
         &self,
         local_oid: Option<Oid>,
@@ -2962,6 +3138,9 @@ impl RepoProcessor {
             self.repo
                 .checkout_head(Some(&mut checkout))
                 .map_err(ZlorbError::Git)?;
+            if let (Some(local_oid), Some(paths)) = (local_oid, changed_paths) {
+                self._verify_checked_out_paths(local_oid, fetch_oid, paths)?;
+            }
             if !absent_paths.is_empty() {
                 if let Err(e) = self._advance_index_entries_to_tree(fetch_oid, &absent_paths) {
                     Logger::error(format!(
@@ -6059,6 +6238,490 @@ mod tests {
             std::fs::read_to_string(watched_path.join("b.txt")).unwrap(),
             "two-b\n"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_accepts_a_tree_matching_the_fetched_commit() {
+        let (root, watched_path, v1, v2) =
+            two_file_repo("post-checkout-verify-accepts-fetched");
+        std::fs::write(watched_path.join("a.txt"), "two-a\n").unwrap();
+        std::fs::write(watched_path.join("b.txt"), "two-b\n").unwrap();
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        processor._verify_checked_out_paths(v1, v2, &changed).unwrap();
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_refuses_content_matching_only_the_old_commit() {
+        let (root, watched_path, v1, v2) =
+            two_file_repo("post-checkout-verify-refuses-old-content");
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        match processor._verify_checked_out_paths(v1, v2, &changed) {
+            Ok(()) => panic!("post-checkout verification must refuse old-commit content"),
+            Err(e) => {
+                let message = format!("{:?}", e);
+                assert!(
+                    message.contains("do not match the fetched commit after the checkout"),
+                    "{}",
+                    message
+                );
+                assert!(message.contains("a.txt"), "{}", message);
+                assert!(message.contains("b.txt"), "{}", message);
+            }
+        }
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_refuses_a_third_content_and_a_missing_file() {
+        let (root, watched_path, v1, v2) =
+            two_file_repo("post-checkout-verify-refuses-third-and-missing");
+        std::fs::write(watched_path.join("a.txt"), "race edit\n").unwrap();
+        std::fs::remove_file(watched_path.join("b.txt")).unwrap();
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        match processor._verify_checked_out_paths(v1, v2, &changed) {
+            Ok(()) => panic!("post-checkout verification must refuse diverged paths"),
+            Err(e) => {
+                let message = format!("{:?}", e);
+                assert!(message.contains("a.txt"), "{}", message);
+                assert!(message.contains("b.txt"), "{}", message);
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("a.txt")).unwrap(),
+            "race edit\n"
+        );
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_accepts_a_deleted_path_only_when_it_is_absent() {
+        let root = temp_dir("post-checkout-verify-deleted-path");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        std::fs::write(watched_path.join("a.txt"), "one-a\n").unwrap();
+        std::fs::write(watched_path.join("b.txt"), "one-b\n").unwrap();
+        let v1 = commit_all(&watched, "v1");
+        std::fs::write(watched_path.join("a.txt"), "two-a\n").unwrap();
+        std::fs::remove_file(watched_path.join("b.txt")).unwrap();
+        let v2 = commit_all(&watched, "v2");
+        drop(watched);
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        processor._verify_checked_out_paths(v1, v2, &changed).unwrap();
+        std::fs::write(watched_path.join("b.txt"), "one-b\n").unwrap();
+        match processor._verify_checked_out_paths(v1, v2, &changed) {
+            Ok(()) => panic!("a recreated deleted path must refuse verification"),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("b.txt"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_accepts_paths_shadowed_by_a_dir_to_file_typechange() {
+        let root = temp_dir("post-checkout-verify-typechange-shadow");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        std::fs::create_dir_all(watched_path.join("thing")).unwrap();
+        std::fs::write(watched_path.join("thing/inner.txt"), "inner\n").unwrap();
+        let v1 = commit_all(&watched, "v1");
+        std::fs::remove_dir_all(watched_path.join("thing")).unwrap();
+        std::fs::write(watched_path.join("thing"), "now a file\n").unwrap();
+        let v2 = commit_all(&watched, "v2");
+        drop(watched);
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        processor._verify_checked_out_paths(v1, v2, &changed).unwrap();
+        std::fs::write(watched_path.join("thing"), "third content\n").unwrap();
+        match processor._verify_checked_out_paths(v1, v2, &changed) {
+            Ok(()) => panic!("a typechange ancestor holding a third content must refuse"),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("thing"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_accepts_paths_shadowed_two_levels_below_a_typechange() {
+        let root = temp_dir("post-checkout-verify-typechange-shadow-deep");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        std::fs::create_dir_all(watched_path.join("thing/sub")).unwrap();
+        std::fs::write(watched_path.join("thing/sub/inner.txt"), "inner\n").unwrap();
+        let v1 = commit_all(&watched, "v1");
+        std::fs::remove_dir_all(watched_path.join("thing")).unwrap();
+        std::fs::write(watched_path.join("thing"), "now a file\n").unwrap();
+        let v2 = commit_all(&watched, "v2");
+        drop(watched);
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        processor._verify_checked_out_paths(v1, v2, &changed).unwrap();
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_accepts_a_gitlink_bump_with_the_submodule_at_the_old_pointer() {
+        let (root, watched_path, v1, v2, sub_a, _sub_b) =
+            gitlink_fixture("post-checkout-verify-gitlink-old-pointer");
+        let sub_path = watched_path.join("sub");
+        let sub = git2::Repository::open(&sub_path).unwrap();
+        let a_commit = sub.find_commit(sub_a).unwrap();
+        sub.reset(a_commit.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(a_commit);
+        drop(sub);
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        processor._verify_checked_out_paths(v1, v2, &changed).unwrap();
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_refuses_a_gitlink_matching_neither_pointer() {
+        let (root, watched_path, v1, v2, _sub_a, _sub_b) =
+            gitlink_fixture("post-checkout-verify-gitlink-diverged");
+        let sub_path = watched_path.join("sub");
+        let sub = git2::Repository::open(&sub_path).unwrap();
+        std::fs::write(sub_path.join("sub.txt"), "sub three\n").unwrap();
+        commit_all(&sub, "sub c");
+        drop(sub);
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        match processor._verify_checked_out_paths(v1, v2, &changed) {
+            Ok(()) => panic!("a gitlink matching neither pointer must refuse verification"),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("sub"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_refuses_a_file_retained_through_a_file_to_gitlink_typechange() {
+        let root = temp_dir("post-checkout-verify-file-to-gitlink");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        std::fs::write(watched_path.join("sub"), "plain\n").unwrap();
+        let v1 = commit_all(&watched, "v1");
+        std::fs::remove_file(watched_path.join("sub")).unwrap();
+        let sub_path = watched_path.join("sub");
+        let sub = git2::Repository::init_opts(&sub_path, &init_opts).unwrap();
+        std::fs::write(sub_path.join("sub.txt"), "sub one\n").unwrap();
+        let sub_a = commit_all(&sub, "sub a");
+        drop(sub);
+        let v2 = commit_with_gitlink(&watched, sub_a, "v2");
+        drop(watched);
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        processor._verify_checked_out_paths(v1, v2, &changed).unwrap();
+        std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::write(watched_path.join("sub"), "plain\n").unwrap();
+        match processor._verify_checked_out_paths(v1, v2, &changed) {
+            Ok(()) => panic!("the retained plain file must refuse verification"),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("sub"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_refuses_a_submodule_retained_through_a_gitlink_to_file_typechange()
+    {
+        let (root, watched_path, v1, v2, sub_a, _sub_b) =
+            gitlink_fixture("post-checkout-verify-gitlink-to-file");
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let blob_id = watched.blob(b"now a file\n").unwrap();
+        let mut index = watched.index().unwrap();
+        index.clear().unwrap();
+        index.add_path(Path::new("Cargo.toml")).unwrap();
+        index.add_path(Path::new("src/main.rs")).unwrap();
+        let entry = git2::IndexEntry {
+            ctime: git2::IndexTime::new(0, 0),
+            mtime: git2::IndexTime::new(0, 0),
+            dev: 0,
+            ino: 0,
+            mode: 0o100644,
+            uid: 0,
+            gid: 0,
+            file_size: 0,
+            id: blob_id,
+            flags: 0,
+            flags_extended: 0,
+            path: b"sub".to_vec(),
+        };
+        index.add(&entry).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        drop(index);
+        let tree = watched.find_tree(tree_oid).unwrap();
+        let sig = Signature::now("zlorb-test", "zlorb-test@example.com").unwrap();
+        let parent = watched.find_commit(v2).unwrap();
+        let v3 = watched
+            .commit(Some("HEAD"), &sig, &sig, "v3", &tree, &[&parent])
+            .unwrap();
+        drop(parent);
+        drop(tree);
+        drop(watched);
+        let sub_path = watched_path.join("sub");
+        let sub = git2::Repository::open(&sub_path).unwrap();
+        let a_commit = sub.find_commit(sub_a).unwrap();
+        sub.reset(a_commit.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(a_commit);
+        drop(sub);
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v3).unwrap();
+        match processor._verify_checked_out_paths(v1, v3, &changed) {
+            Ok(()) => panic!("the retained submodule must refuse verification"),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("sub"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::write(watched_path.join("sub"), "now a file\n").unwrap();
+        processor._verify_checked_out_paths(v1, v3, &changed).unwrap();
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_accepts_a_removed_gitlink_left_on_disk() {
+        let root = temp_dir("post-checkout-verify-gitlink-removed");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        let sub_path = watched_path.join("sub");
+        let sub = git2::Repository::init_opts(&sub_path, &init_opts).unwrap();
+        std::fs::write(sub_path.join("sub.txt"), "sub one\n").unwrap();
+        let sub_a = commit_all(&sub, "sub a");
+        drop(sub);
+        let v1 = commit_with_gitlink(&watched, sub_a, "v1");
+        write_fixture_crate(&watched_path, "fixture-version-two");
+        let mut index = watched.index().unwrap();
+        index.clear().unwrap();
+        index.add_path(Path::new("Cargo.toml")).unwrap();
+        index.add_path(Path::new("src/main.rs")).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        drop(index);
+        let tree = watched.find_tree(tree_oid).unwrap();
+        let sig = Signature::now("zlorb-test", "zlorb-test@example.com").unwrap();
+        let parent = watched.find_commit(v1).unwrap();
+        let v2 = watched
+            .commit(Some("HEAD"), &sig, &sig, "v2", &tree, &[&parent])
+            .unwrap();
+        drop(parent);
+        drop(tree);
+        drop(watched);
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        processor._verify_checked_out_paths(v1, v2, &changed).unwrap();
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gitlink_bump_fast_forwards_with_the_submodule_at_the_old_pointer() {
+        let root = temp_dir("post-checkout-verify-gitlink-full-flow");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        let up_sub_path = upstream_path.join("sub");
+        let up_sub = git2::Repository::init_opts(&up_sub_path, &init_opts).unwrap();
+        std::fs::write(up_sub_path.join("sub.txt"), "sub one\n").unwrap();
+        let sub_a = commit_all(&up_sub, "sub a");
+        std::fs::write(up_sub_path.join("sub.txt"), "sub two\n").unwrap();
+        let sub_b = commit_all(&up_sub, "sub b");
+        let a_commit = up_sub.find_commit(sub_a).unwrap();
+        up_sub
+            .reset(a_commit.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(a_commit);
+        drop(up_sub);
+        let v1 = commit_with_gitlink(&upstream, sub_a, "v1");
+        write_fixture_crate(&upstream_path, "fixture-version-two");
+        commit_with_gitlink(&upstream, sub_b, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v1).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        std::fs::remove_dir_all(watched_path.join("sub")).ok();
+        let sub_path = watched_path.join("sub");
+        let sub = git2::Repository::clone(
+            up_sub_path.to_string_lossy().as_ref(),
+            &sub_path,
+        )
+        .unwrap();
+        assert_eq!(head_oid(&sub), sub_a);
+        drop(sub);
+
+        processor_for(&watched_path).update_from_remote().unwrap();
+
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let v2 = watched
+            .find_reference("refs/remotes/origin/master")
+            .unwrap()
+            .target()
+            .unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        let sub = git2::Repository::open(&sub_path).unwrap();
+        assert_eq!(head_oid(&sub), sub_a);
+        drop(sub);
+        assert!(
+            std::fs::read_to_string(watched_path.join("src/main.rs"))
+                .unwrap()
+                .contains("fixture-version-two")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_names_mismatched_and_unverifiable_files_separately() {
+        let (root, watched_path, _v1, v2) = external_filter_repo(
+            "post-checkout-verify-mixed",
+            "version two\n",
+        );
+        std::fs::write(watched_path.join("data.txt"), "Xversion two\n").unwrap();
+        std::fs::write(
+            watched_path.join("src/main.rs"),
+            "fn main() { println!(\"edited\"); }\n",
+        )
+        .unwrap();
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(_v1, v2).unwrap();
+        match processor._verify_checked_out_paths(_v1, v2, &changed) {
+            Ok(()) => panic!("post-checkout verification must refuse diverged files"),
+            Err(e) => {
+                let message = format!("{:?}", e);
+                assert!(
+                    message.contains("tracked files (src/main.rs) do not match"),
+                    "{}",
+                    message
+                );
+                assert!(
+                    message.contains("tracked files (data.txt) could not be checked"),
+                    "{}",
+                    message
+                );
+            }
+        }
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_accepts_a_file_matching_through_its_clean_filter() {
+        let (root, watched_path, _v1, v2) =
+            external_filter_repo("post-checkout-verify-clean-filter", "version two\n");
+        std::fs::write(watched_path.join("data.txt"), "Xversion two\n").unwrap();
+        std::fs::write(
+            watched_path.join("src/main.rs"),
+            "fn main() { println!(\"fixture-version-two\"); }\n",
+        )
+        .unwrap();
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(_v1, v2).unwrap();
+        processor._verify_checked_out_paths(_v1, v2, &changed).unwrap();
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_names_a_file_whose_clean_filter_fails_as_unverifiable() {
+        let (root, watched_path, _v1, v2) = external_filter_repo(
+            "post-checkout-verify-unverifiable",
+            "version two\n",
+        );
+        std::fs::write(watched_path.join("data.txt"), "Xversion two\n").unwrap();
+        std::fs::write(
+            watched_path.join("src/main.rs"),
+            "fn main() { println!(\"fixture-version-two\"); }\n",
+        )
+        .unwrap();
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(_v1, v2).unwrap();
+        match processor._verify_checked_out_paths(_v1, v2, &changed) {
+            Ok(()) => panic!("post-checkout verification must refuse unverifiable files"),
+            Err(e) => {
+                let message = format!("{:?}", e);
+                assert!(
+                    message.contains("could not be checked against their clean conversion"),
+                    "{}",
+                    message
+                );
+                assert!(message.contains("data.txt"), "{}", message);
+                assert!(
+                    !message.contains("do not match the fetched commit"),
+                    "{}",
+                    message
+                );
+            }
+        }
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_accepts_an_absent_skip_worktree_path() {
+        let (root, watched_path, v1, v2) =
+            two_file_repo("post-checkout-verify-skip-worktree-absent");
+        std::fs::write(watched_path.join("a.txt"), "two-a\n").unwrap();
+        set_index_flag(&watched_path, "--skip-worktree", "b.txt");
+        std::fs::remove_file(watched_path.join("b.txt")).unwrap();
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        processor._verify_checked_out_paths(v1, v2, &changed).unwrap();
+        drop(processor);
         let _ = std::fs::remove_dir_all(&root);
     }
 
