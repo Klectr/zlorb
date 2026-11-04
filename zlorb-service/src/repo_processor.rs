@@ -622,10 +622,12 @@ impl RepoProcessor {
                         unverifiable_clause(&unverifiable)
                     ));
                 }
-                let advice = if tracked_changes.is_empty() {
+                let advice = if unverifiable.is_empty() {
+                    "Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch"
+                } else if tracked_changes.is_empty() {
                     "The re-check errors above name the conversion that could not be applied; make it runnable by the daemon so these files can be verified"
                 } else {
-                    "Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch"
+                    "Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch; make the conversion named in the re-check errors above runnable by the daemon so the unverifiable files can be verified"
                 };
                 return Err(ZlorbError::Other(format!(
                     "Refusing to build {}: {}. {}",
@@ -727,10 +729,12 @@ impl RepoProcessor {
                         unverifiable_clause(&unverifiable)
                     ));
                 }
-                let advice = if tracked_changes.is_empty() {
+                let advice = if unverifiable.is_empty() {
+                    "Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch"
+                } else if tracked_changes.is_empty() {
                     "The re-check errors above name the conversion that could not be applied; make it runnable by the daemon so these files can be verified"
                 } else {
-                    "Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch"
+                    "Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch; make the conversion named in the re-check errors above runnable by the daemon so the unverifiable files can be verified"
                 };
                 return Err(ZlorbError::Other(format!(
                     "Refusing to run the restart command for {}: {}. {}",
@@ -945,10 +949,12 @@ impl RepoProcessor {
                 untracked_collisions.join(", ")
             ));
         }
-        let advice = if tracked_changes.is_empty() && untracked_collisions.is_empty() {
+        let advice = if unverifiable.is_empty() {
+            "Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch"
+        } else if tracked_changes.is_empty() && untracked_collisions.is_empty() {
             "The re-check errors above name the conversion that could not be applied; make it runnable by the daemon so these files can be verified"
         } else {
-            "Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch"
+            "Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch; make the conversion named in the re-check errors above runnable by the daemon so the unverifiable files can be verified"
         };
         Err(ZlorbError::Other(format!(
             "Refusing to fast-forward {}: {}. {}",
@@ -4380,6 +4386,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn build_refusal_with_a_change_and_a_hidden_unverifiable_file_carries_both_advices() {
+        let (root, watched_path, _v1, v2) =
+            external_filter_repo("skip-worktree-external-filter-build-mixed", "version two\n");
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v2).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        std::fs::write(watched_path.join("data.txt"), "Xversion two\n").unwrap();
+        set_index_flag(&watched_path, "--skip-worktree", "data.txt");
+        std::fs::write(
+            watched_path.join("src/main.rs"),
+            "fn main() { println!(\"edited\"); }\n",
+        )
+        .unwrap();
+        let mut processor = processor_for(&watched_path);
+        processor.config.out_dir = Some("dist-out".to_string());
+        let tracked = processor._tracked_local_changes().unwrap();
+        assert_eq!(tracked.changes, vec![PathBuf::from("src/main.rs")]);
+        assert_eq!(tracked.unverifiable, vec![PathBuf::from("data.txt")]);
+        let err = processor.update_from_remote().unwrap_err();
+        let message = format!("{:?}", err);
+        assert!(message.contains("Refusing to build"), "{}", message);
+        assert!(
+            message.contains("local changes to tracked files (src/main.rs)"),
+            "{}",
+            message
+        );
+        assert!(
+            message.contains("could not be checked against their clean conversion"),
+            "{}",
+            message
+        );
+        assert!(message.contains("Stash the work"), "{}", message);
+        assert!(
+            message.contains("make the conversion named in the re-check errors above runnable by the daemon so the unverifiable files can be verified"),
+            "{}",
+            message
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn external_filter_repo(label: &str, v2_data: &str) -> (PathBuf, PathBuf, Oid, Oid) {
         let root = temp_dir(label);
         let upstream_path = root.join("upstream");
@@ -4666,6 +4718,11 @@ mod tests {
         );
         assert!(message.contains("data.txt"), "{}", message);
         assert!(message.contains("Stash the work"), "{}", message);
+        assert!(
+            message.contains("make the conversion named in the re-check errors above runnable by the daemon so the unverifiable files can be verified"),
+            "{}",
+            message
+        );
         drop(processor);
         let watched = git2::Repository::open(&watched_path).unwrap();
         assert_eq!(head_oid(&watched), v1);
@@ -10228,6 +10285,67 @@ mod tests {
                 .unwrap()
                 .contains_key(&tracker_key(&watched_path.to_string_lossy()))
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_restart_retry_refusal_with_a_change_and_an_unverifiable_file_carries_both_advices()
+    {
+        let (root, watched_path, _v1, v2) =
+            external_filter_repo("external-filter-restart-refusal-mixed", "version two\n");
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v2).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        std::fs::write(watched_path.join("data.txt"), "Xversion two\n").unwrap();
+        std::fs::write(
+            watched_path.join("src/main.rs"),
+            "fn main() { println!(\"edited\"); }\n",
+        )
+        .unwrap();
+
+        let failed_restarts = new_failed_restarts();
+        failed_restarts
+            .lock()
+            .unwrap()
+            .insert(tracker_key(&watched_path.to_string_lossy()), v2);
+
+        let processor = processor_with_restart(
+            &watched_path,
+            Some("echo ran > restart-ran.txt".to_string()),
+            failed_restarts.clone(),
+        );
+        let tracked = processor._tracked_local_changes().unwrap();
+        assert_eq!(tracked.changes, vec![PathBuf::from("src/main.rs")]);
+        assert_eq!(tracked.unverifiable, vec![PathBuf::from("data.txt")]);
+        let err = processor.update_from_remote().unwrap_err();
+        let message = format!("{:?}", err);
+        assert!(
+            message.contains("Refusing to run the restart command"),
+            "{}",
+            message
+        );
+        assert!(
+            message.contains("local changes to tracked files (src/main.rs)"),
+            "{}",
+            message
+        );
+        assert!(
+            message.contains("could not be checked against their clean conversion"),
+            "{}",
+            message
+        );
+        assert!(message.contains("Stash the work"), "{}", message);
+        assert!(
+            message.contains("make the conversion named in the re-check errors above runnable by the daemon so the unverifiable files can be verified"),
+            "{}",
+            message
+        );
+        assert!(!watched_path.join("restart-ran.txt").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
