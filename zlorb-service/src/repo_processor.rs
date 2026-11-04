@@ -1952,7 +1952,7 @@ impl RepoProcessor {
                 }
                 Some(git2::ObjectType::Commit) => {
                     child_is_real_dir
-                        && self._rollback_gitlink_matches(&child_full, entry.id(), true)
+                        && self._rollback_gitlink_matches(&child_full, entry.id(), true, false)
                 }
                 _ => self._rollback_disk_matches(
                     workdir,
@@ -2487,9 +2487,12 @@ impl RepoProcessor {
             let include_ignored = other_mode != Some(0o160000)
                 && (gitlink_ignored_blocks || other_mode.is_some());
             let matches = match entry_mode {
-                Some(0o160000) => {
-                    self._rollback_gitlink_matches(&full_path, expected, include_ignored)
-                }
+                Some(0o160000) => self._rollback_gitlink_matches(
+                    &full_path,
+                    expected,
+                    include_ignored,
+                    !gitlink_ignored_blocks && !include_ignored,
+                ),
                 Some(0o40000) => match self.repo.find_tree(expected) {
                     Ok(tree) => self._rollback_dir_matches_tree(workdir, path, &tree),
                     Err(_) => false,
@@ -2508,12 +2511,16 @@ impl RepoProcessor {
         full_path: &Path,
         expected: Oid,
         include_ignored: bool,
+        loose_fallbacks: bool,
     ) -> bool {
         match git2::Repository::open(full_path) {
             Ok(sub_repo) => {
                 let Some(head) = sub_repo.head().ok().and_then(|head| head.target()) else {
-                    return self
-                        ._rollback_gitlink_is_submodule_placeholder(&sub_repo, full_path);
+                    return self._rollback_gitlink_is_submodule_placeholder(
+                        &sub_repo,
+                        full_path,
+                        loose_fallbacks,
+                    );
                 };
                 if head != expected {
                     return false;
@@ -2529,10 +2536,33 @@ impl RepoProcessor {
                     Ok(statuses) if statuses.is_empty()
                 )
             }
-            Err(_) => match std::fs::read_dir(full_path) {
-                Ok(mut entries) => entries.next().is_none(),
-                Err(_) => false,
-            },
+            Err(_) => {
+                let Ok(entries) = std::fs::read_dir(full_path) else {
+                    return false;
+                };
+                let mut names = Vec::new();
+                for entry in entries {
+                    let Ok(entry) = entry else {
+                        return false;
+                    };
+                    names.push(entry.file_name());
+                }
+                if names.is_empty() {
+                    return true;
+                }
+                if !loose_fallbacks {
+                    return false;
+                }
+                let Some(workdir) = self.repo.workdir() else {
+                    return false;
+                };
+                let Ok(rel_path) = full_path.strip_prefix(workdir) else {
+                    return false;
+                };
+                names.iter().all(|name| {
+                    self._checkout_extra_entry_holds_only_ignored(&rel_path.join(name))
+                })
+            }
         }
     }
 
@@ -2540,6 +2570,7 @@ impl RepoProcessor {
         &self,
         sub_repo: &git2::Repository,
         full_path: &Path,
+        loose_fallbacks: bool,
     ) -> bool {
         if sub_repo.is_bare() {
             return false;
@@ -2580,10 +2611,13 @@ impl RepoProcessor {
         }
         let mut status_options = git2::StatusOptions::new();
         status_options.include_untracked(true);
-        status_options.include_ignored(true);
+        status_options.include_ignored(!loose_fallbacks);
         let Ok(statuses) = sub_repo.statuses(Some(&mut status_options)) else {
             return false;
         };
+        if loose_fallbacks {
+            return statuses.is_empty();
+        }
         statuses.iter().all(|entry| {
             entry.status() == git2::Status::IGNORED
                 && entry
@@ -2669,7 +2703,7 @@ impl RepoProcessor {
                 }
                 Some(git2::ObjectType::Commit) => {
                     child_is_real_dir
-                        && self._rollback_gitlink_matches(&child_full, entry.id(), true)
+                        && self._rollback_gitlink_matches(&child_full, entry.id(), true, false)
                 }
                 _ => self._rollback_disk_matches(
                     workdir,
@@ -7817,6 +7851,131 @@ mod tests {
     fn rollback_preserves_an_added_gitlink_holding_only_an_ignored_file() {
         let (root, watched_path, v1, v2, _sub_a) =
             added_gitlink_fixture("rollback-added-gitlink-ignored");
+        std::fs::write(watched_path.join("sub/data.db"), "precious\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/data.db")).unwrap(),
+            "precious\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_classification_accepts_a_removed_gitlink_placeholder_holding_only_an_ignored_file()
+    {
+        let (root, watched_path, v1, v2, _sub_a) =
+            removed_gitlink_fixture("checkout-placeholder-removed-gitlink-ignored");
+        submodule_placeholder(&watched_path);
+        std::fs::write(
+            watched_path.join(".git/modules/sub/info/exclude"),
+            "data.db\n",
+        )
+        .unwrap();
+        std::fs::write(watched_path.join("sub/data.db"), "build output\n").unwrap();
+        let processor = processor_for(&watched_path);
+        let (safe, preserved, _absent, _unverifiable, failed) =
+            processor._checkout_restore_paths(v1, v2, &[PathBuf::from("sub")]);
+        assert!(!failed);
+        assert_eq!(safe, vec![PathBuf::from("sub")]);
+        assert!(preserved.is_empty());
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_accepts_a_removed_gitlink_placeholder_holding_only_an_ignored_file() {
+        let (root, watched_path, v1, v2, _sub_a) =
+            removed_gitlink_fixture("checkout-step-placeholder-removed-gitlink-ignored");
+        submodule_placeholder(&watched_path);
+        std::fs::write(
+            watched_path.join(".git/modules/sub/info/exclude"),
+            "data.db\n",
+        )
+        .unwrap();
+        std::fs::write(watched_path.join("sub/data.db"), "build output\n").unwrap();
+        let processor = processor_for(&watched_path);
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        let remote_ref = processor
+            ._checkout_and_get_ref(Some(v1), v2, Some(&changed))
+            .unwrap();
+        assert_eq!(remote_ref.target(), Some(v2));
+        drop(remote_ref);
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_classification_accepts_a_removed_gitlink_plain_directory_holding_only_an_ignored_file(
+    ) {
+        let (root, watched_path, v1, v2, _sub_a) =
+            removed_gitlink_fixture("checkout-plain-removed-gitlink-ignored");
+        std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::create_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::write(watched_path.join(".git/info/exclude"), "sub/data.db\n").unwrap();
+        std::fs::write(watched_path.join("sub/data.db"), "build output\n").unwrap();
+        let processor = processor_for(&watched_path);
+        let (safe, preserved, _absent, _unverifiable, failed) =
+            processor._checkout_restore_paths(v1, v2, &[PathBuf::from("sub")]);
+        assert!(!failed);
+        assert_eq!(safe, vec![PathBuf::from("sub")]);
+        assert!(preserved.is_empty());
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_classification_refuses_a_removed_gitlink_plain_directory_holding_an_untracked_file(
+    ) {
+        let (root, watched_path, v1, v2, _sub_a) =
+            removed_gitlink_fixture("checkout-plain-removed-gitlink-untracked");
+        std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::create_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::write(watched_path.join(".git/info/exclude"), "sub/data.db\n").unwrap();
+        std::fs::write(watched_path.join("sub/notes.txt"), "user notes\n").unwrap();
+        let processor = processor_for(&watched_path);
+        let (safe, preserved, _absent, _unverifiable, failed) =
+            processor._checkout_restore_paths(v1, v2, &[PathBuf::from("sub")]);
+        assert!(!failed);
+        assert!(safe.is_empty());
+        assert_eq!(preserved, vec![PathBuf::from("sub")]);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/notes.txt")).unwrap(),
+            "user notes\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_a_removed_gitlink_plain_directory_holding_only_an_ignored_file() {
+        let (root, watched_path, v1, v2, _sub_a) =
+            removed_gitlink_fixture("rollback-plain-removed-gitlink-ignored");
+        std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::create_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::write(watched_path.join(".git/info/exclude"), "sub/data.db\n").unwrap();
+        std::fs::write(watched_path.join("sub/data.db"), "precious\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/data.db")).unwrap(),
+            "precious\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_a_bumped_gitlink_plain_directory_holding_only_an_ignored_file() {
+        let (root, watched_path, v1, v2, _sub_a, _sub_b) =
+            gitlink_fixture("rollback-plain-bumped-gitlink-ignored");
+        std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::create_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::write(watched_path.join(".git/info/exclude"), "sub/data.db\n").unwrap();
         std::fs::write(watched_path.join("sub/data.db"), "precious\n").unwrap();
         let processor = processor_for(&watched_path);
         assert!(!processor._rollback_fast_forward(v1, v2));
