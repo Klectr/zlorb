@@ -2717,15 +2717,21 @@ impl RepoProcessor {
                             return false;
                         }
                     }
-                    sub_repo
-                        .blob_writer(Some(&rel_path))
+                    std::fs::read(&flagged_full)
                         .ok()
-                        .and_then(|mut writer| {
-                            let mut file = std::fs::File::open(&flagged_full).ok()?;
-                            std::io::copy(&mut file, &mut writer).ok()?;
-                            writer.commit().ok()
+                        .and_then(|contents| {
+                            Oid::hash_object(git2::ObjectType::Blob, &contents).ok()
                         })
                         == Some(entry.id)
+                        || sub_repo
+                            .blob_writer(Some(&rel_path))
+                            .ok()
+                            .and_then(|mut writer| {
+                                let mut file = std::fs::File::open(&flagged_full).ok()?;
+                                std::io::copy(&mut file, &mut writer).ok()?;
+                                writer.commit().ok()
+                            })
+                            == Some(entry.id)
                 }
                 0o160000 => {
                     if !flagged_type.is_dir() {
@@ -3019,16 +3025,23 @@ impl RepoProcessor {
                                     return false;
                                 }
                             }
-                            sub_repo
-                                .blob_writer(Some(&rel_path))
+                            std::fs::read(&flagged_full)
                                 .ok()
-                                .and_then(|mut writer| {
-                                    let mut file =
-                                        std::fs::File::open(&flagged_full).ok()?;
-                                    std::io::copy(&mut file, &mut writer).ok()?;
-                                    writer.commit().ok()
+                                .and_then(|contents| {
+                                    Oid::hash_object(git2::ObjectType::Blob, &contents)
+                                        .ok()
                                 })
                                 == Some(entry.id)
+                                || sub_repo
+                                    .blob_writer(Some(&rel_path))
+                                    .ok()
+                                    .and_then(|mut writer| {
+                                        let mut file =
+                                            std::fs::File::open(&flagged_full).ok()?;
+                                        std::io::copy(&mut file, &mut writer).ok()?;
+                                        writer.commit().ok()
+                                    })
+                                    == Some(entry.id)
                         }
                         0o160000 => {
                             if !flagged_type.is_dir() {
@@ -9288,6 +9301,98 @@ mod tests {
             std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
             "sub one\r\n"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn preclone_check_accepts_a_flagged_file_whose_blob_and_disk_bytes_are_identical_crlf()
+    {
+        let root = temp_dir("precloned-flagged-raw-crlf");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        let v1 = commit_all(&upstream, "v1");
+        let up_sub_path = upstream_path.join("sub");
+        let up_sub = git2::Repository::init_opts(&up_sub_path, &init_opts).unwrap();
+        std::fs::write(up_sub_path.join("sub.txt"), b"sub one\r\n").unwrap();
+        let sub_a = commit_all(&up_sub, "sub a");
+        drop(up_sub);
+        write_fixture_crate(&upstream_path, "fixture-version-two");
+        commit_with_gitlink(&upstream, sub_a, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v1).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        git2::Repository::clone(
+            up_sub_path.to_string_lossy().as_ref(),
+            watched_path.join("sub"),
+        )
+        .unwrap();
+        {
+            let info_dir = watched_path.join("sub/.git/info");
+            std::fs::create_dir_all(&info_dir).unwrap();
+            std::fs::write(info_dir.join("attributes"), "sub.txt text\n").unwrap();
+        }
+        {
+            let sub = git2::Repository::open(watched_path.join("sub")).unwrap();
+            let index = sub.index().unwrap();
+            let entry = index.get_path(Path::new("sub.txt"), 0).unwrap();
+            let blob = sub.find_blob(entry.id).unwrap();
+            assert_eq!(blob.content(), b"sub one\r\n");
+        }
+        set_index_flag(&watched_path.join("sub"), "--assume-unchanged", "sub.txt");
+
+        let processor = processor_for(&watched_path);
+        assert!(processor._precloned_gitlink_matches(Path::new("sub"), sub_a));
+        std::fs::write(watched_path.join("sub/sub.txt"), b"sub two\r\n").unwrap();
+        assert!(!processor._precloned_gitlink_matches(Path::new("sub"), sub_a));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_gitlink_check_accepts_a_flagged_file_whose_blob_and_disk_bytes_are_identical_crlf(
+    ) {
+        let root = temp_dir("rollback-flagged-raw-crlf");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        commit_all(&watched, "v1");
+        drop(watched);
+        let sub_path = watched_path.join("sub");
+        let sub = git2::Repository::init_opts(&sub_path, &init_opts).unwrap();
+        std::fs::write(sub_path.join("sub.txt"), b"sub one\r\n").unwrap();
+        let sub_a = commit_all(&sub, "sub a");
+        {
+            let info_dir = sub_path.join(".git/info");
+            std::fs::create_dir_all(&info_dir).unwrap();
+            std::fs::write(info_dir.join("attributes"), "sub.txt text\n").unwrap();
+        }
+        {
+            let index = sub.index().unwrap();
+            let entry = index.get_path(Path::new("sub.txt"), 0).unwrap();
+            let blob = sub.find_blob(entry.id).unwrap();
+            assert_eq!(blob.content(), b"sub one\r\n");
+        }
+        drop(sub);
+        set_index_flag(&sub_path, "--assume-unchanged", "sub.txt");
+
+        let processor = processor_for(&watched_path);
+        assert!(processor._rollback_gitlink_matches(&sub_path, sub_a, false, false));
+        std::fs::write(sub_path.join("sub.txt"), b"sub two\r\n").unwrap();
+        assert!(!processor._rollback_gitlink_matches(&sub_path, sub_a, false, false));
+        drop(processor);
         let _ = std::fs::remove_dir_all(&root);
     }
 
