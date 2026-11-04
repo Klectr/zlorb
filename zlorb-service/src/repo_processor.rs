@@ -1057,7 +1057,7 @@ impl RepoProcessor {
         }
         let mut known = changes.clone();
         known.extend(unverifiable.iter().cloned());
-        let hidden = self._hidden_local_changes(&known);
+        let hidden = self._hidden_local_changes(&known)?;
         changes.extend(hidden.changes);
         unverifiable.extend(hidden.unverifiable);
         Ok(TrackedLocalChanges {
@@ -1140,24 +1140,28 @@ impl RepoProcessor {
         }
     }
 
-    fn _hidden_local_changes(&self, known: &[PathBuf]) -> TrackedLocalChanges {
+    fn _hidden_local_changes(
+        &self,
+        known: &[PathBuf],
+    ) -> Result<TrackedLocalChanges, ZlorbError> {
         let Some(workdir) = self.repo.workdir().map(|path| path.to_path_buf()) else {
-            return TrackedLocalChanges {
-                changes: Vec::new(),
-                unverifiable: Vec::new(),
-            };
+            Logger::error(format!(
+                "{} has no working directory; local changes under skip-worktree or assume-unchanged cannot be checked, so the update is refused rather than risk discarding them",
+                self.config.name
+            ));
+            return Err(ZlorbError::Other(format!(
+                "{} has no working directory, so local changes under skip-worktree or assume-unchanged cannot be checked",
+                self.config.name
+            )));
         };
         let index = match self.repo.index() {
             Ok(index) => index,
             Err(e) => {
                 Logger::error(format!(
-                    "Could not read the index for {}; local changes under skip-worktree or assume-unchanged cannot be checked this cycle and would not be reported: {}",
+                    "Could not read the index for {}; local changes under skip-worktree or assume-unchanged cannot be checked, so the update is refused rather than risk discarding them: {}",
                     self.config.name, e
                 ));
-                return TrackedLocalChanges {
-                    changes: Vec::new(),
-                    unverifiable: Vec::new(),
-                };
+                return Err(ZlorbError::Git(e));
             }
         };
         let file_mode = self
@@ -1321,10 +1325,10 @@ impl RepoProcessor {
                 }
             }
         }
-        TrackedLocalChanges {
+        Ok(TrackedLocalChanges {
             changes: hidden,
             unverifiable: hidden_unverifiable,
-        }
+        })
     }
 
     fn _matches_after_external_clean_filter(
@@ -4129,9 +4133,36 @@ mod tests {
             root.join("objects-away"),
         )
         .unwrap();
-        let hidden = processor._hidden_local_changes(&[]);
+        let hidden = processor._hidden_local_changes(&[]).unwrap();
         assert!(hidden.changes.is_empty());
         assert_eq!(hidden.unverifiable, vec![PathBuf::from("b.txt")]);
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hidden_changes_check_errors_when_the_repo_has_no_working_directory() {
+        let root = temp_dir("hidden-check-no-workdir");
+        let bare_path = root.join("bare");
+        git2::Repository::init_bare(&bare_path).unwrap();
+        let processor = processor_for(&bare_path);
+        assert!(processor._hidden_local_changes(&[]).is_err());
+        assert!(processor._tracked_local_changes().is_err());
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hidden_changes_check_errors_when_the_index_cannot_be_read() {
+        let (root, watched_path, _v1, _v2) = two_file_repo("hidden-check-index-unreadable");
+        set_index_flag(&watched_path, "--skip-worktree", "b.txt");
+        std::fs::write(
+            watched_path.join(".git").join("index"),
+            b"not a valid index",
+        )
+        .unwrap();
+        let processor = processor_for(&watched_path);
+        assert!(processor._hidden_local_changes(&[]).is_err());
         drop(processor);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4157,7 +4188,7 @@ mod tests {
         let (root, watched_path) =
             hidden_metadata_loop_repo("skip-worktree-metadata-loop", "--skip-worktree");
         let processor = processor_for(&watched_path);
-        let hidden = processor._hidden_local_changes(&[]);
+        let hidden = processor._hidden_local_changes(&[]).unwrap();
         assert!(hidden.changes.is_empty());
         assert_eq!(
             hidden.unverifiable,
@@ -4172,7 +4203,7 @@ mod tests {
         let (root, watched_path) =
             hidden_metadata_loop_repo("assume-unchanged-metadata-loop", "--assume-unchanged");
         let processor = processor_for(&watched_path);
-        let hidden = processor._hidden_local_changes(&[]);
+        let hidden = processor._hidden_local_changes(&[]).unwrap();
         assert!(hidden.changes.is_empty());
         assert_eq!(
             hidden.unverifiable,
