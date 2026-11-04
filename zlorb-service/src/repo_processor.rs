@@ -1730,7 +1730,7 @@ impl RepoProcessor {
                 (Some(safe), preserved)
             }
             None => match self._rollback_scoped_fallback_paths(local_oid, fetch_oid) {
-                Some((safe, preserved)) => {
+                Some((safe, mut preserved, unverifiable)) => {
                     for path in &preserved {
                         Logger::error(format!(
                             "Preserving local changes to {} in {} during rollback: the path could not be certified as matching the rolled-back commit or the fetched commit, or it sits under a symlinked ancestor, so the scoped fallback restore is not writing to it and the working tree is left diverged from {}",
@@ -1739,6 +1739,15 @@ impl RepoProcessor {
                             local_oid
                         ));
                     }
+                    for path in &unverifiable {
+                        Logger::error(format!(
+                            "Preserving {} in {} during rollback: the file could not be checked against its clean conversion in the daemon environment, so it is not being restored and the working tree is left diverged from {}",
+                            path.display(),
+                            self.config.name,
+                            local_oid
+                        ));
+                    }
+                    preserved.extend(unverifiable);
                     (Some(safe), preserved)
                 }
                 None => {
@@ -2199,7 +2208,7 @@ impl RepoProcessor {
         &self,
         local_oid: Oid,
         fetch_oid: Oid,
-    ) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
+    ) -> Option<(Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>)> {
         let workdir = self.repo.workdir()?.to_path_buf();
         let local_tree = self.repo.find_commit(local_oid).ok()?.tree().ok()?;
         let fetch_tree = self.repo.find_commit(fetch_oid).ok()?.tree().ok()?;
@@ -2232,6 +2241,7 @@ impl RepoProcessor {
         }
         let mut safe = Vec::new();
         let mut preserved = Vec::new();
+        let mut unverifiable = Vec::new();
         for path in paths {
             if self._rollback_has_symlinked_ancestor(&workdir, &path) {
                 preserved.push(path);
@@ -2251,18 +2261,29 @@ impl RepoProcessor {
                 }
                 continue;
             }
-            if self._rollback_disk_matches(&workdir, &path, local_id, local_mode)
-                || self._rollback_disk_matches(&workdir, &path, fetch_id, fetch_mode)
+            let local_recheck =
+                self._rollback_disk_recheck(&workdir, &path, local_id, local_mode);
+            if local_recheck == CleanRecheck::Match {
+                safe.push(path);
+                continue;
+            }
+            let fetch_recheck =
+                self._rollback_disk_recheck(&workdir, &path, fetch_id, fetch_mode);
+            if fetch_recheck == CleanRecheck::Match
                 || self._rollback_structured_matches(
                     &workdir, &path, local_id, local_mode, fetch_id, fetch_mode,
                 )
             {
                 safe.push(path);
+            } else if local_recheck == CleanRecheck::Unverifiable
+                || fetch_recheck == CleanRecheck::Unverifiable
+            {
+                unverifiable.push(path);
             } else {
                 preserved.push(path);
             }
         }
-        Some((safe, preserved))
+        Some((safe, preserved, unverifiable))
     }
 
     fn _rollback_has_symlinked_ancestor(&self, workdir: &Path, path: &Path) -> bool {
@@ -8347,9 +8368,10 @@ mod tests {
         drop(watched);
 
         let processor = processor_for(&watched_path);
-        let (safe, preserved) = processor
+        let (safe, preserved, unverifiable) = processor
             ._rollback_scoped_fallback_paths(v1, v2)
             .unwrap();
+        assert!(unverifiable.is_empty());
         assert!(safe.contains(&PathBuf::from("new.txt")));
         assert!(safe.contains(&PathBuf::from("src/main.rs")));
         assert!(preserved.is_empty());
@@ -8372,9 +8394,10 @@ mod tests {
         std::fs::write(watched_path.join("src/main.rs"), "user edit\n").unwrap();
 
         let processor = processor_for(&watched_path);
-        let (safe, preserved) = processor
+        let (safe, preserved, unverifiable) = processor
             ._rollback_scoped_fallback_paths(v1, v2)
             .unwrap();
+        assert!(unverifiable.is_empty());
         assert!(preserved.contains(&PathBuf::from("src/main.rs")));
         assert!(!safe.contains(&PathBuf::from("src/main.rs")));
         assert!(safe.contains(&PathBuf::from("Cargo.toml")));
@@ -8398,9 +8421,10 @@ mod tests {
         std::fs::write(watched_path.join("unchanged.txt"), "user edit\n").unwrap();
 
         let processor = processor_for(&watched_path);
-        let (safe, preserved) = processor
+        let (safe, preserved, unverifiable) = processor
             ._rollback_scoped_fallback_paths(v1, v2)
             .unwrap();
+        assert!(unverifiable.is_empty());
         assert!(preserved.contains(&PathBuf::from("unchanged.txt")));
         assert!(!safe.contains(&PathBuf::from("unchanged.txt")));
         drop(processor);
@@ -8418,9 +8442,10 @@ mod tests {
         drop(sub);
 
         let processor = processor_for(&watched_path);
-        let (safe, preserved) = processor
+        let (safe, preserved, unverifiable) = processor
             ._rollback_scoped_fallback_paths(v1, v2)
             .unwrap();
+        assert!(unverifiable.is_empty());
         assert!(preserved.contains(&PathBuf::from("sub")));
         assert!(!safe.contains(&PathBuf::from("sub")));
         drop(processor);
@@ -8445,9 +8470,10 @@ mod tests {
         std::fs::remove_file(watched_path.join("new.txt")).unwrap();
 
         let processor = processor_for(&watched_path);
-        let (safe, preserved) = processor
+        let (safe, preserved, unverifiable) = processor
             ._rollback_scoped_fallback_paths(v1, v2)
             .unwrap();
+        assert!(unverifiable.is_empty());
         assert!(preserved.contains(&PathBuf::from("unchanged.txt")));
         assert!(!safe.contains(&PathBuf::from("unchanged.txt")));
         assert!(safe.contains(&PathBuf::from("new.txt")));
@@ -8473,11 +8499,49 @@ mod tests {
         std::os::unix::fs::symlink("Cargo.toml", watched_path.join("link.txt")).unwrap();
 
         let processor = processor_for(&watched_path);
-        let (safe, preserved) = processor
+        let (safe, preserved, unverifiable) = processor
             ._rollback_scoped_fallback_paths(v1, v2)
             .unwrap();
+        assert!(unverifiable.is_empty());
         assert!(preserved.contains(&PathBuf::from("link.txt")));
         assert!(!safe.contains(&PathBuf::from("link.txt")));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_scoped_fallback_classifies_a_file_whose_external_clean_filter_fails_as_unverifiable() {
+        let (root, watched_path, v1, v2) =
+            external_filter_repo("fallback-classifier-unverifiable", "version two\n");
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        set_repo_config(&watched_path, "filter.strip.clean", "false");
+        let processor = processor_for(&watched_path);
+        let (safe, preserved, unverifiable) = processor
+            ._rollback_scoped_fallback_paths(v1, v2)
+            .unwrap();
+        assert!(preserved.is_empty());
+        assert_eq!(unverifiable, vec![PathBuf::from("data.txt")]);
+        assert!(safe.contains(&PathBuf::from("src/main.rs")));
+        assert!(!safe.contains(&PathBuf::from("data.txt")));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_scoped_fallback_classifies_a_file_changed_after_an_external_clean_filter_as_preserved() {
+        let (root, watched_path, v1, v2) = external_filter_repo(
+            "fallback-classifier-preserved-on-mismatch",
+            "version two\n",
+        );
+        std::fs::write(watched_path.join("data.txt"), "Xgoodbye\n").unwrap();
+        let processor = processor_for(&watched_path);
+        let (safe, preserved, unverifiable) = processor
+            ._rollback_scoped_fallback_paths(v1, v2)
+            .unwrap();
+        assert_eq!(preserved, vec![PathBuf::from("data.txt")]);
+        assert!(unverifiable.is_empty());
+        assert!(safe.contains(&PathBuf::from("src/main.rs")));
+        assert!(!safe.contains(&PathBuf::from("data.txt")));
         drop(processor);
         let _ = std::fs::remove_dir_all(&root);
     }
