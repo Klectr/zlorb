@@ -1397,7 +1397,21 @@ impl RepoProcessor {
         expected: Oid,
         timeout: std::time::Duration,
     ) -> CleanRecheck {
-        let Some(filter_name) = self._external_clean_filter_name(path) else {
+        self._recheck_after_external_clean_filter_for(
+            &self.repo, workdir, path, full_path, expected, timeout,
+        )
+    }
+
+    fn _recheck_after_external_clean_filter_for(
+        &self,
+        repo: &git2::Repository,
+        workdir: &Path,
+        path: &Path,
+        full_path: &Path,
+        expected: Oid,
+        timeout: std::time::Duration,
+    ) -> CleanRecheck {
+        let Some(filter_name) = Self::_external_clean_filter_name_for(repo, path) else {
             return CleanRecheck::Unverifiable;
         };
         self._recheck_after_clean_conversion_with_timeout(
@@ -1408,6 +1422,42 @@ impl RepoProcessor {
             timeout,
             &format!("the external clean filter {}", filter_name),
         )
+    }
+
+    fn _flagged_gitlink_file_matches(
+        &self,
+        sub_repo: &git2::Repository,
+        sub_workdir: &Path,
+        rel_path: &Path,
+        flagged_full: &Path,
+        expected: Oid,
+        disk_len: u64,
+    ) -> bool {
+        if raw_blob_hash_matches(sub_repo, flagged_full, expected, disk_len) {
+            return true;
+        }
+        let filtered = sub_repo
+            .blob_writer(Some(rel_path))
+            .ok()
+            .and_then(|mut writer| {
+                let mut file = std::fs::File::open(flagged_full).ok()?;
+                std::io::copy(&mut file, &mut writer).ok()?;
+                writer.commit().ok()
+            });
+        if filtered == Some(expected) {
+            return true;
+        }
+        if Self::_external_clean_filter_name_for(sub_repo, rel_path).is_none() {
+            return false;
+        }
+        self._recheck_after_external_clean_filter_for(
+            sub_repo,
+            sub_workdir,
+            rel_path,
+            flagged_full,
+            expected,
+            std::time::Duration::from_secs(30),
+        ) == CleanRecheck::Match
     }
 
     fn _matches_after_builtin_conversion(
@@ -1639,15 +1689,18 @@ impl RepoProcessor {
     }
 
     fn _external_clean_filter_name(&self, path: &Path) -> Option<String> {
-        let value = self
-            .repo
+        Self::_external_clean_filter_name_for(&self.repo, path)
+    }
+
+    fn _external_clean_filter_name_for(repo: &git2::Repository, path: &Path) -> Option<String> {
+        let value = repo
             .get_attr(path, "filter", git2::AttrCheckFlags::FILE_THEN_INDEX)
             .ok()?;
         let name = match git2::AttrValue::from_string(value) {
             git2::AttrValue::String(name) => name.to_string(),
             _ => return None,
         };
-        let config = self.repo.config().ok()?;
+        let config = repo.config().ok()?;
         let configured = ["clean", "process"].iter().any(|kind| {
             config
                 .get_string(&format!("filter.{}.{}", name, kind))
@@ -2733,21 +2786,14 @@ impl RepoProcessor {
                             return false;
                         }
                     }
-                    raw_blob_hash_matches(
+                    self._flagged_gitlink_file_matches(
                         &sub_repo,
+                        &sub_workdir,
+                        &rel_path,
                         &flagged_full,
                         entry.id,
                         flagged_metadata.len(),
                     )
-                        || sub_repo
-                            .blob_writer(Some(&rel_path))
-                            .ok()
-                            .and_then(|mut writer| {
-                                let mut file = std::fs::File::open(&flagged_full).ok()?;
-                                std::io::copy(&mut file, &mut writer).ok()?;
-                                writer.commit().ok()
-                            })
-                            == Some(entry.id)
                 }
                 0o160000 => {
                     if !flagged_type.is_dir() {
@@ -3050,22 +3096,14 @@ impl RepoProcessor {
                                     return false;
                                 }
                             }
-                            raw_blob_hash_matches(
+                            self._flagged_gitlink_file_matches(
                                 &sub_repo,
+                                &sub_workdir,
+                                &rel_path,
                                 &flagged_full,
                                 entry.id,
                                 flagged_metadata.len(),
                             )
-                                || sub_repo
-                                    .blob_writer(Some(&rel_path))
-                                    .ok()
-                                    .and_then(|mut writer| {
-                                        let mut file =
-                                            std::fs::File::open(&flagged_full).ok()?;
-                                        std::io::copy(&mut file, &mut writer).ok()?;
-                                        writer.commit().ok()
-                                    })
-                                    == Some(entry.id)
                         }
                         0o160000 => {
                             if !flagged_type.is_dir() {
@@ -9770,6 +9808,96 @@ mod tests {
         let processor = processor_for(&watched_path);
         assert!(processor._rollback_gitlink_matches(&sub_path, sub_a, false, false));
         std::fs::write(sub_path.join("sub.txt"), b"sub two\r\n").unwrap();
+        assert!(!processor._rollback_gitlink_matches(&sub_path, sub_a, false, false));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn gitlink_external_filter_preclone_fixture(
+        label: &str,
+    ) -> (PathBuf, PathBuf, Oid) {
+        let root = temp_dir(label);
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let sub_src_path = root.join("sub-src");
+        let sub_src = git2::Repository::init_opts(&sub_src_path, &init_opts).unwrap();
+        std::fs::write(sub_src_path.join(".gitattributes"), "*.txt filter=strip\n").unwrap();
+        std::fs::write(sub_src_path.join("sub.txt"), "sub one\n").unwrap();
+        let sub_a = commit_all(&sub_src, "sub a");
+        drop(sub_src);
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        let v1 = commit_all(&upstream, "v1");
+        write_fixture_crate(&upstream_path, "fixture-version-two");
+        commit_with_gitlink(&upstream, sub_a, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v1).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        git2::Repository::clone(
+            sub_src_path.to_string_lossy().as_ref(),
+            watched_path.join("sub"),
+        )
+        .unwrap();
+        set_repo_config(
+            &watched_path.join("sub"),
+            "filter.strip.clean",
+            "sed 's/^X//'",
+        );
+        (root, watched_path, sub_a)
+    }
+
+    #[test]
+    fn preclone_check_accepts_a_flagged_file_clean_only_through_an_external_clean_filter()
+    {
+        let (root, watched_path, sub_a) =
+            gitlink_external_filter_preclone_fixture("precloned-flagged-external-filter");
+        set_index_flag(&watched_path.join("sub"), "--assume-unchanged", "sub.txt");
+        std::fs::write(watched_path.join("sub/sub.txt"), "Xsub one\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(processor._precloned_gitlink_matches(Path::new("sub"), sub_a));
+        std::fs::write(watched_path.join("sub/sub.txt"), "Xsub two\n").unwrap();
+        assert!(!processor._precloned_gitlink_matches(Path::new("sub"), sub_a));
+        set_repo_config(&watched_path.join("sub"), "filter.strip.clean", "false");
+        std::fs::write(watched_path.join("sub/sub.txt"), "Xsub one\n").unwrap();
+        assert!(!processor._precloned_gitlink_matches(Path::new("sub"), sub_a));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_gitlink_check_accepts_a_flagged_file_clean_only_through_an_external_clean_filter(
+    ) {
+        let root = temp_dir("rollback-flagged-external-filter");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        commit_all(&watched, "v1");
+        drop(watched);
+        let sub_path = watched_path.join("sub");
+        let sub = git2::Repository::init_opts(&sub_path, &init_opts).unwrap();
+        std::fs::write(sub_path.join(".gitattributes"), "*.txt filter=strip\n").unwrap();
+        std::fs::write(sub_path.join("sub.txt"), "sub one\n").unwrap();
+        let sub_a = commit_all(&sub, "sub a");
+        drop(sub);
+        set_repo_config(&sub_path, "filter.strip.clean", "sed 's/^X//'");
+        set_index_flag(&sub_path, "--assume-unchanged", "sub.txt");
+        std::fs::write(sub_path.join("sub.txt"), "Xsub one\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(processor._rollback_gitlink_matches(&sub_path, sub_a, false, false));
+        std::fs::write(sub_path.join("sub.txt"), "Xsub two\n").unwrap();
         assert!(!processor._rollback_gitlink_matches(&sub_path, sub_a, false, false));
         drop(processor);
         let _ = std::fs::remove_dir_all(&root);
