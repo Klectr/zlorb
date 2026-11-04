@@ -2125,7 +2125,10 @@ impl RepoProcessor {
             let fetch_id = fetch_entry.as_ref().map(|entry| entry.id());
             let local_mode = local_entry.as_ref().map(|entry| entry.filemode());
             let fetch_mode = fetch_entry.as_ref().map(|entry| entry.filemode());
-            if std::fs::symlink_metadata(workdir.join(path)).is_err() {
+            if matches!(
+                std::fs::symlink_metadata(workdir.join(path)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound
+            ) {
                 if local_id.is_some() && fetch_id.is_some() {
                     if self._index_path_is_skip_worktree(path) {
                         Logger::info(format!(
@@ -3604,6 +3607,45 @@ mod tests {
         assert!(preserved.is_empty());
         assert!(safe.contains(&PathBuf::from("a.txt")));
         assert!(!safe.contains(&PathBuf::from("b.txt")));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_restore_paths_preserves_a_skip_worktree_path_whose_metadata_cannot_be_read() {
+        let root = temp_dir("rollback-restore-paths-skip-worktree-metadata-error");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        std::fs::create_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::write(watched_path.join("sub").join("b.txt"), "one-b\n").unwrap();
+        let v1 = commit_all(&watched, "v1");
+        write_fixture_crate(&watched_path, "fixture-version-two");
+        std::fs::write(watched_path.join("sub").join("b.txt"), "two-b\n").unwrap();
+        let v2 = commit_all(&watched, "v2");
+        drop(watched);
+        set_index_flag(&watched_path, "--skip-worktree", "sub/b.txt");
+        std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::write(watched_path.join("sub"), "blocker\n").unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(watched_path.join("sub").join("b.txt"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotADirectory
+        );
+
+        let processor = processor_for(&watched_path);
+        assert!(processor._index_path_is_skip_worktree(Path::new("sub/b.txt")));
+        let paths = vec![PathBuf::from("sub").join("b.txt")];
+        let (safe, preserved, absent, unverifiable, failed) =
+            processor._rollback_restore_paths(v1, v2, &paths);
+        assert!(!failed);
+        assert!(absent.is_empty());
+        assert!(safe.is_empty());
+        assert!(unverifiable.is_empty());
+        assert_eq!(preserved, paths);
         drop(processor);
         let _ = std::fs::remove_dir_all(&root);
     }
