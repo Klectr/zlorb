@@ -2770,6 +2770,12 @@ impl RepoProcessor {
                                 }
                                 && nested.head().ok().and_then(|head| head.target())
                                     == Some(entry.id)
+                                && self._rollback_gitlink_matches(
+                                    &flagged_full,
+                                    entry.id,
+                                    false,
+                                    false,
+                                )
                         }
                         Err(_) => false,
                     }
@@ -9491,6 +9497,89 @@ mod tests {
         let processor = processor_for(&watched_path);
         assert!(processor._precloned_gitlink_matches(Path::new("sub"), sub_a));
         std::fs::write(watched_path.join("sub/sub.txt"), b"sub two\r\n").unwrap();
+        assert!(!processor._precloned_gitlink_matches(Path::new("sub"), sub_a));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn preclone_check_refuses_a_flagged_gitlink_whose_nested_clone_is_dirty_behind_ignore_all()
+    {
+        let root = temp_dir("precloned-flagged-gitlink-nested-dirty");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let nested_src_path = root.join("nested-src");
+        let nested_src = git2::Repository::init_opts(&nested_src_path, &init_opts).unwrap();
+        std::fs::write(nested_src_path.join("inner.txt"), "inner one\n").unwrap();
+        let nested_a = commit_all(&nested_src, "nested a");
+        drop(nested_src);
+        let sub_src_path = root.join("sub-src");
+        let sub_src = git2::Repository::init_opts(&sub_src_path, &init_opts).unwrap();
+        std::fs::write(sub_src_path.join("sub.txt"), "sub one\n").unwrap();
+        let sub_a = {
+            let mut index = sub_src.index().unwrap();
+            index.add_path(Path::new("sub.txt")).unwrap();
+            let entry = git2::IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode: 0o160000,
+                uid: 0,
+                gid: 0,
+                file_size: 0,
+                id: nested_a,
+                flags: 0,
+                flags_extended: 0,
+                path: b"nested".to_vec(),
+            };
+            index.add(&entry).unwrap();
+            index.write().unwrap();
+            let tree_oid = index.write_tree().unwrap();
+            let tree = sub_src.find_tree(tree_oid).unwrap();
+            let sig = Signature::now("zlorb-test", "zlorb-test@example.com").unwrap();
+            sub_src
+                .commit(Some("HEAD"), &sig, &sig, "sub a", &tree, &[])
+                .unwrap()
+        };
+        drop(sub_src);
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        let v1 = commit_all(&upstream, "v1");
+        write_fixture_crate(&upstream_path, "fixture-version-two");
+        commit_with_gitlink(&upstream, sub_a, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v1).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        git2::Repository::clone(
+            sub_src_path.to_string_lossy().as_ref(),
+            watched_path.join("sub"),
+        )
+        .unwrap();
+        git2::Repository::clone(
+            nested_src_path.to_string_lossy().as_ref(),
+            watched_path.join("sub/nested"),
+        )
+        .unwrap();
+        {
+            let sub = git2::Repository::open(watched_path.join("sub")).unwrap();
+            let mut config = sub.config().unwrap();
+            config.set_str("submodule.nested.ignore", "all").unwrap();
+        }
+        set_index_flag(&watched_path.join("sub"), "--assume-unchanged", "nested");
+
+        let processor = processor_for(&watched_path);
+        assert!(processor._precloned_gitlink_matches(Path::new("sub"), sub_a));
+        std::fs::write(watched_path.join("sub/nested/inner.txt"), "inner edit\n").unwrap();
         assert!(!processor._precloned_gitlink_matches(Path::new("sub"), sub_a));
         drop(processor);
         let _ = std::fs::remove_dir_all(&root);
