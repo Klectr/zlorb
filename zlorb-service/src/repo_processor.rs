@@ -2685,6 +2685,9 @@ impl RepoProcessor {
                 continue;
             }
             let rel_path = path_from_bytes(&entry.path);
+            if self._rollback_has_symlinked_ancestor(&sub_workdir, &rel_path) {
+                return false;
+            }
             let flagged_full = sub_workdir.join(&rel_path);
             let flagged_metadata = match std::fs::symlink_metadata(&flagged_full) {
                 Ok(metadata) => metadata,
@@ -2765,6 +2768,9 @@ impl RepoProcessor {
                                         std::fs::canonicalize(nested_workdir)
                                             .map(|dir| dir == flagged_path)
                                             .unwrap_or(false)
+                                            && std::fs::canonicalize(&sub_workdir)
+                                                .map(|dir| flagged_path.starts_with(dir))
+                                                .unwrap_or(false)
                                     }
                                     _ => false,
                                 }
@@ -3080,6 +3086,11 @@ impl RepoProcessor {
                                                 std::fs::canonicalize(nested_workdir)
                                                     .map(|dir| dir == flagged_path)
                                                     .unwrap_or(false)
+                                                    && std::fs::canonicalize(&sub_workdir)
+                                                        .map(|dir| {
+                                                            flagged_path.starts_with(dir)
+                                                        })
+                                                        .unwrap_or(false)
                                             }
                                             _ => false,
                                         }
@@ -9580,6 +9591,148 @@ mod tests {
         let processor = processor_for(&watched_path);
         assert!(processor._precloned_gitlink_matches(Path::new("sub"), sub_a));
         std::fs::write(watched_path.join("sub/nested/inner.txt"), "inner edit\n").unwrap();
+        assert!(!processor._precloned_gitlink_matches(Path::new("sub"), sub_a));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn preclone_check_refuses_a_flagged_file_under_a_symlinked_ancestor() {
+        let root = temp_dir("precloned-flagged-file-symlinked-ancestor");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let sub_src_path = root.join("sub-src");
+        let sub_src = git2::Repository::init_opts(&sub_src_path, &init_opts).unwrap();
+        std::fs::create_dir_all(sub_src_path.join("a")).unwrap();
+        std::fs::write(sub_src_path.join("a/b.txt"), "b one\n").unwrap();
+        std::fs::write(sub_src_path.join("sub.txt"), "sub one\n").unwrap();
+        let sub_a = commit_all(&sub_src, "sub a");
+        drop(sub_src);
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        let v1 = commit_all(&upstream, "v1");
+        write_fixture_crate(&upstream_path, "fixture-version-two");
+        commit_with_gitlink(&upstream, sub_a, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v1).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        git2::Repository::clone(
+            sub_src_path.to_string_lossy().as_ref(),
+            watched_path.join("sub"),
+        )
+        .unwrap();
+        set_index_flag(&watched_path.join("sub"), "--assume-unchanged", "a/b.txt");
+        {
+            let info_dir = watched_path.join("sub/.git/info");
+            std::fs::create_dir_all(&info_dir).unwrap();
+            std::fs::write(info_dir.join("exclude"), "/a\n").unwrap();
+        }
+
+        let processor = processor_for(&watched_path);
+        assert!(processor._precloned_gitlink_matches(Path::new("sub"), sub_a));
+        let outside_path = root.join("outside");
+        std::fs::create_dir_all(&outside_path).unwrap();
+        std::fs::write(outside_path.join("b.txt"), "b one\n").unwrap();
+        std::fs::remove_dir_all(watched_path.join("sub/a")).unwrap();
+        std::os::unix::fs::symlink(&outside_path, watched_path.join("sub/a")).unwrap();
+        assert!(!processor._precloned_gitlink_matches(Path::new("sub"), sub_a));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn preclone_check_refuses_a_flagged_gitlink_under_a_symlinked_ancestor() {
+        let root = temp_dir("precloned-flagged-gitlink-symlinked-ancestor");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let nested_src_path = root.join("nested-src");
+        let nested_src = git2::Repository::init_opts(&nested_src_path, &init_opts).unwrap();
+        std::fs::write(nested_src_path.join("inner.txt"), "inner one\n").unwrap();
+        let nested_a = commit_all(&nested_src, "nested a");
+        drop(nested_src);
+        let sub_src_path = root.join("sub-src");
+        let sub_src = git2::Repository::init_opts(&sub_src_path, &init_opts).unwrap();
+        std::fs::write(sub_src_path.join("sub.txt"), "sub one\n").unwrap();
+        let sub_a = {
+            let mut index = sub_src.index().unwrap();
+            index.add_path(Path::new("sub.txt")).unwrap();
+            let entry = git2::IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode: 0o160000,
+                uid: 0,
+                gid: 0,
+                file_size: 0,
+                id: nested_a,
+                flags: 0,
+                flags_extended: 0,
+                path: b"a/nested".to_vec(),
+            };
+            index.add(&entry).unwrap();
+            index.write().unwrap();
+            let tree_oid = index.write_tree().unwrap();
+            let tree = sub_src.find_tree(tree_oid).unwrap();
+            let sig = Signature::now("zlorb-test", "zlorb-test@example.com").unwrap();
+            sub_src
+                .commit(Some("HEAD"), &sig, &sig, "sub a", &tree, &[])
+                .unwrap()
+        };
+        drop(sub_src);
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        let v1 = commit_all(&upstream, "v1");
+        write_fixture_crate(&upstream_path, "fixture-version-two");
+        commit_with_gitlink(&upstream, sub_a, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v1).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        git2::Repository::clone(
+            sub_src_path.to_string_lossy().as_ref(),
+            watched_path.join("sub"),
+        )
+        .unwrap();
+        git2::Repository::clone(
+            nested_src_path.to_string_lossy().as_ref(),
+            watched_path.join("sub/a/nested"),
+        )
+        .unwrap();
+        set_index_flag(&watched_path.join("sub"), "--assume-unchanged", "a/nested");
+        {
+            let info_dir = watched_path.join("sub/.git/info");
+            std::fs::create_dir_all(&info_dir).unwrap();
+            std::fs::write(info_dir.join("exclude"), "/a\n").unwrap();
+        }
+
+        let processor = processor_for(&watched_path);
+        assert!(processor._precloned_gitlink_matches(Path::new("sub"), sub_a));
+        let outside_path = root.join("outside");
+        git2::Repository::clone(
+            nested_src_path.to_string_lossy().as_ref(),
+            outside_path.join("nested"),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(watched_path.join("sub/a")).unwrap();
+        std::os::unix::fs::symlink(&outside_path, watched_path.join("sub/a")).unwrap();
         assert!(!processor._precloned_gitlink_matches(Path::new("sub"), sub_a));
         drop(processor);
         let _ = std::fs::remove_dir_all(&root);
