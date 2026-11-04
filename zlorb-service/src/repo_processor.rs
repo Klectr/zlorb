@@ -2650,11 +2650,11 @@ impl RepoProcessor {
                 return false;
             };
             let file_type = metadata.file_type();
-            if rel_path.as_os_str().is_empty()
-                && name == std::ffi::OsStr::new(".git")
-                && !file_type.is_dir()
-            {
-                continue;
+            if name == std::ffi::OsStr::new(".git") {
+                if rel_path.as_os_str().is_empty() && !file_type.is_dir() {
+                    continue;
+                }
+                return false;
             }
             if file_type.is_dir() {
                 if git2::Repository::open_ext(
@@ -8054,6 +8054,72 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_classification_refuses_a_removed_gitlink_placeholder_with_a_bogus_dot_git_file_in_an_ignored_directory(
+    ) {
+        let (root, watched_path, v1, v2, _sub_a) = removed_gitlink_fixture(
+            "checkout-placeholder-removed-gitlink-ignored-dir-bogus-dot-git",
+        );
+        submodule_placeholder(&watched_path);
+        std::fs::write(
+            watched_path.join(".git/modules/sub/info/exclude"),
+            "cache/\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(watched_path.join("sub/cache/nested")).unwrap();
+        std::fs::write(
+            watched_path.join("sub/cache/nested/.git"),
+            "gitdir: /nonexistent\n",
+        )
+        .unwrap();
+        std::fs::write(watched_path.join("sub/cache/nested/inner.txt"), "inner\n").unwrap();
+        let processor = processor_for(&watched_path);
+        let (safe, preserved, _absent, _unverifiable, failed) =
+            processor._checkout_restore_paths(v1, v2, &[PathBuf::from("sub")]);
+        assert!(!failed);
+        assert!(safe.is_empty());
+        assert_eq!(preserved, vec![PathBuf::from("sub")]);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/cache/nested/.git")).unwrap(),
+            "gitdir: /nonexistent\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_classification_refuses_a_removed_gitlink_placeholder_with_a_partial_dot_git_directory_in_an_ignored_directory(
+    ) {
+        let (root, watched_path, v1, v2, _sub_a) = removed_gitlink_fixture(
+            "checkout-placeholder-removed-gitlink-ignored-dir-partial-dot-git",
+        );
+        submodule_placeholder(&watched_path);
+        std::fs::write(
+            watched_path.join(".git/modules/sub/info/exclude"),
+            "cache/\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(watched_path.join("sub/cache/nested/.git")).unwrap();
+        std::fs::write(
+            watched_path.join("sub/cache/nested/.git/HEAD"),
+            "ref: refs/heads/master\n",
+        )
+        .unwrap();
+        let processor = processor_for(&watched_path);
+        let (safe, preserved, _absent, _unverifiable, failed) =
+            processor._checkout_restore_paths(v1, v2, &[PathBuf::from("sub")]);
+        assert!(!failed);
+        assert!(safe.is_empty());
+        assert_eq!(preserved, vec![PathBuf::from("sub")]);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/cache/nested/.git/HEAD"))
+                .unwrap(),
+            "ref: refs/heads/master\n"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
