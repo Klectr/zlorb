@@ -2592,6 +2592,34 @@ impl RepoProcessor {
                 preserved.push(path.clone());
             }
         }
+        if !preserved.is_empty() {
+            let mut still_preserved = Vec::new();
+            for path in preserved {
+                let blocked_by_typechange = matches!(
+                    std::fs::symlink_metadata(workdir.join(&path)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotADirectory
+                ) && path.ancestors().skip(1).any(|ancestor| {
+                    safe.iter().any(|safe_path| safe_path == ancestor)
+                        && matches!(
+                            local_tree.get_path(ancestor),
+                            Ok(entry) if entry.filemode() != 0o40000
+                        )
+                        && matches!(
+                            fetch_tree.get_path(ancestor),
+                            Ok(entry) if entry.filemode() == 0o40000
+                        )
+                        && std::fs::symlink_metadata(workdir.join(ancestor))
+                            .map(|metadata| metadata.file_type().is_file())
+                            .unwrap_or(false)
+                });
+                if blocked_by_typechange {
+                    safe.push(path);
+                } else {
+                    still_preserved.push(path);
+                }
+            }
+            preserved = still_preserved;
+        }
         (safe, preserved, absent, unverifiable, false)
     }
 
@@ -8470,6 +8498,147 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(watched_path.join("thing/cache/debug.log")).unwrap(),
             "staged\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn file_to_dir_repo(label: &str) -> (PathBuf, PathBuf, Oid, Oid) {
+        let root = temp_dir(label);
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        std::fs::write(watched_path.join("thing"), "was a file\n").unwrap();
+        let v1 = commit_all(&watched, "v1");
+        std::fs::remove_file(watched_path.join("thing")).unwrap();
+        std::fs::create_dir_all(watched_path.join("thing")).unwrap();
+        std::fs::write(watched_path.join("thing/inner.txt"), "inner\n").unwrap();
+        let v2 = commit_all(&watched, "v2");
+        let v1_commit = watched.find_commit(v1).unwrap();
+        watched
+            .reset(v1_commit.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(v1_commit);
+        drop(watched);
+        (root, watched_path, v1, v2)
+    }
+
+    #[test]
+    fn checkout_step_accepts_file_to_dir_typechange() {
+        let (root, watched_path, v1, v2) = file_to_dir_repo("checkout-file-to-dir");
+
+        let processor = processor_for(&watched_path);
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        let remote_ref = processor
+            ._checkout_and_get_ref(Some(v1), v2, Some(&changed))
+            .unwrap();
+        assert_eq!(remote_ref.target(), Some(v2));
+        drop(remote_ref);
+        drop(processor);
+        assert!(watched_path.join("thing").is_dir());
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("thing/inner.txt")).unwrap(),
+            "inner\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_refuses_file_to_dir_typechange_when_the_file_has_local_changes() {
+        let (root, watched_path, v1, v2) =
+            file_to_dir_repo("checkout-file-to-dir-local-changes");
+        std::fs::write(watched_path.join("thing"), "local edit\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        match processor._checkout_and_get_ref(Some(v1), v2, Some(&changed)) {
+            Ok(_) => panic!(
+                "checkout must refuse when the file replaced by a directory has local changes"
+            ),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("thing"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        drop(processor);
+        assert!(watched_path.join("thing").is_file());
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("thing")).unwrap(),
+            "local edit\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_refuses_file_to_dir_typechange_when_the_file_was_replaced_by_a_symlink() {
+        let (root, watched_path, v1, v2) =
+            file_to_dir_repo("checkout-file-to-dir-symlink");
+        std::fs::remove_file(watched_path.join("thing")).unwrap();
+        std::fs::write(watched_path.join("elsewhere.txt"), "elsewhere\n").unwrap();
+        std::os::unix::fs::symlink("elsewhere.txt", watched_path.join("thing")).unwrap();
+
+        let processor = processor_for(&watched_path);
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        match processor._checkout_and_get_ref(Some(v1), v2, Some(&changed)) {
+            Ok(_) => panic!(
+                "checkout must refuse when the file replaced by a directory was replaced by a symlink"
+            ),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("thing"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        drop(processor);
+        assert!(
+            std::fs::symlink_metadata(watched_path.join("thing"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_accepts_file_to_nested_dir_typechange() {
+        let root = temp_dir("checkout-file-to-nested-dir");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        std::fs::write(watched_path.join("thing"), "was a file\n").unwrap();
+        let v1 = commit_all(&watched, "v1");
+        std::fs::remove_file(watched_path.join("thing")).unwrap();
+        std::fs::create_dir_all(watched_path.join("thing/deep")).unwrap();
+        std::fs::write(
+            watched_path.join("thing/deep/inner.txt"),
+            "nested inner\n",
+        )
+        .unwrap();
+        let v2 = commit_all(&watched, "v2");
+        let v1_commit = watched.find_commit(v1).unwrap();
+        watched
+            .reset(v1_commit.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(v1_commit);
+        drop(watched);
+
+        let processor = processor_for(&watched_path);
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        let remote_ref = processor
+            ._checkout_and_get_ref(Some(v1), v2, Some(&changed))
+            .unwrap();
+        assert_eq!(remote_ref.target(), Some(v2));
+        drop(remote_ref);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("thing/deep/inner.txt")).unwrap(),
+            "nested inner\n"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
