@@ -2934,13 +2934,159 @@ impl RepoProcessor {
                 if sub_repo.is_bare() {
                     return false;
                 }
+                let Some(sub_workdir) = sub_repo.workdir().map(|dir| dir.to_path_buf()) else {
+                    return false;
+                };
+                let Ok(mut sub_index) = sub_repo.index() else {
+                    return false;
+                };
+                if sub_index.read(true).is_err() {
+                    return false;
+                }
+                let Ok(head_tree) = sub_repo
+                    .find_commit(expected)
+                    .and_then(|commit| commit.tree())
+                else {
+                    return false;
+                };
+                let sub_file_mode = sub_repo
+                    .config()
+                    .and_then(|config| config.get_bool("core.fileMode"))
+                    .unwrap_or(true);
+                let mut skip_worktree_absent: Vec<PathBuf> = Vec::new();
+                for entry in sub_index.iter() {
+                    let skip_worktree = entry.flags & 0x4000 != 0
+                        && git2::IndexEntryExtendedFlag::from_bits_truncate(
+                            entry.flags_extended,
+                        )
+                        .is_skip_worktree();
+                    let assume_unchanged = entry.flags & 0x8000 != 0;
+                    if !skip_worktree && !assume_unchanged {
+                        continue;
+                    }
+                    let rel_path = path_from_bytes(&entry.path);
+                    if self._rollback_has_symlinked_ancestor(&sub_workdir, &rel_path) {
+                        return false;
+                    }
+                    match head_tree.get_path(&rel_path) {
+                        Ok(tree_entry)
+                            if tree_entry.id() == entry.id
+                                && tree_entry.filemode() as u32 == entry.mode => {}
+                        _ => return false,
+                    }
+                    let flagged_full = sub_workdir.join(&rel_path);
+                    let flagged_metadata = match std::fs::symlink_metadata(&flagged_full) {
+                        Ok(metadata) => metadata,
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::NotFound
+                                && skip_worktree
+                                && !assume_unchanged =>
+                        {
+                            skip_worktree_absent.push(rel_path);
+                            continue;
+                        }
+                        Err(_) => return false,
+                    };
+                    let flagged_type = flagged_metadata.file_type();
+                    let verified = match entry.mode {
+                        0o120000 => {
+                            flagged_type.is_symlink()
+                                && std::fs::read_link(&flagged_full)
+                                    .ok()
+                                    .and_then(|target| {
+                                        use std::os::unix::ffi::OsStrExt;
+                                        Oid::hash_object(
+                                            git2::ObjectType::Blob,
+                                            target.as_os_str().as_bytes(),
+                                        )
+                                        .ok()
+                                    })
+                                    == Some(entry.id)
+                        }
+                        0o100644 | 0o100755 => {
+                            if !flagged_type.is_file() {
+                                return false;
+                            }
+                            if sub_file_mode {
+                                use std::os::unix::fs::PermissionsExt;
+                                let disk_mode =
+                                    if flagged_metadata.permissions().mode() & 0o111 != 0 {
+                                        0o100755
+                                    } else {
+                                        0o100644
+                                    };
+                                if disk_mode != entry.mode {
+                                    return false;
+                                }
+                            }
+                            sub_repo
+                                .blob_writer(Some(&rel_path))
+                                .ok()
+                                .and_then(|mut writer| {
+                                    let mut file =
+                                        std::fs::File::open(&flagged_full).ok()?;
+                                    std::io::copy(&mut file, &mut writer).ok()?;
+                                    writer.commit().ok()
+                                })
+                                == Some(entry.id)
+                        }
+                        0o160000 => {
+                            if !flagged_type.is_dir() {
+                                return false;
+                            }
+                            match git2::Repository::open_ext(
+                                &flagged_full,
+                                git2::RepositoryOpenFlags::NO_SEARCH,
+                                Vec::<&Path>::new(),
+                            ) {
+                                Ok(nested) => {
+                                    !nested.is_bare()
+                                        && match (
+                                            nested.workdir(),
+                                            std::fs::canonicalize(&flagged_full),
+                                        ) {
+                                            (Some(nested_workdir), Ok(flagged_path)) => {
+                                                std::fs::canonicalize(nested_workdir)
+                                                    .map(|dir| dir == flagged_path)
+                                                    .unwrap_or(false)
+                                            }
+                                            _ => false,
+                                        }
+                                        && nested.head().ok().and_then(|head| head.target())
+                                            == Some(entry.id)
+                                        && self._rollback_gitlink_matches(
+                                            &flagged_full,
+                                            entry.id,
+                                            include_ignored,
+                                            false,
+                                        )
+                                }
+                                Err(_) => false,
+                            }
+                        }
+                        _ => return false,
+                    };
+                    if !verified {
+                        return false;
+                    }
+                }
                 let mut status_options = git2::StatusOptions::new();
                 status_options.include_untracked(true);
                 status_options.include_ignored(include_ignored);
-                matches!(
-                    sub_repo.statuses(Some(&mut status_options)),
-                    Ok(statuses) if statuses.is_empty()
-                )
+                match sub_repo.statuses(Some(&mut status_options)) {
+                    Ok(statuses) => statuses.iter().all(|status_entry| {
+                        status_entry.status() == git2::Status::WT_DELETED
+                            && skip_worktree_absent
+                                .contains(&path_from_bytes(status_entry.path_bytes()))
+                            && matches!(
+                                std::fs::symlink_metadata(sub_workdir.join(
+                                    path_from_bytes(status_entry.path_bytes())
+                                )),
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound
+                            )
+                    }),
+                    Err(_) => false,
+                }
             }
             Err(_) => {
                 let Ok(entries) = std::fs::read_dir(full_path) else {
@@ -9258,6 +9404,190 @@ mod tests {
         assert!(processor._precloned_gitlink_matches(Path::new("sub"), sub_a));
         drop(processor);
         assert!(!watched_path.join("sub/sub.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fast_forward_accepts_an_added_gitlink_whose_preclone_holds_a_skip_worktree_absent_entry()
+    {
+        let (root, watched_path, _v1, v2, _sub_a, _sub_b) =
+            added_gitlink_preclone_fixture("full-flow-added-gitlink-precloned-sw-absent");
+        set_index_flag(&watched_path.join("sub"), "--skip-worktree", "sub.txt");
+        std::fs::remove_file(watched_path.join("sub/sub.txt")).unwrap();
+
+        processor_for(&watched_path).update_from_remote().unwrap();
+
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert!(!watched_path.join("sub/sub.txt").exists());
+        assert!(
+            std::fs::read_to_string(watched_path.join("src/main.rs"))
+                .unwrap()
+                .contains("fixture-version-two")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fast_forward_refuses_an_added_gitlink_whose_preclone_holds_a_skip_worktree_entry_edited_on_disk()
+    {
+        let (root, watched_path, v1, _v2, _sub_a, _sub_b) =
+            added_gitlink_preclone_fixture("full-flow-added-gitlink-precloned-sw-edited");
+        set_index_flag(&watched_path.join("sub"), "--skip-worktree", "sub.txt");
+        std::fs::write(watched_path.join("sub/sub.txt"), "hidden edit\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("sub"),
+            "unexpected error: {:?}",
+            err
+        );
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
+            "hidden edit\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_accepts_a_gitlink_whose_submodule_holds_a_skip_worktree_absent_entry() {
+        let (root, watched_path, v1, v2, _sub_a, _sub_b) =
+            gitlink_fixture("rollback-gitlink-sw-absent");
+        set_index_flag(&watched_path.join("sub"), "--skip-worktree", "sub.txt");
+        std::fs::remove_file(watched_path.join("sub/sub.txt")).unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert!(!watched_path.join("sub/sub.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_gitlink_whose_submodule_hides_an_edit_behind_skip_worktree() {
+        let (root, watched_path, v1, v2, _sub_a, _sub_b) =
+            gitlink_fixture("rollback-gitlink-sw-edited");
+        set_index_flag(&watched_path.join("sub"), "--skip-worktree", "sub.txt");
+        std::fs::write(watched_path.join("sub/sub.txt"), "hidden edit\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
+            "hidden edit\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_gitlink_whose_submodule_holds_an_assume_unchanged_absent_entry() {
+        let (root, watched_path, v1, v2, _sub_a, _sub_b) =
+            gitlink_fixture("rollback-gitlink-au-absent");
+        set_index_flag(&watched_path.join("sub"), "--assume-unchanged", "sub.txt");
+        std::fs::remove_file(watched_path.join("sub/sub.txt")).unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert!(!watched_path.join("sub/sub.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_gitlink_with_a_skip_worktree_absent_entry_and_a_flagged_edit() {
+        let (root, watched_path, v1, v2, _sub_a, _sub_b) =
+            gitlink_fixture("rollback-gitlink-sw-absent-plus-edit");
+        set_index_flag(&watched_path.join("sub"), "--skip-worktree", "sub.txt");
+        std::fs::remove_file(watched_path.join("sub/sub.txt")).unwrap();
+        set_index_flag(&watched_path.join("sub"), "--assume-unchanged", ".gitignore");
+        std::fs::write(watched_path.join("sub/.gitignore"), "other.db\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert!(!watched_path.join("sub/sub.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/.gitignore")).unwrap(),
+            "other.db\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_gitlink_check_rejects_dirt_inside_a_flagged_nested_gitlink() {
+        let root = temp_dir("rollback-gitlink-flagged-nested-dirty");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        commit_all(&watched, "v1");
+        drop(watched);
+        let sub_path = watched_path.join("sub");
+        let sub = git2::Repository::init_opts(&sub_path, &init_opts).unwrap();
+        std::fs::write(sub_path.join("sub.txt"), "sub one\n").unwrap();
+        let nested_path = sub_path.join("nested");
+        let nested = git2::Repository::init_opts(&nested_path, &init_opts).unwrap();
+        std::fs::write(nested_path.join("inner.txt"), "inner one\n").unwrap();
+        let nested_a = commit_all(&nested, "nested a");
+        drop(nested);
+        let sub_a = {
+            let mut index = sub.index().unwrap();
+            index.clear().unwrap();
+            index.add_path(Path::new("sub.txt")).unwrap();
+            let entry = git2::IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode: 0o160000,
+                uid: 0,
+                gid: 0,
+                file_size: 0,
+                id: nested_a,
+                flags: 6,
+                flags_extended: 0,
+                path: b"nested".to_vec(),
+            };
+            index.add(&entry).unwrap();
+            index.write().unwrap();
+            let tree_oid = index.write_tree().unwrap();
+            let tree = sub.find_tree(tree_oid).unwrap();
+            let sig = Signature::now("zlorb-test", "zlorb-test@example.com").unwrap();
+            sub.commit(Some("HEAD"), &sig, &sig, "sub a", &tree, &[])
+                .unwrap()
+        };
+        {
+            let tree = sub.find_commit(sub_a).unwrap().tree().unwrap();
+            let nested_entry = tree.get_path(Path::new("nested")).unwrap();
+            assert_eq!(nested_entry.filemode(), 0o160000);
+        }
+        drop(sub);
+
+        let processor = processor_for(&watched_path);
+        assert!(processor._rollback_gitlink_matches(&sub_path, sub_a, false, false));
+
+        std::fs::write(nested_path.join("inner.txt"), "dirty\n").unwrap();
+        set_index_flag(&sub_path, "--assume-unchanged", "nested");
+        assert!(!processor._rollback_gitlink_matches(&sub_path, sub_a, false, false));
+
+        std::fs::write(nested_path.join("inner.txt"), "inner one\n").unwrap();
+        set_index_flag(&sub_path, "--no-assume-unchanged", "nested");
+        set_index_flag(&sub_path, "--skip-worktree", "nested");
+        std::fs::write(nested_path.join("inner.txt"), "dirty\n").unwrap();
+        assert!(!processor._rollback_gitlink_matches(&sub_path, sub_a, false, false));
+        drop(processor);
         let _ = std::fs::remove_dir_all(&root);
     }
 
