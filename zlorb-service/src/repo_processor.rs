@@ -1017,6 +1017,12 @@ impl RepoProcessor {
                     };
                     let is_full_path = position + 1 == components.len();
                     let blocks_descent = !is_full_path && !metadata.is_dir();
+                    if is_full_path
+                        && entry.kind() == Some(git2::ObjectType::Commit)
+                        && self._precloned_gitlink_matches(&prefix, entry.id())
+                    {
+                        break;
+                    }
                     if (is_full_path || blocks_descent)
                         && index.get_path(&prefix, 0).is_none()
                     {
@@ -2506,6 +2512,108 @@ impl RepoProcessor {
         false
     }
 
+    fn _precloned_gitlink_matches(&self, path: &Path, expected: Oid) -> bool {
+        let Some(workdir) = self.repo.workdir().map(|workdir| workdir.to_path_buf()) else {
+            return false;
+        };
+        let full_path = workdir.join(path);
+        if !std::fs::symlink_metadata(&full_path)
+            .map(|metadata| metadata.file_type().is_dir())
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        let Ok(sub_repo) = git2::Repository::open_ext(
+            &full_path,
+            git2::RepositoryOpenFlags::NO_SEARCH,
+            Vec::<&Path>::new(),
+        ) else {
+            return false;
+        };
+        if sub_repo.is_bare() {
+            return false;
+        }
+        let workdir_matches = match (sub_repo.workdir(), std::fs::canonicalize(&full_path)) {
+            (Some(sub_workdir), Ok(path)) => std::fs::canonicalize(sub_workdir)
+                .map(|dir| dir == path)
+                .unwrap_or(false),
+            _ => false,
+        };
+        if !workdir_matches {
+            return false;
+        }
+        if sub_repo.head().ok().and_then(|head| head.target()) != Some(expected) {
+            return false;
+        }
+        let mut status_options = git2::StatusOptions::new();
+        status_options.include_untracked(true);
+        status_options.include_ignored(false);
+        status_options.recurse_untracked_dirs(true);
+        matches!(
+            sub_repo.statuses(Some(&mut status_options)),
+            Ok(statuses) if statuses.is_empty()
+        )
+    }
+
+    fn _seed_added_gitlink_preclones(
+        &self,
+        local_oid: Oid,
+        fetch_oid: Oid,
+        changed_paths: &[PathBuf],
+    ) -> Vec<PathBuf> {
+        let (Ok(local_commit), Ok(fetch_commit)) = (
+            self.repo.find_commit(local_oid),
+            self.repo.find_commit(fetch_oid),
+        ) else {
+            return Vec::new();
+        };
+        let (Ok(local_tree), Ok(fetch_tree)) = (local_commit.tree(), fetch_commit.tree())
+        else {
+            return Vec::new();
+        };
+        let Ok(mut index) = self.repo.index() else {
+            return Vec::new();
+        };
+        let mut seeded = Vec::new();
+        for path in changed_paths {
+            if local_tree.get_path(path).is_ok() {
+                continue;
+            }
+            let Ok(fetch_entry) = fetch_tree.get_path(path) else {
+                continue;
+            };
+            if fetch_entry.filemode() != 0o160000 {
+                continue;
+            }
+            if !self._precloned_gitlink_matches(path, fetch_entry.id()) {
+                continue;
+            }
+            use std::os::unix::ffi::OsStrExt;
+            let path_bytes = path.as_os_str().as_bytes().to_vec();
+            let entry = git2::IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode: 0o160000,
+                uid: 0,
+                gid: 0,
+                file_size: 0,
+                id: fetch_entry.id(),
+                flags: path_bytes.len().min(0x0FFF) as u16,
+                flags_extended: 0,
+                path: path_bytes,
+            };
+            if index.add(&entry).is_ok() {
+                seeded.push(path.clone());
+            }
+        }
+        if !seeded.is_empty() && index.write().is_err() {
+            return Vec::new();
+        }
+        seeded
+    }
+
     fn _rollback_gitlink_matches(
         &self,
         full_path: &Path,
@@ -3180,6 +3288,7 @@ impl RepoProcessor {
             checkout.force();
             checkout.disable_pathspec_match(true);
             let mut absent_paths: Vec<PathBuf> = Vec::new();
+            let mut seeded_only_checkout = false;
             if let Some(paths) = changed_paths {
                 let paths = match local_oid {
                     Some(local_oid) => {
@@ -3256,13 +3365,27 @@ impl RepoProcessor {
                         )));
                     }
                 };
+                let seeded_preclones = match local_oid {
+                    Some(local_oid) => {
+                        self._seed_added_gitlink_preclones(local_oid, fetch_oid, &paths)
+                    }
+                    None => Vec::new(),
+                };
+                seeded_only_checkout = !paths.is_empty()
+                    && paths
+                        .iter()
+                        .all(|path| seeded_preclones.contains(path));
                 for path in &paths {
-                    checkout.path(path);
+                    if !seeded_preclones.contains(path) {
+                        checkout.path(path);
+                    }
                 }
             }
-            self.repo
-                .checkout_head(Some(&mut checkout))
-                .map_err(ZlorbError::Git)?;
+            if !seeded_only_checkout {
+                self.repo
+                    .checkout_head(Some(&mut checkout))
+                    .map_err(ZlorbError::Git)?;
+            }
             if let (Some(local_oid), Some(paths)) = (local_oid, changed_paths) {
                 self._verify_checked_out_paths(local_oid, fetch_oid, paths)?;
             }
@@ -7854,6 +7977,14 @@ mod tests {
         assert_eq!(remote_ref.target(), Some(v2));
         drop(remote_ref);
         drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
+            "sub one\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/data.db")).unwrap(),
+            "build output\n"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -8296,10 +8427,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn fast_forward_refuses_an_added_gitlink_whose_precloned_submodule_holds_an_ignored_file()
-    {
-        let root = temp_dir("full-flow-added-gitlink-precloned-ignored");
+    fn added_gitlink_preclone_fixture(
+        label: &str,
+    ) -> (PathBuf, PathBuf, Oid, Oid, Oid, Oid) {
+        let root = temp_dir(label);
         let upstream_path = root.join("upstream");
         let watched_path = root.join("watched");
         let mut init_opts = RepositoryInitOptions::new();
@@ -8312,9 +8443,11 @@ mod tests {
         std::fs::write(up_sub_path.join(".gitignore"), "data.db\n").unwrap();
         std::fs::write(up_sub_path.join("sub.txt"), "sub one\n").unwrap();
         let sub_a = commit_all(&up_sub, "sub a");
+        std::fs::write(up_sub_path.join("sub.txt"), "sub two\n").unwrap();
+        let sub_b = commit_all(&up_sub, "sub b");
         drop(up_sub);
         write_fixture_crate(&upstream_path, "fixture-version-two");
-        commit_with_gitlink(&upstream, sub_a, "v2");
+        let v2 = commit_with_gitlink(&upstream, sub_a, "v2");
         drop(upstream);
         git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
             .unwrap();
@@ -8325,12 +8458,86 @@ mod tests {
             .unwrap();
         drop(checkout);
         drop(watched);
-        git2::Repository::clone(
+        let sub_clone = git2::Repository::clone(
             up_sub_path.to_string_lossy().as_ref(),
             watched_path.join("sub"),
         )
         .unwrap();
+        let a_commit = sub_clone.find_commit(sub_a).unwrap();
+        sub_clone
+            .reset(a_commit.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(a_commit);
+        drop(sub_clone);
+        (root, watched_path, v1, v2, sub_a, sub_b)
+    }
+
+    #[test]
+    fn fast_forward_accepts_an_added_gitlink_whose_precloned_submodule_holds_an_ignored_file()
+    {
+        let (root, watched_path, _v1, v2, sub_a, _sub_b) =
+            added_gitlink_preclone_fixture("full-flow-added-gitlink-precloned-ignored");
         std::fs::write(watched_path.join("sub/data.db"), "build output\n").unwrap();
+
+        processor_for(&watched_path).update_from_remote().unwrap();
+
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        let index = watched.index().unwrap();
+        assert_eq!(index.get_path(Path::new("sub"), 0).unwrap().id, sub_a);
+        drop(index);
+        drop(watched);
+        assert!(
+            std::fs::read_to_string(watched_path.join("src/main.rs"))
+                .unwrap()
+                .contains("fixture-version-two")
+        );
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
+            "sub one\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/data.db")).unwrap(),
+            "build output\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fast_forward_refuses_an_added_gitlink_whose_preclone_is_at_the_wrong_pointer() {
+        let (root, watched_path, v1, _v2, _sub_a, sub_b) =
+            added_gitlink_preclone_fixture("full-flow-added-gitlink-precloned-wrong-pointer");
+        let sub_path = watched_path.join("sub");
+        let sub = git2::Repository::open(&sub_path).unwrap();
+        let b_commit = sub.find_commit(sub_b).unwrap();
+        sub.reset(b_commit.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(b_commit);
+        drop(sub);
+
+        let processor = processor_for(&watched_path);
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("sub"),
+            "unexpected error: {:?}",
+            err
+        );
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
+            "sub two\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fast_forward_refuses_an_added_gitlink_whose_preclone_holds_an_untracked_file() {
+        let (root, watched_path, v1, _v2, _sub_a, _sub_b) =
+            added_gitlink_preclone_fixture("full-flow-added-gitlink-precloned-untracked");
+        std::fs::write(watched_path.join("sub/notes.txt"), "user notes\n").unwrap();
 
         let processor = processor_for(&watched_path);
         let err = processor.update_from_remote().unwrap_err();
@@ -8348,8 +8555,32 @@ mod tests {
             "sub one\n"
         );
         assert_eq!(
-            std::fs::read_to_string(watched_path.join("sub/data.db")).unwrap(),
-            "build output\n"
+            std::fs::read_to_string(watched_path.join("sub/notes.txt")).unwrap(),
+            "user notes\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fast_forward_refuses_an_added_gitlink_whose_preclone_holds_a_tracked_edit() {
+        let (root, watched_path, v1, _v2, _sub_a, _sub_b) =
+            added_gitlink_preclone_fixture("full-flow-added-gitlink-precloned-dirty");
+        std::fs::write(watched_path.join("sub/sub.txt"), "user edit\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("sub"),
+            "unexpected error: {:?}",
+            err
+        );
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
+            "user edit\n"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
