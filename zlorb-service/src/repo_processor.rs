@@ -2284,7 +2284,10 @@ impl RepoProcessor {
             let fetch_id = fetch_entry.as_ref().map(|entry| entry.id());
             let local_mode = local_entry.as_ref().map(|entry| entry.filemode());
             let fetch_mode = fetch_entry.as_ref().map(|entry| entry.filemode());
-            if std::fs::symlink_metadata(workdir.join(&path)).is_err() {
+            if matches!(
+                std::fs::symlink_metadata(workdir.join(&path)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound
+            ) {
                 if local_id.is_some() && fetch_id.is_some() {
                     preserved.push(path);
                 } else {
@@ -8848,6 +8851,76 @@ mod tests {
         assert!(unverifiable.is_empty());
         assert!(preserved.contains(&PathBuf::from("link.txt")));
         assert!(!safe.contains(&PathBuf::from("link.txt")));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_scoped_fallback_preserves_a_local_only_path_whose_metadata_cannot_be_read() {
+        let root = temp_dir("rollback-fallback-local-only-metadata-error");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        std::fs::create_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::write(watched_path.join("sub").join("b.txt"), "one-b\n").unwrap();
+        let v1 = commit_all(&watched, "v1");
+        write_fixture_crate(&watched_path, "fixture-version-two");
+        std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
+        let v2 = commit_all(&watched, "v2");
+        drop(watched);
+        std::fs::write(watched_path.join("sub"), "blocker\n").unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(watched_path.join("sub").join("b.txt"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotADirectory
+        );
+
+        let processor = processor_for(&watched_path);
+        let (safe, preserved, unverifiable) = processor
+            ._rollback_scoped_fallback_paths(v1, v2)
+            .unwrap();
+        assert!(unverifiable.is_empty());
+        assert_eq!(preserved, vec![PathBuf::from("sub").join("b.txt")]);
+        assert!(!safe.contains(&PathBuf::from("sub").join("b.txt")));
+        assert!(safe.contains(&PathBuf::from("src/main.rs")));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_scoped_fallback_preserves_a_fetch_only_path_whose_metadata_cannot_be_read() {
+        let root = temp_dir("rollback-fallback-fetch-only-metadata-error");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        let v1 = commit_all(&watched, "v1");
+        write_fixture_crate(&watched_path, "fixture-version-two");
+        std::fs::create_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::write(watched_path.join("sub").join("b.txt"), "two-b\n").unwrap();
+        let v2 = commit_all(&watched, "v2");
+        drop(watched);
+        std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
+        std::fs::write(watched_path.join("sub"), "blocker\n").unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(watched_path.join("sub").join("b.txt"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotADirectory
+        );
+
+        let processor = processor_for(&watched_path);
+        let (safe, preserved, unverifiable) = processor
+            ._rollback_scoped_fallback_paths(v1, v2)
+            .unwrap();
+        assert!(unverifiable.is_empty());
+        assert_eq!(preserved, vec![PathBuf::from("sub").join("b.txt")]);
+        assert!(!safe.contains(&PathBuf::from("sub").join("b.txt")));
+        assert!(safe.contains(&PathBuf::from("src/main.rs")));
         drop(processor);
         let _ = std::fs::remove_dir_all(&root);
     }
