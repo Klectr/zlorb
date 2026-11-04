@@ -2171,8 +2171,10 @@ impl RepoProcessor {
         let Some(workdir) = self.repo.workdir() else {
             return false;
         };
-        std::fs::symlink_metadata(workdir.join(path)).is_err()
-            && self._index_path_is_skip_worktree(path)
+        matches!(
+            std::fs::symlink_metadata(workdir.join(path)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        ) && self._index_path_is_skip_worktree(path)
     }
 
     fn _advance_index_entries_to_tree(
@@ -4130,6 +4132,114 @@ mod tests {
         assert_eq!(
             hidden.unverifiable,
             vec![PathBuf::from("sub").join("b.txt")]
+        );
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn skip_worktree_absent_check_requires_the_file_to_be_absent_not_unreadable() {
+        let (root, watched_path) =
+            hidden_metadata_loop_repo("skip-worktree-absent-check-loop", "--skip-worktree");
+        let processor = processor_for(&watched_path);
+        assert!(!processor
+            ._path_is_skip_worktree_absent(&PathBuf::from("sub").join("b.txt")));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+
+        let (root, watched_path, _v1, _v2) = two_file_repo("skip-worktree-absent-check-deleted");
+        set_index_flag(&watched_path, "--skip-worktree", "b.txt");
+        std::fs::remove_file(watched_path.join("b.txt")).unwrap();
+        let processor = processor_for(&watched_path);
+        assert!(processor._path_is_skip_worktree_absent(Path::new("b.txt")));
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn nested_upstream_repo(label: &str) -> (PathBuf, PathBuf, Oid, Oid) {
+        let root = temp_dir(label);
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        std::fs::create_dir_all(upstream_path.join("sub")).unwrap();
+        std::fs::write(upstream_path.join("sub").join("b.txt"), "one-b\n").unwrap();
+        let v1 = commit_all(&upstream, "v1");
+        write_fixture_crate(&upstream_path, "fixture-version-two");
+        std::fs::write(upstream_path.join("sub").join("b.txt"), "two-b\n").unwrap();
+        let v2 = commit_all(&upstream, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        (root, watched_path, v1, v2)
+    }
+
+    fn loop_the_sub_parent(watched_path: &Path) {
+        std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
+        std::os::unix::fs::symlink("sub", watched_path.join("sub")).unwrap();
+    }
+
+    #[test]
+    fn build_refusal_names_a_skip_worktree_file_whose_metadata_cannot_be_read() {
+        let (root, watched_path, _v1, v2) = nested_upstream_repo("build-refusal-metadata-loop");
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v2).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        set_index_flag(&watched_path, "--skip-worktree", "sub/b.txt");
+        loop_the_sub_parent(&watched_path);
+        let mut processor = processor_for(&watched_path);
+        processor.config.out_dir = Some("dist-out".to_string());
+        let err = processor.update_from_remote().unwrap_err();
+        let message = format!("{:?}", err);
+        assert!(message.contains("Refusing to build"), "{}", message);
+        assert!(
+            message.contains("local changes to tracked files (sub/b.txt)"),
+            "{}",
+            message
+        );
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fast_forward_guard_refuses_a_skip_worktree_file_whose_metadata_cannot_be_read() {
+        let (root, watched_path, v1, v2) = nested_upstream_repo("ff-guard-metadata-loop");
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v1).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        set_index_flag(&watched_path, "--skip-worktree", "sub/b.txt");
+        loop_the_sub_parent(&watched_path);
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        assert!(changed.contains(&PathBuf::from("sub").join("b.txt")));
+        let err = {
+            let fetch_ref = processor
+                .repo
+                .find_reference("refs/remotes/origin/master")
+                .unwrap();
+            let fetch_commit = processor
+                .repo
+                .reference_to_annotated_commit(&fetch_ref)
+                .unwrap();
+            processor
+                ._refuse_if_update_would_overwrite(&fetch_commit, Some(&changed))
+                .unwrap_err()
+        };
+        let message = format!("{:?}", err);
+        assert!(
+            message.contains("local changes to tracked files (sub/b.txt) would be overwritten"),
+            "{}",
+            message
         );
         drop(processor);
         let _ = std::fs::remove_dir_all(&root);
