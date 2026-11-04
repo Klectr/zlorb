@@ -2058,6 +2058,25 @@ impl RepoProcessor {
         fetch_oid: Oid,
         changed_paths: &[PathBuf],
     ) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>, bool) {
+        self._classify_restore_paths(local_oid, fetch_oid, changed_paths, true)
+    }
+
+    fn _checkout_restore_paths(
+        &self,
+        local_oid: Oid,
+        fetch_oid: Oid,
+        changed_paths: &[PathBuf],
+    ) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>, bool) {
+        self._classify_restore_paths(local_oid, fetch_oid, changed_paths, false)
+    }
+
+    fn _classify_restore_paths(
+        &self,
+        local_oid: Oid,
+        fetch_oid: Oid,
+        changed_paths: &[PathBuf],
+        gitlink_ignored_blocks: bool,
+    ) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>, bool) {
         let mut load_failed = false;
         let local_commit = match self.repo.find_commit(local_oid) {
             Ok(commit) => Some(commit),
@@ -2168,7 +2187,13 @@ impl RepoProcessor {
             };
             if fetch_recheck == CleanRecheck::Match
                 || self._rollback_structured_matches(
-                    &workdir, path, local_id, local_mode, fetch_id, fetch_mode,
+                    &workdir,
+                    path,
+                    local_id,
+                    local_mode,
+                    fetch_id,
+                    fetch_mode,
+                    gitlink_ignored_blocks,
                 )
             {
                 safe.push(path.clone());
@@ -2318,7 +2343,7 @@ impl RepoProcessor {
                 self._rollback_disk_recheck(&workdir, &path, fetch_id, fetch_mode);
             if fetch_recheck == CleanRecheck::Match
                 || self._rollback_structured_matches(
-                    &workdir, &path, local_id, local_mode, fetch_id, fetch_mode,
+                    &workdir, &path, local_id, local_mode, fetch_id, fetch_mode, true,
                 )
             {
                 safe.push(path);
@@ -2443,6 +2468,7 @@ impl RepoProcessor {
         local_mode: Option<i32>,
         fetch_id: Option<Oid>,
         fetch_mode: Option<i32>,
+        gitlink_ignored_blocks: bool,
     ) -> bool {
         let full_path = workdir.join(path);
         let Ok(metadata) = std::fs::symlink_metadata(&full_path) else {
@@ -2451,15 +2477,18 @@ impl RepoProcessor {
         if !metadata.file_type().is_dir() {
             return false;
         }
-        for (entry_id, entry_mode) in [(local_id, local_mode), (fetch_id, fetch_mode)] {
+        for (entry_id, entry_mode, other_mode) in [
+            (local_id, local_mode, fetch_mode),
+            (fetch_id, fetch_mode, local_mode),
+        ] {
             let Some(expected) = entry_id else {
                 continue;
             };
-            let both_gitlinks =
-                local_mode == Some(0o160000) && fetch_mode == Some(0o160000);
+            let include_ignored = other_mode != Some(0o160000)
+                && (gitlink_ignored_blocks || other_mode.is_some());
             let matches = match entry_mode {
                 Some(0o160000) => {
-                    self._rollback_gitlink_matches(&full_path, expected, !both_gitlinks)
+                    self._rollback_gitlink_matches(&full_path, expected, include_ignored)
                 }
                 Some(0o40000) => match self.repo.find_tree(expected) {
                     Ok(tree) => self._rollback_dir_matches_tree(workdir, path, &tree),
@@ -2959,14 +2988,14 @@ impl RepoProcessor {
         let mut classification_failed = false;
         if !regular.is_empty() {
             let (_safe, paths, _absent, unverifiable_paths, failed) =
-                self._rollback_restore_paths(fetch_oid, fetch_oid, &regular);
+                self._checkout_restore_paths(fetch_oid, fetch_oid, &regular);
             classified.extend(paths);
             unverifiable.extend(unverifiable_paths);
             classification_failed |= failed;
         }
         if !gitlinks.is_empty() {
             let (_safe, paths, _absent, unverifiable_paths, failed) =
-                self._rollback_restore_paths(local_oid, fetch_oid, &gitlinks);
+                self._checkout_restore_paths(local_oid, fetch_oid, &gitlinks);
             classified.extend(paths);
             unverifiable.extend(unverifiable_paths);
             classification_failed |= failed;
@@ -3059,7 +3088,7 @@ impl RepoProcessor {
                 let paths = match local_oid {
                     Some(local_oid) => {
                         let (mut safe, classified, absent, unverifiable, classification_failed) =
-                            self._rollback_restore_paths(local_oid, fetch_oid, paths);
+                            self._checkout_restore_paths(local_oid, fetch_oid, paths);
                         absent_paths = absent;
                         let mut preserved = Vec::new();
                         for path in classified {
@@ -7643,6 +7672,272 @@ mod tests {
         let v2 = commit_with_gitlink(&watched, sub_b, "v2");
         drop(watched);
         (root, watched_path, v1, v2, sub_a, sub_b)
+    }
+
+    fn commit_without_gitlink(repo: &git2::Repository, parent: Oid, message: &str) -> Oid {
+        let mut index = repo.index().unwrap();
+        index.clear().unwrap();
+        index.add_path(Path::new("Cargo.toml")).unwrap();
+        index.add_path(Path::new("src/main.rs")).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig = Signature::now("zlorb-test", "zlorb-test@example.com").unwrap();
+        let parent_commit = repo.find_commit(parent).unwrap();
+        repo.commit(None, &sig, &sig, message, &tree, &[&parent_commit])
+            .unwrap()
+    }
+
+    fn reset_sub_to(watched_path: &Path, oid: Oid) {
+        let sub_path = watched_path.join("sub");
+        let sub = git2::Repository::open(&sub_path).unwrap();
+        let commit = sub.find_commit(oid).unwrap();
+        sub.reset(commit.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+    }
+
+    fn removed_gitlink_fixture(
+        label: &str,
+    ) -> (PathBuf, PathBuf, Oid, Oid, Oid) {
+        let (root, watched_path, v1, _v2, sub_a, _sub_b) = gitlink_fixture(label);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let v2 = commit_without_gitlink(&watched, v1, "v2-removed");
+        drop(watched);
+        reset_sub_to(&watched_path, sub_a);
+        (root, watched_path, v1, v2, sub_a)
+    }
+
+    fn added_gitlink_fixture(label: &str) -> (PathBuf, PathBuf, Oid, Oid, Oid) {
+        let root = temp_dir(label);
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        let v1 = commit_all(&watched, "v1");
+        let sub_path = watched_path.join("sub");
+        let sub = git2::Repository::init_opts(&sub_path, &init_opts).unwrap();
+        std::fs::write(sub_path.join(".gitignore"), "data.db\n").unwrap();
+        std::fs::write(sub_path.join("sub.txt"), "sub one\n").unwrap();
+        let sub_a = commit_all(&sub, "sub a");
+        drop(sub);
+        let v2 = commit_with_gitlink(&watched, sub_a, "v2");
+        drop(watched);
+        (root, watched_path, v1, v2, sub_a)
+    }
+
+    #[test]
+    fn checkout_step_accepts_a_removed_gitlink_holding_only_an_ignored_file() {
+        let (root, watched_path, v1, v2, _sub_a) =
+            removed_gitlink_fixture("checkout-removed-gitlink-ignored");
+        std::fs::write(watched_path.join("sub/data.db"), "build output\n").unwrap();
+        let processor = processor_for(&watched_path);
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        let remote_ref = processor
+            ._checkout_and_get_ref(Some(v1), v2, Some(&changed))
+            .unwrap();
+        assert_eq!(remote_ref.target(), Some(v2));
+        drop(remote_ref);
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_accepts_an_added_gitlink_precloned_at_the_fetched_pointer_holding_only_an_ignored_file(
+    ) {
+        let (root, watched_path, v1, v2, _sub_a) =
+            added_gitlink_fixture("checkout-added-gitlink-ignored");
+        std::fs::write(watched_path.join("sub/data.db"), "build output\n").unwrap();
+        let processor = processor_for(&watched_path);
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        let remote_ref = processor
+            ._checkout_and_get_ref(Some(v1), v2, Some(&changed))
+            .unwrap();
+        assert_eq!(remote_ref.target(), Some(v2));
+        drop(remote_ref);
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_refuses_a_removed_gitlink_holding_an_untracked_file() {
+        let (root, watched_path, v1, v2, _sub_a) =
+            removed_gitlink_fixture("checkout-removed-gitlink-untracked");
+        std::fs::write(watched_path.join("sub/notes.txt"), "user notes\n").unwrap();
+        let processor = processor_for(&watched_path);
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        match processor._checkout_and_get_ref(Some(v1), v2, Some(&changed)) {
+            Ok(_) => panic!("a removed gitlink holding an untracked file must refuse the checkout"),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("sub"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/notes.txt")).unwrap(),
+            "user notes\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_checkout_verify_accepts_a_removed_gitlink_holding_only_an_ignored_file() {
+        let (root, watched_path, v1, v2, _sub_a) =
+            removed_gitlink_fixture("post-checkout-verify-removed-gitlink-ignored");
+        std::fs::write(watched_path.join("sub/data.db"), "build output\n").unwrap();
+        let processor = processor_for(&watched_path);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        processor._verify_checked_out_paths(v1, v2, &changed).unwrap();
+        drop(processor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_a_removed_gitlink_holding_only_an_ignored_file() {
+        let (root, watched_path, v1, v2, _sub_a) =
+            removed_gitlink_fixture("rollback-removed-gitlink-ignored");
+        std::fs::write(watched_path.join("sub/data.db"), "precious\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/data.db")).unwrap(),
+            "precious\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_preserves_an_added_gitlink_holding_only_an_ignored_file() {
+        let (root, watched_path, v1, v2, _sub_a) =
+            added_gitlink_fixture("rollback-added-gitlink-ignored");
+        std::fs::write(watched_path.join("sub/data.db"), "precious\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert!(!processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/data.db")).unwrap(),
+            "precious\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn removed_gitlink_holding_only_an_ignored_file_fast_forwards() {
+        let root = temp_dir("full-flow-removed-gitlink-ignored");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        let up_sub_path = upstream_path.join("sub");
+        let up_sub = git2::Repository::init_opts(&up_sub_path, &init_opts).unwrap();
+        std::fs::write(up_sub_path.join(".gitignore"), "data.db\n").unwrap();
+        std::fs::write(up_sub_path.join("sub.txt"), "sub one\n").unwrap();
+        let sub_a = commit_all(&up_sub, "sub a");
+        drop(up_sub);
+        let v1 = commit_with_gitlink(&upstream, sub_a, "v1");
+        write_fixture_crate(&upstream_path, "fixture-version-two");
+        let v2 = commit_without_gitlink(&upstream, v1, "v2");
+        upstream
+            .reference("refs/heads/master", v2, true, "test")
+            .unwrap();
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v1).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        std::fs::remove_dir_all(watched_path.join("sub")).ok();
+        git2::Repository::clone(
+            up_sub_path.to_string_lossy().as_ref(),
+            watched_path.join("sub"),
+        )
+        .unwrap();
+        std::fs::write(watched_path.join("sub/data.db"), "build output\n").unwrap();
+
+        processor_for(&watched_path).update_from_remote().unwrap();
+
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        drop(watched);
+        assert!(
+            std::fs::read_to_string(watched_path.join("src/main.rs"))
+                .unwrap()
+                .contains("fixture-version-two")
+        );
+        assert!(!watched_path.join("sub").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fast_forward_refuses_an_added_gitlink_whose_precloned_submodule_holds_an_ignored_file()
+    {
+        let root = temp_dir("full-flow-added-gitlink-precloned-ignored");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        let v1 = commit_all(&upstream, "v1");
+        let up_sub_path = upstream_path.join("sub");
+        let up_sub = git2::Repository::init_opts(&up_sub_path, &init_opts).unwrap();
+        std::fs::write(up_sub_path.join(".gitignore"), "data.db\n").unwrap();
+        std::fs::write(up_sub_path.join("sub.txt"), "sub one\n").unwrap();
+        let sub_a = commit_all(&up_sub, "sub a");
+        drop(up_sub);
+        write_fixture_crate(&upstream_path, "fixture-version-two");
+        commit_with_gitlink(&upstream, sub_a, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v1).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+        git2::Repository::clone(
+            up_sub_path.to_string_lossy().as_ref(),
+            watched_path.join("sub"),
+        )
+        .unwrap();
+        std::fs::write(watched_path.join("sub/data.db"), "build output\n").unwrap();
+
+        let processor = processor_for(&watched_path);
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("sub"),
+            "unexpected error: {:?}",
+            err
+        );
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
+            "sub one\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/data.db")).unwrap(),
+            "build output\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
