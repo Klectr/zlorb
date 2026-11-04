@@ -3998,6 +3998,127 @@ impl RepoProcessor {
         )))
     }
 
+    fn _checkout_paths_one_by_one(
+        &self,
+        local_oid: Oid,
+        fetch_oid: Oid,
+        paths: &[PathBuf],
+        seeded_preclones: &[PathBuf],
+    ) -> Result<Vec<PathBuf>, ZlorbError> {
+        let mut ordered: Vec<&PathBuf> = paths
+            .iter()
+            .filter(|path| !seeded_preclones.contains(path))
+            .collect();
+        ordered.sort_by_key(|path| path.components().count());
+        let mut written: Vec<PathBuf> = Vec::new();
+        let mut newly_absent: Vec<PathBuf> = Vec::new();
+        for path in ordered {
+            if self._checkout_one_path(local_oid, fetch_oid, path, &written)? {
+                newly_absent.push(path.clone());
+            } else {
+                written.push(path.clone());
+            }
+        }
+        Ok(newly_absent)
+    }
+
+    fn _checkout_one_path(
+        &self,
+        local_oid: Oid,
+        fetch_oid: Oid,
+        path: &Path,
+        written: &[PathBuf],
+    ) -> Result<bool, ZlorbError> {
+        if !written.is_empty() {
+            if let Ok(fetch_tree) = self
+                .repo
+                .find_commit(fetch_oid)
+                .and_then(|commit| commit.tree())
+            {
+                if fetch_tree.get_path(path).is_err() {
+                    let ancestor_is_file = path
+                        .ancestors()
+                        .skip(1)
+                        .filter(|ancestor| written.contains(&ancestor.to_path_buf()))
+                        .any(|ancestor| {
+                            matches!(
+                                fetch_tree.get_path(ancestor),
+                                Ok(entry) if entry.filemode() != 0o40000
+                            )
+                        });
+                    if ancestor_is_file {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        let (safe, classified, absent, unverifiable, classification_failed) =
+            self._checkout_restore_paths(local_oid, fetch_oid, &[path.to_path_buf()]);
+        if !absent.is_empty() {
+            return Ok(true);
+        }
+        if !unverifiable.is_empty() {
+            Logger::error(format!(
+                "Preserving {} in {} during checkout: the file could not be checked against its clean conversion in the daemon environment, so it is not being overwritten and the update is refused",
+                path.display(),
+                self.config.name
+            ));
+            return Err(ZlorbError::Other(format!(
+                "Refusing to fast-forward {}: {} in {} could not be checked against its clean conversion in the daemon environment during the checkout, so it is not being overwritten. The re-check errors above name the conversion that could not be applied; make it runnable by the daemon so this file can be verified",
+                self.config.name,
+                path.display(),
+                self.config.name
+            )));
+        }
+        let mut writable = safe;
+        for checked in classified {
+            if !classification_failed && self._checkout_dir_is_safe(local_oid, fetch_oid, &checked)
+            {
+                writable.push(checked);
+            } else if classification_failed {
+                Logger::error(format!(
+                    "Preserving {} in {} during checkout: the changed paths could not be classified because a commit, tree, or the working directory could not be loaded, so it is not being overwritten and the update is refused",
+                    path.display(),
+                    self.config.name
+                ));
+                return Err(ZlorbError::Other(format!(
+                    "Refusing to fast-forward {}: the changed path {} in {} could not be classified during the checkout because a commit, tree, or the working directory could not be loaded, so it is not being overwritten",
+                    self.config.name,
+                    path.display(),
+                    self.config.name
+                )));
+            } else {
+                Logger::error(format!(
+                    "Preserving local changes to {} in {} during checkout: the file changed while the checkout was writing the earlier paths and matches neither the current commit nor the fetched commit, so it is not being overwritten and the update is refused",
+                    path.display(),
+                    self.config.name
+                ));
+                return Err(ZlorbError::Other(format!(
+                    "Refusing to fast-forward {}: local changes to {} in {} landed while the checkout was writing and would be overwritten. Stash the work, move it to another branch, or discard it — do not commit it on this branch, the daemon can only fast-forward this branch",
+                    self.config.name,
+                    path.display(),
+                    self.config.name
+                )));
+            }
+        }
+        if writable.is_empty() {
+            return Err(ZlorbError::Other(format!(
+                "Refusing to fast-forward {}: the changed path {} in {} could not be classified during the checkout, so it is not being overwritten",
+                self.config.name,
+                path.display(),
+                self.config.name
+            )));
+        }
+        let mut checkout = git2::build::CheckoutBuilder::default();
+        checkout.force();
+        checkout.disable_pathspec_match(true);
+        checkout.path(path);
+        self.repo
+            .checkout_head(Some(&mut checkout))
+            .map_err(ZlorbError::Git)?;
+        Ok(false)
+    }
+
     fn _checkout_and_get_ref(
         &self,
         local_oid: Option<Oid>,
@@ -4016,9 +4137,6 @@ impl RepoProcessor {
                     self.config.name
                 )));
             }
-            let mut checkout = git2::build::CheckoutBuilder::default();
-            checkout.force();
-            checkout.disable_pathspec_match(true);
             let mut absent_paths: Vec<PathBuf> = Vec::new();
             let mut seeded_only_checkout = false;
             if let Some(paths) = changed_paths {
@@ -4107,16 +4225,17 @@ impl RepoProcessor {
                     && paths
                         .iter()
                         .all(|path| seeded_preclones.contains(path));
-                for path in &paths {
-                    if !seeded_preclones.contains(path) {
-                        checkout.path(path);
+                if !seeded_only_checkout {
+                    if let Some(local_oid) = local_oid {
+                        let mut newly_absent = self._checkout_paths_one_by_one(
+                            local_oid,
+                            fetch_oid,
+                            &paths,
+                            &seeded_preclones,
+                        )?;
+                        absent_paths.append(&mut newly_absent);
                     }
                 }
-            }
-            if !seeded_only_checkout {
-                self.repo
-                    .checkout_head(Some(&mut checkout))
-                    .map_err(ZlorbError::Git)?;
             }
             if let (Some(local_oid), Some(paths)) = (local_oid, changed_paths) {
                 self._verify_checked_out_paths(local_oid, fetch_oid, paths)?;
@@ -7546,6 +7665,66 @@ mod tests {
     }
 
     #[test]
+    fn checkout_one_path_refuses_an_edit_that_landed_after_an_earlier_path_was_written() {
+        let (root, watched_path, v1, v2) = two_file_repo("checkout-one-path-mid-edit");
+        let processor = processor_for(&watched_path);
+        move_ref_to_v2(&processor, v2);
+        processor
+            ._checkout_one_path(v1, v2, Path::new("a.txt"), &[])
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("a.txt")).unwrap(),
+            "two-a\n"
+        );
+        std::fs::write(watched_path.join("b.txt"), "race edit\n").unwrap();
+        match processor._checkout_one_path(
+            v1,
+            v2,
+            Path::new("b.txt"),
+            &[PathBuf::from("a.txt")],
+        ) {
+            Ok(_) => panic!("the per-path checkout must refuse a mid-checkout edit"),
+            Err(e) => assert!(
+                format!("{:?}", e).contains("b.txt"),
+                "unexpected error: {:?}",
+                e
+            ),
+        }
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("b.txt")).unwrap(),
+            "race edit\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_one_path_skips_a_descendant_removed_by_a_typechange_ancestor_write() {
+        let (root, watched_path, v1, v2) =
+            dir_to_file_repo_with_gitignore("checkout-one-path-typechange-skip", "*.log\n");
+        let processor = processor_for(&watched_path);
+        move_ref_to_v2(&processor, v2);
+        processor
+            ._checkout_one_path(v1, v2, Path::new("thing"), &[])
+            .unwrap();
+        assert!(watched_path.join("thing").is_file());
+        processor
+            ._checkout_one_path(
+                v1,
+                v2,
+                Path::new("thing/inner.txt"),
+                &[PathBuf::from("thing")],
+            )
+            .unwrap();
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("thing")).unwrap(),
+            "now a file\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn checkout_step_refuses_deletion_made_after_the_ref_moved() {
         let (root, watched_path, v1, v2) = two_file_repo("checkout-revalidate-deletion");
         let processor = processor_for(&watched_path);
@@ -9089,6 +9268,33 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(watched_path.join("sub/data.db")).unwrap(),
             "build output\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_step_seeded_only_update_preserves_an_unrelated_local_edit() {
+        let (root, watched_path, v1, v2, _sub_a) =
+            added_gitlink_fixture("checkout-seeded-only-unrelated-edit");
+        std::fs::write(watched_path.join("sub/data.db"), "build output\n").unwrap();
+        std::fs::write(watched_path.join("Cargo.toml"), "user edit\n").unwrap();
+        let processor = processor_for(&watched_path);
+        move_ref_to_v2(&processor, v2);
+        let changed = processor._changed_paths(v1, v2).unwrap();
+        assert_eq!(changed, vec![PathBuf::from("sub")]);
+        let remote_ref = processor
+            ._checkout_and_get_ref(Some(v1), v2, Some(&changed))
+            .unwrap();
+        assert_eq!(remote_ref.target(), Some(v2));
+        drop(remote_ref);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("Cargo.toml")).unwrap(),
+            "user edit\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
+            "sub one\n"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
