@@ -1544,7 +1544,11 @@ impl RepoProcessor {
                 } else {
                     let stderr_text = String::from_utf8_lossy(&stderr);
                     let filter_failed = stderr_text.lines().any(|line| {
-                        line.starts_with("error: external filter '") && line.contains("failed")
+                        (line.starts_with("error: external filter '") && line.contains("failed"))
+                            || (line.starts_with("error: initialization for subprocess '")
+                                && line.contains("failed"))
+                            || line.starts_with("error: cannot fork to run subprocess '")
+                            || line.starts_with("error: cannot run ")
                     });
                     if filter_failed {
                         Logger::error(format!(
@@ -4218,6 +4222,107 @@ mod tests {
             ),
             CleanRecheck::Unverifiable
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn unset_repo_config(watched: &Path, key: &str) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(watched)
+            .args(["config", "--unset", key])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    fn process_filter_entry_id(watched: &Path) -> Oid {
+        let repo = git2::Repository::open(watched).unwrap();
+        let mut index = repo.index().unwrap();
+        index.read(true).unwrap();
+        index.get_path(Path::new("data.txt"), 0).unwrap().id
+    }
+
+    #[test]
+    fn missing_process_filter_is_unverifiable_not_a_local_change() {
+        let (root, watched_path, v1, _v2) =
+            external_filter_repo("process-filter-missing", "version two\n");
+        unset_repo_config(&watched_path, "filter.strip.clean");
+        set_repo_config(
+            &watched_path,
+            "filter.strip.process",
+            "zlorb-nonexistent-filter-command",
+        );
+        let entry_id = process_filter_entry_id(&watched_path);
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert_eq!(
+            processor._recheck_after_external_clean_filter_with_timeout(
+                &watched_path,
+                Path::new("data.txt"),
+                &watched_path.join("data.txt"),
+                entry_id,
+                std::time::Duration::from_secs(30)
+            ),
+            CleanRecheck::Unverifiable
+        );
+        let tracked = processor._tracked_local_changes().unwrap();
+        assert!(tracked.changes.is_empty());
+        assert_eq!(tracked.unverifiable, vec![PathBuf::from("data.txt")]);
+        let err = processor.update_from_remote().unwrap_err();
+        let message = format!("{:?}", err);
+        assert!(
+            message.contains("could not be checked against their clean conversion"),
+            "{}",
+            message
+        );
+        assert!(
+            !message.contains("local changes to tracked files"),
+            "{}",
+            message
+        );
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        assert_eq!(
+            std::fs::read(watched_path.join("data.txt")).unwrap(),
+            b"Xhello\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn process_filter_failing_its_handshake_is_unverifiable_not_a_local_change() {
+        let (root, watched_path, _v1, _v2) =
+            external_filter_repo("process-filter-handshake", "version two\n");
+        let script = root.join("bad-handshake.py");
+        std::fs::write(
+            &script,
+            "import sys\ndef pkt_read():\n    hdr = sys.stdin.buffer.read(4)\n    if not hdr:\n        return None\n    n = int(hdr, 16)\n    if n == 0:\n        return b''\n    return sys.stdin.buffer.read(n - 4)\ndef pkt_write(data):\n    sys.stdout.buffer.write(b'%04x' % (len(data) + 4))\n    sys.stdout.buffer.write(data)\n    sys.stdout.buffer.flush()\nwhile True:\n    line = pkt_read()\n    if line in (b'', None):\n        break\npkt_write(b'welcome\\n')\npkt_write(b'version=2\\n')\npkt_write(b'capability=clean\\n')\nsys.stdout.buffer.write(b'0000')\nsys.stdout.buffer.flush()\nimport time\ntime.sleep(1)\n",
+        )
+        .unwrap();
+        unset_repo_config(&watched_path, "filter.strip.clean");
+        set_repo_config(
+            &watched_path,
+            "filter.strip.process",
+            &format!("python3 {}", script.to_string_lossy()),
+        );
+        let entry_id = process_filter_entry_id(&watched_path);
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        let processor = processor_for(&watched_path);
+        assert_eq!(
+            processor._recheck_after_external_clean_filter_with_timeout(
+                &watched_path,
+                Path::new("data.txt"),
+                &watched_path.join("data.txt"),
+                entry_id,
+                std::time::Duration::from_secs(30)
+            ),
+            CleanRecheck::Unverifiable
+        );
+        let tracked = processor._tracked_local_changes().unwrap();
+        assert!(tracked.changes.is_empty());
+        assert_eq!(tracked.unverifiable, vec![PathBuf::from("data.txt")]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
