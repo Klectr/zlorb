@@ -1746,80 +1746,71 @@ impl RepoProcessor {
         if !preclone_paths.is_empty() {
             match self.repo.index() {
                 Ok(mut index) => {
-                    if let Err(e) = index.read(true) {
-                        Logger::error(format!(
-                            "Could not reload the index of {} during rollback to drop the seeded gitlink entries ({}), so they are being preserved instead: {}",
-                            self.config.name,
-                            display_paths(&preclone_paths),
-                            e
-                        ));
-                    } else {
-                        let mut removed = Vec::new();
-                        let mut removal_failed = false;
-                        for path in &preclone_paths {
-                            match index.remove_path(path) {
-                                Ok(_) => removed.push(path.clone()),
-                                Err(e) => {
-                                    removal_failed = true;
-                                    Logger::error(format!(
-                                        "Could not drop the seeded gitlink entry for {} in {} from the index during rollback, so no seeded entries are being dropped and they are being preserved instead: {}",
-                                        path.display(),
-                                        self.config.name,
-                                        e
-                                    ));
+                    let mut removed = Vec::new();
+                    let mut removal_failed = false;
+                    for path in &preclone_paths {
+                        match index.remove_path(path) {
+                            Ok(_) => removed.push(path.clone()),
+                            Err(e) => {
+                                removal_failed = true;
+                                Logger::error(format!(
+                                    "Could not drop the seeded gitlink entry for {} in {} from the index during rollback, so no seeded entries are being dropped and they are being preserved instead: {}",
+                                    path.display(),
+                                    self.config.name,
+                                    e
+                                ));
+                            }
+                        }
+                    }
+                    if removal_failed {
+                        if let Ok(fetch_tree) = self
+                            .repo
+                            .find_commit(fetch_oid)
+                            .and_then(|commit| commit.tree())
+                        {
+                            for path in &removed {
+                                if let Ok(fetch_entry) = fetch_tree.get_path(path) {
+                                    use std::os::unix::ffi::OsStrExt;
+                                    let path_bytes =
+                                        path.as_os_str().as_bytes().to_vec();
+                                    let entry = git2::IndexEntry {
+                                        ctime: git2::IndexTime::new(0, 0),
+                                        mtime: git2::IndexTime::new(0, 0),
+                                        dev: 0,
+                                        ino: 0,
+                                        mode: 0o160000,
+                                        uid: 0,
+                                        gid: 0,
+                                        file_size: 0,
+                                        id: fetch_entry.id(),
+                                        flags: path_bytes.len().min(0x0FFF) as u16,
+                                        flags_extended: 0,
+                                        path: path_bytes,
+                                    };
+                                    let _ = index.add(&entry);
                                 }
                             }
                         }
-                        if removal_failed {
-                            if let Ok(fetch_tree) = self
-                                .repo
-                                .find_commit(fetch_oid)
-                                .and_then(|commit| commit.tree())
-                            {
+                    } else if !removed.is_empty() {
+                        match index.write() {
+                            Ok(_) => {
                                 for path in &removed {
-                                    if let Ok(fetch_entry) = fetch_tree.get_path(path) {
-                                        use std::os::unix::ffi::OsStrExt;
-                                        let path_bytes =
-                                            path.as_os_str().as_bytes().to_vec();
-                                        let entry = git2::IndexEntry {
-                                            ctime: git2::IndexTime::new(0, 0),
-                                            mtime: git2::IndexTime::new(0, 0),
-                                            dev: 0,
-                                            ino: 0,
-                                            mode: 0o160000,
-                                            uid: 0,
-                                            gid: 0,
-                                            file_size: 0,
-                                            id: fetch_entry.id(),
-                                            flags: path_bytes.len().min(0x0FFF) as u16,
-                                            flags_extended: 0,
-                                            path: path_bytes,
-                                        };
-                                        let _ = index.add(&entry);
-                                    }
-                                }
-                            }
-                        } else if !removed.is_empty() {
-                            match index.write() {
-                                Ok(_) => {
-                                    for path in &removed {
-                                        Logger::info(format!(
-                                            "Restored the pre-cloned submodule at {} in {} to its pre-update state during rollback: the gitlink entry the failed update added to the index is dropped and the clone on disk is left untouched",
-                                            path.display(),
-                                            self.config.name
-                                        ));
-                                    }
-                                    restored_preclone_paths = removed;
-                                }
-                                Err(e) => {
-                                    let _ = index.read(true);
-                                    Logger::error(format!(
-                                        "Could not drop the seeded gitlink entries ({}) in {} from the index during rollback, so they are being preserved instead: {}",
-                                        display_paths(&removed),
-                                        self.config.name,
-                                        e
+                                    Logger::info(format!(
+                                        "Restored the pre-cloned submodule at {} in {} to its pre-update state during rollback: the gitlink entry the failed update added to the index is dropped and the clone on disk is left untouched",
+                                        path.display(),
+                                        self.config.name
                                     ));
                                 }
+                                restored_preclone_paths = removed;
+                            }
+                            Err(e) => {
+                                let _ = index.read(true);
+                                Logger::error(format!(
+                                    "Could not drop the seeded gitlink entries ({}) in {} from the index during rollback, so they are being preserved instead: {}",
+                                    display_paths(&removed),
+                                    self.config.name,
+                                    e
+                                ));
                             }
                         }
                     }
@@ -2667,37 +2658,106 @@ impl RepoProcessor {
         let Some(sub_workdir) = sub_repo.workdir().map(|dir| dir.to_path_buf()) else {
             return false;
         };
+        let sub_file_mode = sub_repo
+            .config()
+            .and_then(|config| config.get_bool("core.fileMode"))
+            .unwrap_or(true);
+        let mut skip_worktree_absent: Vec<PathBuf> = Vec::new();
         for entry in sub_index.iter() {
-            let flagged = git2::IndexEntryExtendedFlag::from_bits_truncate(
-                entry.flags_extended,
-            )
-            .is_skip_worktree()
-                || entry.flags & 0x8000 != 0;
-            if !flagged {
+            let skip_worktree = entry.flags & 0x4000 != 0
+                && git2::IndexEntryExtendedFlag::from_bits_truncate(entry.flags_extended)
+                    .is_skip_worktree();
+            let assume_unchanged = entry.flags & 0x8000 != 0;
+            if !skip_worktree && !assume_unchanged {
                 continue;
             }
             let rel_path = path_from_bytes(&entry.path);
             let flagged_full = sub_workdir.join(&rel_path);
-            let Ok(flagged_metadata) = std::fs::symlink_metadata(&flagged_full) else {
-                continue;
+            let flagged_metadata = match std::fs::symlink_metadata(&flagged_full) {
+                Ok(metadata) => metadata,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        && skip_worktree
+                        && !assume_unchanged =>
+                {
+                    skip_worktree_absent.push(rel_path);
+                    continue;
+                }
+                Err(_) => return false,
             };
             let flagged_type = flagged_metadata.file_type();
-            let disk_id = if flagged_type.is_symlink() {
-                std::fs::read_link(&flagged_full).ok().and_then(|target| {
-                    use std::os::unix::ffi::OsStrExt;
-                    Oid::hash_object(git2::ObjectType::Blob, target.as_os_str().as_bytes())
+            let verified = match entry.mode {
+                0o120000 => {
+                    flagged_type.is_symlink()
+                        && std::fs::read_link(&flagged_full)
+                            .ok()
+                            .and_then(|target| {
+                                use std::os::unix::ffi::OsStrExt;
+                                Oid::hash_object(
+                                    git2::ObjectType::Blob,
+                                    target.as_os_str().as_bytes(),
+                                )
+                                .ok()
+                            })
+                            == Some(entry.id)
+                }
+                0o100644 | 0o100755 => {
+                    if !flagged_type.is_file() {
+                        return false;
+                    }
+                    if sub_file_mode {
+                        use std::os::unix::fs::PermissionsExt;
+                        let disk_mode =
+                            if flagged_metadata.permissions().mode() & 0o111 != 0 {
+                                0o100755
+                            } else {
+                                0o100644
+                            };
+                        if disk_mode != entry.mode {
+                            return false;
+                        }
+                    }
+                    sub_repo
+                        .blob_writer(Some(&rel_path))
                         .ok()
-                })
-            } else if flagged_type.is_file() {
-                sub_repo.blob_writer(Some(&rel_path)).ok().and_then(|mut writer| {
-                    let mut file = std::fs::File::open(&flagged_full).ok()?;
-                    std::io::copy(&mut file, &mut writer).ok()?;
-                    writer.commit().ok()
-                })
-            } else {
-                return false;
+                        .and_then(|mut writer| {
+                            let mut file = std::fs::File::open(&flagged_full).ok()?;
+                            std::io::copy(&mut file, &mut writer).ok()?;
+                            writer.commit().ok()
+                        })
+                        == Some(entry.id)
+                }
+                0o160000 => {
+                    if !flagged_type.is_dir() {
+                        return false;
+                    }
+                    match git2::Repository::open_ext(
+                        &flagged_full,
+                        git2::RepositoryOpenFlags::NO_SEARCH,
+                        Vec::<&Path>::new(),
+                    ) {
+                        Ok(nested) => {
+                            !nested.is_bare()
+                                && match (
+                                    nested.workdir(),
+                                    std::fs::canonicalize(&flagged_full),
+                                ) {
+                                    (Some(nested_workdir), Ok(flagged_path)) => {
+                                        std::fs::canonicalize(nested_workdir)
+                                            .map(|dir| dir == flagged_path)
+                                            .unwrap_or(false)
+                                    }
+                                    _ => false,
+                                }
+                                && nested.head().ok().and_then(|head| head.target())
+                                    == Some(entry.id)
+                        }
+                        Err(_) => false,
+                    }
+                }
+                _ => return false,
             };
-            if disk_id != Some(entry.id) {
+            if !verified {
                 return false;
             }
         }
@@ -2705,10 +2765,20 @@ impl RepoProcessor {
         status_options.include_untracked(true);
         status_options.include_ignored(false);
         status_options.recurse_untracked_dirs(true);
-        matches!(
-            sub_repo.statuses(Some(&mut status_options)),
-            Ok(statuses) if statuses.is_empty()
-        )
+        match sub_repo.statuses(Some(&mut status_options)) {
+            Ok(statuses) => statuses.iter().all(|status_entry| {
+                status_entry.status() == git2::Status::WT_DELETED
+                    && skip_worktree_absent
+                        .contains(&path_from_bytes(status_entry.path_bytes()))
+                    && matches!(
+                        std::fs::symlink_metadata(
+                            sub_workdir.join(path_from_bytes(status_entry.path_bytes()))
+                        ),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+                    )
+            }),
+            Err(_) => false,
+        }
     }
 
     fn _seed_added_gitlink_preclones(
@@ -9150,6 +9220,145 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
     }
+
+
+    #[test]
+    fn fast_forward_refuses_an_added_gitlink_whose_preclone_hides_a_deletion_behind_assume_unchanged()
+    {
+        let (root, watched_path, v1, _v2, _sub_a, _sub_b) =
+            added_gitlink_preclone_fixture(
+                "full-flow-added-gitlink-precloned-assume-unchanged-absent",
+            );
+        set_entry_flags(&watched_path, 0x8000, 0);
+        std::fs::remove_file(watched_path.join("sub/sub.txt")).unwrap();
+
+        let processor = processor_for(&watched_path);
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("sub"),
+            "unexpected error: {:?}",
+            err
+        );
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        assert!(!watched_path.join("sub/sub.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn preclone_check_accepts_a_skip_worktree_absent_flagged_entry() {
+        let (root, watched_path, _v1, _v2, sub_a, _sub_b) =
+            added_gitlink_preclone_fixture("precloned-skip-worktree-absent");
+        set_index_flag(&watched_path.join("sub"), "--skip-worktree", "sub.txt");
+        std::fs::remove_file(watched_path.join("sub/sub.txt")).unwrap();
+
+        let processor = processor_for(&watched_path);
+        assert!(processor._precloned_gitlink_matches(Path::new("sub"), sub_a));
+        drop(processor);
+        assert!(!watched_path.join("sub/sub.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fast_forward_refuses_an_added_gitlink_whose_preclone_hides_a_mode_change_behind_assume_unchanged()
+    {
+        let (root, watched_path, v1, _v2, _sub_a, _sub_b) =
+            added_gitlink_preclone_fixture(
+                "full-flow-added-gitlink-precloned-assume-unchanged-mode",
+            );
+        set_entry_flags(&watched_path, 0x8000, 0);
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let sub_txt = watched_path.join("sub/sub.txt");
+            let mut permissions = std::fs::metadata(&sub_txt).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&sub_txt, permissions).unwrap();
+        }
+
+        let processor = processor_for(&watched_path);
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("sub"),
+            "unexpected error: {:?}",
+            err
+        );
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fast_forward_refuses_an_added_gitlink_whose_preclone_hides_a_symlink_swap_behind_assume_unchanged()
+    {
+        let (root, watched_path, v1, _v2, _sub_a, _sub_b) =
+            added_gitlink_preclone_fixture(
+                "full-flow-added-gitlink-precloned-assume-unchanged-symlink",
+            );
+        set_entry_flags(&watched_path, 0x8000, 0);
+        let sub_txt = watched_path.join("sub/sub.txt");
+        std::fs::remove_file(&sub_txt).unwrap();
+        std::os::unix::fs::symlink("sub one\n", &sub_txt).unwrap();
+
+        let processor = processor_for(&watched_path);
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("sub"),
+            "unexpected error: {:?}",
+            err
+        );
+        drop(processor);
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        assert!(std::fs::symlink_metadata(&sub_txt)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_drops_a_seeded_gitlink_entry_held_only_in_memory() {
+        let (root, watched_path, v1, v2, sub_a, _sub_b) =
+            added_gitlink_preclone_fixture("rollback-seeded-unseed-memory-only");
+        let processor = processor_for(&watched_path);
+        {
+            let mut index = processor.repo.index().unwrap();
+            let entry = git2::IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode: 0o160000,
+                uid: 0,
+                gid: 0,
+                file_size: 0,
+                id: sub_a,
+                flags: 3,
+                flags_extended: 0,
+                path: b"sub".to_vec(),
+            };
+            index.add(&entry).unwrap();
+        }
+        set_index_flag(&watched_path, "--skip-worktree", "src/main.rs");
+        std::fs::write(watched_path.join(".git/index"), b"not an index").unwrap();
+        assert!(processor._rollback_fast_forward(v1, v2));
+        assert_eq!(head_oid(&processor.repo), v1);
+        let index = processor.repo.index().unwrap();
+        assert!(index.get_path(Path::new("sub"), 0).is_none());
+        drop(index);
+        drop(processor);
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("sub/sub.txt")).unwrap(),
+            "sub one\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
 
     #[test]
     fn rollback_restores_gitlink_whose_head_matches_the_fetched_commit() {
