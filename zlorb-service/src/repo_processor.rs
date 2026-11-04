@@ -120,6 +120,186 @@ fn kill_pipe_holders(targets: &[String]) {
     }
 }
 
+static RECHECK_CGROUP_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn own_cgroup_dir() -> Option<PathBuf> {
+    let text = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let rel = text
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?
+        .trim()
+        .trim_start_matches('/');
+    let mut dir = PathBuf::from("/sys/fs/cgroup");
+    if !rel.is_empty() {
+        dir.push(rel);
+    }
+    Some(dir)
+}
+
+fn attach_self_to_cgroup(procs_path: &std::ffi::CStr) {
+    let pid = unsafe { libc::getpid() } as u32;
+    let mut reversed = [0u8; 10];
+    let mut rlen = 0;
+    let mut n = pid;
+    if n == 0 {
+        reversed[0] = b'0';
+        rlen = 1;
+    }
+    while n > 0 {
+        reversed[rlen] = b'0' + (n % 10) as u8;
+        rlen += 1;
+        n /= 10;
+    }
+    let mut data = [0u8; 11];
+    for i in 0..rlen {
+        data[i] = reversed[rlen - 1 - i];
+    }
+    data[rlen] = b'\n';
+    let len = rlen + 1;
+    unsafe {
+        let fd = libc::open(procs_path.as_ptr(), libc::O_WRONLY);
+        if fd >= 0 {
+            libc::write(fd, data.as_ptr() as *const libc::c_void, len);
+            libc::close(fd);
+        }
+    }
+}
+
+fn cgroup_member_pids(dir: &Path) -> Vec<libc::pid_t> {
+    std::fs::read_to_string(dir.join("cgroup.procs"))
+        .map(|text| {
+            text.lines()
+                .filter_map(|line| line.trim().parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn process_state(pid: libc::pid_t) -> Option<char> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let close = stat.rfind(')')?;
+    stat[close + 1..].split_whitespace().next()?.chars().next()
+}
+
+struct RecheckCgroup {
+    dir: PathBuf,
+    procs_path: std::ffi::CString,
+}
+
+impl RecheckCgroup {
+    fn create() -> Option<Self> {
+        Self::create_in(&own_cgroup_dir()?)
+    }
+
+    fn create_in(base: &Path) -> Option<Self> {
+        use std::os::unix::ffi::OsStrExt;
+        for _ in 0..16 {
+            let n = RECHECK_CGROUP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = base.join(format!("zlorb-recheck-{}-{}", std::process::id(), n));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => return None,
+            }
+            let procs = dir.join("cgroup.procs");
+            let procs_path = if procs.exists() {
+                std::ffi::CString::new(procs.as_os_str().as_bytes()).ok()
+            } else {
+                None
+            };
+            match procs_path {
+                Some(procs_path) => return Some(Self { dir, procs_path }),
+                None => {
+                    let _ = std::fs::remove_dir(&dir);
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
+    fn member_pids(&self) -> Vec<libc::pid_t> {
+        cgroup_member_pids(&self.dir)
+    }
+
+    fn subtree_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = vec![self.dir.clone()];
+        let mut index = 0;
+        while index < dirs.len() {
+            let current = dirs[index].clone();
+            if let Ok(entries) = std::fs::read_dir(&current) {
+                for entry in entries.flatten() {
+                    if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                        dirs.push(entry.path());
+                    }
+                }
+            }
+            index += 1;
+        }
+        dirs.reverse();
+        dirs
+    }
+
+    fn populated(&self) -> bool {
+        self.subtree_dirs().iter().any(|dir| {
+            cgroup_member_pids(dir)
+                .iter()
+                .any(|pid| !matches!(process_state(*pid), Some('Z') | Some('X') | None))
+        })
+    }
+
+    fn kill_and_remove(&self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while self.populated() {
+            for dir in self.subtree_dirs() {
+                if std::fs::write(dir.join("cgroup.kill"), "1").is_err() {
+                    for pid in cgroup_member_pids(&dir) {
+                        unsafe {
+                            libc::kill(pid, libc::SIGKILL);
+                        }
+                    }
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if self.populated() {
+            Logger::error(format!(
+                "Could not kill every process in the recheck cgroup {} before the deadline; leaving it in place",
+                self.dir.display()
+            ));
+        }
+        let remove_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            let mut remaining = false;
+            for dir in self.subtree_dirs() {
+                if std::fs::remove_dir(&dir).is_err() && dir.exists() {
+                    remaining = true;
+                }
+            }
+            if !remaining || std::time::Instant::now() >= remove_deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+}
+
+impl Drop for RecheckCgroup {
+    fn drop(&mut self) {
+        self.kill_and_remove();
+    }
+}
+
+fn cleanup_recheck_cgroup(cgroup: &Option<RecheckCgroup>) {
+    if let Some(cgroup) = cgroup {
+        cgroup.kill_and_remove();
+    }
+}
+
 fn set_nonblocking(fd: libc::c_int) {
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
@@ -1540,6 +1720,7 @@ impl RepoProcessor {
             conversion
         ));
         use std::os::unix::process::CommandExt;
+        let cgroup = RecheckCgroup::create();
         let mut command = Command::new("git");
         command
             .arg("-C")
@@ -1551,6 +1732,15 @@ impl RepoProcessor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0);
+        if let Some(cgroup) = &cgroup {
+            let procs_path = cgroup.procs_path.clone();
+            unsafe {
+                command.pre_exec(move || {
+                    attach_self_to_cgroup(&procs_path);
+                    Ok(())
+                });
+            }
+        }
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -1561,10 +1751,23 @@ impl RepoProcessor {
                     conversion,
                     e
                 ));
+                cleanup_recheck_cgroup(&cgroup);
                 return CleanRecheck::Unverifiable;
             }
         };
         let pgid = child.id() as libc::pid_t;
+        if let Some(cgroup) = &cgroup {
+            if Path::new(&format!("/proc/{pgid}")).exists()
+                && !cgroup.member_pids().contains(&pgid)
+            {
+                Logger::error(format!(
+                    "git hash-object for {} in {} did not land in its recheck cgroup while applying {}; a fully detached descendant of the filter will not be killed at the end of this recheck",
+                    path.display(),
+                    self.config.name,
+                    conversion
+                ));
+            }
+        }
         let mut drains = match (child.stdout.take(), child.stderr.take()) {
             (Some(stdout), Some(stderr)) => PipeDrains::new(stdout, stderr),
             _ => {
@@ -1577,6 +1780,7 @@ impl RepoProcessor {
                     self.config.name,
                     conversion
                 ));
+                cleanup_recheck_cgroup(&cgroup);
                 return CleanRecheck::Unverifiable;
             }
         };
@@ -1595,6 +1799,7 @@ impl RepoProcessor {
                             timeout.as_secs(),
                             conversion
                         ));
+                        cleanup_recheck_cgroup(&cgroup);
                         let drain_deadline = pipe_drain_deadline();
                         let _ = drains.finish(drain_deadline, pgid);
                         return CleanRecheck::Unverifiable;
@@ -1612,6 +1817,7 @@ impl RepoProcessor {
                         conversion,
                         e
                     ));
+                    cleanup_recheck_cgroup(&cgroup);
                     let drain_deadline = pipe_drain_deadline();
                     let _ = drains.finish(drain_deadline, pgid);
                     return CleanRecheck::Unverifiable;
@@ -1626,8 +1832,10 @@ impl RepoProcessor {
                 self.config.name,
                 conversion
             ));
+            cleanup_recheck_cgroup(&cgroup);
             return CleanRecheck::Unverifiable;
         }
+        cleanup_recheck_cgroup(&cgroup);
         let stdout = std::mem::take(&mut drains.stdout.buf);
         let stderr = std::mem::take(&mut drains.stderr.buf);
         if !status.success() {
@@ -6358,6 +6566,167 @@ mod tests {
     }
 
     #[test]
+    fn recheck_cgroup_kills_a_fully_detached_escapee_holding_nothing() {
+        use std::os::unix::process::CommandExt;
+        let Some(base) = own_cgroup_dir() else {
+            return;
+        };
+        let Some(cgroup) = RecheckCgroup::create_in(&base) else {
+            return;
+        };
+        let root = temp_dir("recheck-cgroup-detached");
+        let pid_file = root.join("escapee.pid");
+        let procs_path = cgroup.procs_path.clone();
+        let mut command = Command::new("setsid");
+        command
+            .arg("sh")
+            .arg("-c")
+            .arg(format!(
+                "sh -c 'sleep 30 & echo $! > \"{}\"' </dev/null >/dev/null 2>&1",
+                pid_file.display()
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(move || {
+                attach_self_to_cgroup(&procs_path);
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let _ = child.wait();
+        let mut pid = None;
+        for _ in 0..60 {
+            if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                pid = text.trim().parse::<i32>().ok();
+                if pid.is_some() {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let pid = pid.expect("detached escapee never wrote its pid file");
+        assert!(process_is_running(pid));
+        if !cgroup.member_pids().contains(&(pid as libc::pid_t)) {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+            panic!("detached escapee {pid} was not a member of the recheck cgroup");
+        }
+        cgroup.kill_and_remove();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while process_is_running(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let running = process_is_running(pid);
+        if running {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+        assert!(!running, "fully detached escapee {pid} survived the cgroup kill");
+        assert!(
+            !cgroup.dir.exists(),
+            "recheck cgroup {} was left behind",
+            cgroup.dir.display()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recheck_cgroup_kills_an_escapee_hiding_in_a_nested_cgroup() {
+        use std::os::unix::process::CommandExt;
+        let Some(base) = own_cgroup_dir() else {
+            return;
+        };
+        let Some(cgroup) = RecheckCgroup::create_in(&base) else {
+            return;
+        };
+        let root = temp_dir("recheck-cgroup-nested");
+        let pid_file = root.join("escapee.pid");
+        let nested = cgroup.dir.join("nested");
+        let procs_path = cgroup.procs_path.clone();
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(format!(
+                "mkdir \"{}\" \n sleep 30 & \n echo $! > \"{}\" \n echo $! > \"{}\" \n wait \n",
+                nested.display(),
+                pid_file.display(),
+                nested.join("cgroup.procs").display()
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(move || {
+                attach_self_to_cgroup(&procs_path);
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let mut pid = None;
+        for _ in 0..60 {
+            if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                pid = text.trim().parse::<i32>().ok();
+                if pid.is_some() {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let pid = pid.expect("nested escapee never wrote its pid file");
+        let pid_t = pid as libc::pid_t;
+        let move_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !cgroup_member_pids(&nested).contains(&pid_t)
+            && std::time::Instant::now() < move_deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            cgroup_member_pids(&nested).contains(&pid_t),
+            "escapee {pid} never moved into the nested cgroup"
+        );
+        assert!(
+            !cgroup.member_pids().contains(&pid_t),
+            "escapee {pid} is still a direct member of the recheck cgroup"
+        );
+        cgroup.kill_and_remove();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while process_is_running(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let running = process_is_running(pid);
+        if running {
+            unsafe {
+                libc::kill(pid_t, libc::SIGKILL);
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!running, "nested-cgroup escapee {pid} survived the cgroup kill");
+        assert!(
+            !cgroup.dir.exists(),
+            "recheck cgroup {} was left behind",
+            cgroup.dir.display()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recheck_cgroup_create_in_a_plain_directory_is_unavailable() {
+        let root = temp_dir("recheck-cgroup-plain");
+        assert!(RecheckCgroup::create_in(&root).is_none());
+        let leftovers: Vec<_> = std::fs::read_dir(&root).unwrap().collect();
+        assert!(
+            leftovers.is_empty(),
+            "create_in left a directory behind in a non-cgroup directory"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn pipe_drain_second_sweep_kills_a_holder_that_grabs_the_pipe_after_the_first_sweep() {
         use std::os::unix::io::AsRawFd;
         use std::os::unix::process::ExitStatusExt;
@@ -6794,6 +7163,93 @@ mod tests {
             }
         }
         assert!(!running, "setsid descendant {pid} survived the recheck");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn external_clean_filter_fully_detached_descendant_is_killed() {
+        let Some(probe) = RecheckCgroup::create() else {
+            return;
+        };
+        probe.kill_and_remove();
+        let root = temp_dir("skip-worktree-external-filter-detached-kill");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        std::fs::write(upstream_path.join(".gitattributes"), "*.txt filter=strip\n").unwrap();
+        std::fs::write(upstream_path.join("data.txt"), "hello\n").unwrap();
+        let v1 = commit_all(&upstream, "v1");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+        let escapee = write_filter_script(
+            &root,
+            "detached-escapee.sh",
+            &format!(
+                "#!/bin/sh\nsleep 30 &\necho $! > \"{}\"\n",
+                root.join("escapee.pid").display()
+            ),
+        );
+        let script = write_filter_script(
+            &root,
+            "strip-filter-detached-kill.sh",
+            &format!(
+                "#!/bin/sh\nsed 's/^X//'\nsetsid \"{}\" </dev/null >/dev/null 2>&1 &\nfor i in $(seq 1 50); do\n  [ -f \"{}\" ] && break\n  sleep 0.1\ndone\n",
+                escapee.display(),
+                root.join("escapee.pid").display()
+            ),
+        );
+        set_repo_config(
+            &watched_path,
+            "filter.strip.clean",
+            script.to_string_lossy().as_ref(),
+        );
+        std::fs::write(watched_path.join("data.txt"), "Xhello\n").unwrap();
+        set_index_flag(&watched_path, "--skip-worktree", "data.txt");
+
+        let processor = processor_for(&watched_path);
+        let entry_id = processor
+            .repo
+            .index()
+            .unwrap()
+            .get_path(Path::new("data.txt"), 0)
+            .unwrap()
+            .id;
+        let started = std::time::Instant::now();
+        let matched = processor._matches_after_external_clean_filter_with_timeout(
+            &watched_path,
+            Path::new("data.txt"),
+            &watched_path.join("data.txt"),
+            entry_id,
+            std::time::Duration::from_secs(30),
+        );
+        assert!(matched);
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        let pid: i32 = std::fs::read_to_string(root.join("escapee.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while process_is_running(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let running = process_is_running(pid);
+        if running {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        assert!(
+            !running,
+            "fully detached descendant {pid} survived the recheck"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
