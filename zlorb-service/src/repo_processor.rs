@@ -1060,7 +1060,7 @@ impl RepoProcessor {
         let local_branch = self._get_local_branch()?;
         let local_oid = self._get_local_oid_from_branch(local_branch)?;
         let mut remote = self._get_remote()?;
-        self._download_new_data(&mut remote);
+        self._download_new_data(&mut remote)?;
         let analysis = self._get_analysis()?;
         let (merge_analysis, _, fetch_commit) = analysis;
         if merge_analysis.is_up_to_date() {
@@ -3819,12 +3819,14 @@ impl RepoProcessor {
         Ok(remote)
     }
 
-    fn _download_new_data(&self, remote: &mut Remote) {
-        let _ = remote.fetch(
-            std::slice::from_ref(&self.config.branch),
-            Some(&mut self._setup_fetchoptions_with_creds()),
-            None,
-        );
+    fn _download_new_data(&self, remote: &mut Remote) -> Result<(), ZlorbError> {
+        remote
+            .fetch(
+                std::slice::from_ref(&self.config.branch),
+                Some(&mut self._setup_fetchoptions_with_creds()),
+                None,
+            )
+            .map_err(ZlorbError::Git)
     }
 
     fn _get_analysis(
@@ -4523,6 +4525,64 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).contains("fixture-version-two")
         );
         drop(statuses);
+        drop(watched);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_fetch_after_a_successful_one_errors_instead_of_reading_as_up_to_date() {
+        let root = temp_dir("failed-fetch");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        let v1 = commit_all(&upstream, "v1");
+        drop(upstream);
+        let watched = git2::Repository::clone(
+            upstream_path.to_string_lossy().as_ref(),
+            &watched_path,
+        )
+        .unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        drop(watched);
+
+        processor_for(&watched_path).update_from_remote().unwrap();
+
+        let upstream = git2::Repository::open(&upstream_path).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-two");
+        let v2 = commit_all(&upstream, "v2");
+        drop(upstream);
+
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        watched
+            .remote_set_url("origin", "/nonexistent/definitely-gone")
+            .unwrap();
+        drop(watched);
+
+        let result = processor_for(&watched_path).update_from_remote();
+        assert!(
+            result.is_err(),
+            "a failed fetch must error, not read the stale FETCH_HEAD as up-to-date"
+        );
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        watched
+            .remote_set_url("origin", upstream_path.to_string_lossy().as_ref())
+            .unwrap();
+        drop(watched);
+
+        processor_for(&watched_path).update_from_remote().unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        let artifact = fixture_artifact(&watched_path);
+        assert!(artifact.exists());
+        let output = std::process::Command::new(&artifact).output().unwrap();
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("fixture-version-two")
+        );
         drop(watched);
         let _ = std::fs::remove_dir_all(&root);
     }
