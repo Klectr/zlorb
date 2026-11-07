@@ -768,7 +768,7 @@ impl RepoProcessor {
         Logger::info(format!("Updating from remote for {}", self.config.name));
         self.config.resolved_build_strategy()?;
         let head_before = self.head_oid("before fetch");
-        let has_updates = self.fetch_remote_updates()?;
+        let (has_updates, fetch_error) = self.fetch_remote_updates()?;
         Logger::info(format!("Remote updates found: {}", has_updates));
 
         let out_dir_missing = self.config.out_dir.is_some() && !self.check_if_out_dir_exists()?;
@@ -866,9 +866,16 @@ impl RepoProcessor {
                 Ok(())
             }
         };
-        build_outcome.and_then(|_| {
+        let local_outcome = build_outcome.and_then(|_| {
             self.run_restart_if_needed(head_before, retrying_failed_build, should_run_build)
-        })
+        });
+        match local_outcome {
+            Err(e) => Err(e),
+            Ok(()) => match fetch_error {
+                Some(e) => Err(e),
+                None => Ok(()),
+            },
+        }
     }
 
     fn run_restart_if_needed(
@@ -1056,15 +1063,21 @@ impl RepoProcessor {
         }
     }
 
-    fn fetch_remote_updates(&self) -> Result<bool, ZlorbError> {
+    fn fetch_remote_updates(&self) -> Result<(bool, Option<ZlorbError>), ZlorbError> {
         let local_branch = self._get_local_branch()?;
         let local_oid = self._get_local_oid_from_branch(local_branch)?;
         let mut remote = self._get_remote()?;
-        self._download_new_data(&mut remote)?;
+        if let Err(e) = self._download_new_data(&mut remote) {
+            Logger::error(format!(
+                "Failed to fetch updates for {}: {}; skipping the fast-forward this cycle so local build and restart retries can still run",
+                self.config.name, e
+            ));
+            return Ok((false, Some(e)));
+        }
         let analysis = self._get_analysis()?;
         let (merge_analysis, _, fetch_commit) = analysis;
         if merge_analysis.is_up_to_date() {
-            return Ok(false);
+            return Ok((false, None));
         }
         if !merge_analysis.is_fast_forward() {
             return Err(ZlorbError::Git(git2::Error::new(
@@ -1094,6 +1107,7 @@ impl RepoProcessor {
         };
 
         self._should_trigger_update(remote_ref, local_oid)
+            .map(|has_updates| (has_updates, None))
     }
 
     fn _refuse_if_update_would_overwrite(
@@ -4584,6 +4598,218 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).contains("fixture-version-two")
         );
         drop(watched);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_build_is_retried_while_the_remote_is_unreachable() {
+        let root = temp_dir("failed-build-retry-dead-remote");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        let v1 = commit_all(&upstream, "v1");
+        write_sentinel_fixture_crate(&upstream_path, "fixture-version-two");
+        let v2 = commit_all(&upstream, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched.find_commit(v1).unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+
+        let failed_builds = new_failed_builds();
+        std::fs::write(watched_path.join("fail-build"), "").unwrap();
+        let err = processor_with_tracker(&watched_path, failed_builds.clone())
+            .update_from_remote()
+            .unwrap_err();
+        assert!(format!("{:?}", err).contains("Failed to build"));
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        watched
+            .remote_set_url("origin", "/nonexistent/definitely-gone")
+            .unwrap();
+        drop(watched);
+        assert!(!fixture_artifact(&watched_path).exists());
+
+        let err = processor_with_tracker(&watched_path, failed_builds.clone())
+            .update_from_remote()
+            .unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("Failed to build"),
+            "the retry must run and report its own failure while the remote is unreachable, got: {:?}",
+            err
+        );
+        assert!(!fixture_artifact(&watched_path).exists());
+
+        std::fs::remove_file(watched_path.join("fail-build")).unwrap();
+        let err = processor_with_tracker(&watched_path, failed_builds.clone())
+            .update_from_remote()
+            .unwrap_err();
+        assert!(
+            !format!("{:?}", err).contains("Failed to build"),
+            "the retried build must succeed while the remote is unreachable, got: {:?}",
+            err
+        );
+        let artifact = fixture_artifact(&watched_path);
+        assert!(artifact.exists());
+        let output = std::process::Command::new(&artifact).output().unwrap();
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("fixture-version-two")
+        );
+        assert!(
+            !failed_builds
+                .lock()
+                .unwrap()
+                .contains_key(&tracker_key(&watched_path.to_string_lossy())),
+            "a successful retry must clear the failed-build record even when the fetch failed"
+        );
+
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        watched
+            .remote_set_url("origin", upstream_path.to_string_lossy().as_ref())
+            .unwrap();
+        drop(watched);
+        processor_with_tracker(&watched_path, failed_builds.clone())
+            .update_from_remote()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_out_dir_is_rebuilt_while_the_remote_is_unreachable() {
+        let root = temp_dir("out-dir-dead-remote");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        commit_all(&upstream, "v1");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        watched
+            .remote_set_url("origin", "/nonexistent/definitely-gone")
+            .unwrap();
+        drop(watched);
+        assert!(!fixture_artifact(&watched_path).exists());
+
+        let mut processor = processor_for(&watched_path);
+        processor.config.out_dir = Some("dist-out".to_string());
+        let err = processor.update_from_remote().unwrap_err();
+        assert!(
+            !format!("{:?}", err).contains("Failed to build"),
+            "the out_dir build must succeed while the remote is unreachable, got: {:?}",
+            err
+        );
+        assert!(
+            format!("{:?}", err).contains("Git("),
+            "the surfaced error must be the fetch failure itself, got: {:?}",
+            err
+        );
+        let artifact = fixture_artifact(&watched_path);
+        assert!(artifact.exists());
+        let output = std::process::Command::new(&artifact).output().unwrap();
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("fixture-version-one")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_restart_is_retried_while_the_remote_is_unreachable() {
+        let root = temp_dir("restart-retry-dead-remote");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        commit_all(&upstream, "v1");
+        write_fixture_crate(&upstream_path, "fixture-version-two");
+        let v2 = commit_all(&upstream, "v2");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        let checkout = watched
+            .find_commit(watched.revparse_single("HEAD~1").unwrap().id())
+            .unwrap();
+        watched
+            .reset(checkout.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        drop(checkout);
+        drop(watched);
+
+        let failed_restarts = new_failed_restarts();
+        let err = processor_with_restart(
+            &watched_path,
+            Some("false".to_string()),
+            failed_restarts.clone(),
+        )
+        .update_from_remote()
+        .unwrap_err();
+        assert!(format!("{:?}", err).contains("Restart command"));
+        assert_eq!(
+            failed_restarts
+                .lock()
+                .unwrap()
+                .get(&tracker_key(&watched_path.to_string_lossy())),
+            Some(&v2)
+        );
+
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        watched
+            .remote_set_url("origin", "/nonexistent/definitely-gone")
+            .unwrap();
+        drop(watched);
+
+        let err = processor_with_restart(
+            &watched_path,
+            Some(serve_command(&watched_path)),
+            failed_restarts.clone(),
+        )
+        .update_from_remote()
+        .unwrap_err();
+        assert!(
+            !format!("{:?}", err).contains("Restart command"),
+            "the retried restart must succeed while the remote is unreachable, got: {:?}",
+            err
+        );
+        assert_eq!(
+            std::fs::read_to_string(watched_path.join("served.txt")).unwrap(),
+            "fixture-version-two\n"
+        );
+        assert!(
+            !failed_restarts
+                .lock()
+                .unwrap()
+                .contains_key(&tracker_key(&watched_path.to_string_lossy())),
+            "a successful retry must clear the failed-restart record even when the fetch failed"
+        );
+
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        watched
+            .remote_set_url("origin", upstream_path.to_string_lossy().as_ref())
+            .unwrap();
+        drop(watched);
+        processor_with_restart(
+            &watched_path,
+            Some(serve_command(&watched_path)),
+            failed_restarts.clone(),
+        )
+        .update_from_remote()
+        .unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
 
