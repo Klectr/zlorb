@@ -3,7 +3,7 @@ use zlorb_lib::{
     config::{RepositoriesConfigurationFile, RepositoryConfiguration},
     create_config_from_toml,
     error::ZlorbError,
-    git::is_git_repo,
+    git::detect_repo,
     is_root,
     log::Logger,
 };
@@ -55,17 +55,19 @@ pub(crate) fn remove(repo_name: String) -> Result<(), ZlorbError> {
 
 pub(crate) fn add() -> Result<(), ZlorbError> {
     let cwd = env::current_dir()?;
-    let path_str = cwd.to_string_lossy().to_string();
+    let detected = detect_repo(&cwd)?;
+    let path_str = detected.root.to_string_lossy().to_string();
 
-    if !is_git_repo(&path_str) {
-        let err = format!("{} is not a valid git repository", path_str);
-        return Err(ZlorbError::Other(err));
-    }
-
-    let repo_name = cwd
+    let repo_name = detected
+        .root
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
-        .unwrap();
+        .ok_or_else(|| {
+            ZlorbError::Other(format!(
+                "could not read a repository name from {}",
+                path_str
+            ))
+        })?;
 
     let (mut config, mut file) = create_config_from_toml(true)?;
 
@@ -74,8 +76,8 @@ pub(crate) fn add() -> Result<(), ZlorbError> {
     let new_repo = RepositoryConfiguration {
         name: repo_name,
         path: path_str,
-        remote: "origin".to_string(),
-        branch: "master".to_string(),
+        remote: detected.remote,
+        branch: detected.branch,
         build_strategy: None,
         build_command: String::new(),
         restart_command: None,
