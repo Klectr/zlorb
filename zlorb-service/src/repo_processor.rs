@@ -748,6 +748,7 @@ impl RepoProcessor {
     pub fn new(config: RepositoryConfiguration) -> Result<Self, ZlorbError> {
         Logger::info(format!("Initializing RepoProcessor for {}", config.name));
         config.validate_branch_names()?;
+        config.validate_remote_name()?;
         let repo = git2::Repository::open(&config.path).map_err(|e| {
             ZlorbError::Other(format!(
                 "Failed to acquire repo {} at {}: {}",
