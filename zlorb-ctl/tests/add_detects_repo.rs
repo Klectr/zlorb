@@ -216,6 +216,48 @@ fn add_same_repo_twice_fails_as_a_path_duplicate() {
 }
 
 #[test]
+fn add_fails_when_a_seeded_entry_aliases_the_same_path() {
+    let root = temp_dir("duplicate-alias");
+    let config_dir = root.join("config");
+    let repo_path = root.join("my-app");
+    init_repo_with_origin(&repo_path, "main");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let alias = format!("{}/./", repo_path.display());
+    std::fs::write(
+        config_dir.join("repositories.toml"),
+        format!(
+            "[[repository]]\nname = \"seeded-app\"\npath = \"{}\"\nremote = \"origin\"\nbranch = \"main\"\n",
+            alias
+        ),
+    )
+    .unwrap();
+
+    let output = run_add(&repo_path, &config_dir);
+    assert!(
+        !output.status.success(),
+        "add unexpectedly succeeded for a canonically identical path"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("already in the configuration as 'seeded-app'"),
+        "alias duplicate error should name the tracked name, got: {}",
+        combined
+    );
+    let repos = std::fs::read_to_string(config_dir.join("repositories.toml")).unwrap();
+    assert_eq!(
+        repos.matches("[[repository]]").count(),
+        1,
+        "alias duplicate must leave exactly one entry: {}",
+        repos
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn add_two_repos_sharing_a_basename_tracks_both_under_distinct_names() {
     let root = temp_dir("same-basename");
     let config_dir = root.join("config");
@@ -276,6 +318,15 @@ fn add_two_repos_sharing_a_basename_tracks_both_under_distinct_names() {
         "second path missing: {}",
         repos
     );
+    let second_block = repos
+        .split("[[repository]]")
+        .find(|block| block.contains(&second_path.display().to_string()))
+        .expect("second repo entry missing");
+    assert!(
+        second_block.contains("name = \"personal-app\""),
+        "personal-app must be the name of the second path's entry: {}",
+        second_block
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -285,7 +336,8 @@ fn add_disambiguation_falls_back_to_a_numeric_suffix() {
     let config_dir = root.join("config");
     let first_path = root.join("a").join("personal").join("app");
     let third_path = root.join("c").join("personal").join("app");
-    for path in [&first_path, &third_path] {
+    let fourth_path = root.join("d").join("personal").join("app");
+    for path in [&first_path, &third_path, &fourth_path] {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         init_repo_with_origin(path, "main");
     }
@@ -302,7 +354,25 @@ fn add_disambiguation_falls_back_to_a_numeric_suffix() {
         String::from_utf8_lossy(&third.stdout),
         String::from_utf8_lossy(&third.stderr)
     );
+    let fourth = run_add(&fourth_path, &config_dir);
+    assert!(
+        fourth.status.success(),
+        "fourth add failed: {}{}",
+        String::from_utf8_lossy(&fourth.stdout),
+        String::from_utf8_lossy(&fourth.stderr)
+    );
     let repos = std::fs::read_to_string(config_dir.join("repositories.toml")).unwrap();
+    assert_eq!(
+        repos.matches("[[repository]]").count(),
+        4,
+        "all four repos should be tracked: {}",
+        repos
+    );
+    assert!(
+        repos.contains("name = \"app\""),
+        "base name missing: {}",
+        repos
+    );
     assert!(
         repos.contains("name = \"personal-app\""),
         "parent-qualified name missing: {}",
@@ -312,6 +382,15 @@ fn add_disambiguation_falls_back_to_a_numeric_suffix() {
         repos.contains("name = \"personal-app-2\""),
         "suffix fallback name missing: {}",
         repos
+    );
+    let fourth_block = repos
+        .split("[[repository]]")
+        .find(|block| block.contains(&fourth_path.display().to_string()))
+        .expect("fourth repo entry missing");
+    assert!(
+        fourth_block.contains("name = \"personal-app-3\""),
+        "fourth repo should continue the suffix chain: {}",
+        fourth_block
     );
     let _ = std::fs::remove_dir_all(&root);
 }
