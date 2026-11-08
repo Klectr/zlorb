@@ -9,6 +9,7 @@ use zlorb_lib::{create_file_with_content, error::ZlorbError, get_zlorb_config_di
 pub struct ConfigManager {
     config_dir: PathBuf,
     reported_strategy_errors: RefCell<HashSet<String>>,
+    reported_skip_errors: RefCell<HashSet<String>>,
 }
 
 impl ConfigManager {
@@ -20,7 +21,24 @@ impl ConfigManager {
         Self {
             config_dir,
             reported_strategy_errors: RefCell::new(HashSet::new()),
+            reported_skip_errors: RefCell::new(HashSet::new()),
         }
+    }
+
+    fn unreported_skip_errors(&self, skips: &[String]) -> Vec<String> {
+        let mut current = HashSet::new();
+        let mut fresh = Vec::new();
+        {
+            let mut reported = self.reported_skip_errors.borrow_mut();
+            for skip in skips {
+                current.insert(skip.clone());
+                if reported.insert(skip.clone()) {
+                    fresh.push(skip.clone());
+                }
+            }
+            reported.retain(|key| current.contains(key));
+        }
+        fresh
     }
 
     fn unreported_strategy_errors(
@@ -132,16 +150,20 @@ impl ConfigManager {
             }
         }
         let mut processors = Vec::new();
+        let mut skips = Vec::new();
         for repo in repos {
             match RepoProcessor::new(repo.clone()) {
                 Ok(processor) => processors.push(processor),
                 Err(e) => {
-                    Logger::error(format!(
+                    skips.push(format!(
                         "Skipping repo {} at {}: {:?}",
                         repo.name, repo.path, e
                     ));
                 }
             }
+        }
+        for message in self.unreported_skip_errors(&skips) {
+            Logger::error(message);
         }
         Ok(processors)
     }
@@ -252,6 +274,26 @@ mod tests {
         init_repo(&bad);
         let bad_entry = format!(
             "[[repository]]\nname = \"bad\"\npath = \"{}\"\nremote = \"origin\"\nbranch = \"foo..bar\"\nbuild_command = \"cargo build\"\n",
+            bad.display()
+        );
+        let contents = format!("{}{}", repo_entry("good", &good), bad_entry);
+        write_repos(&config_dir, &contents);
+        let manager = ConfigManager::with_config_dir(config_dir);
+        let repos = manager.load_all_repo_configs().unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].config.name, "good");
+    }
+
+    #[test]
+    fn repo_with_invalid_remote_is_skipped_and_good_repo_still_loads() {
+        let root = temp_dir("skip-invalid-remote");
+        let config_dir = root.join("config");
+        let good = root.join("good");
+        let bad = root.join("bad");
+        init_repo(&good);
+        init_repo(&bad);
+        let bad_entry = format!(
+            "[[repository]]\nname = \"bad\"\npath = \"{}\"\nremote = \"foo bar\"\nbranch = \"master\"\nbuild_command = \"cargo build\"\n",
             bad.display()
         );
         let contents = format!("{}{}", repo_entry("good", &good), bad_entry);
@@ -401,6 +443,35 @@ mod tests {
         assert_eq!(manager.unreported_strategy_errors(&broken).len(), 1);
         assert!(manager.unreported_strategy_errors(&[]).is_empty());
         assert_eq!(manager.unreported_strategy_errors(&broken).len(), 1);
+    }
+
+    #[test]
+    fn skip_error_is_reported_once_across_reloads() {
+        let manager = ConfigManager::with_config_dir(temp_dir("dedupe-skip-once"));
+        let skips = vec!["Skipping repo bad at /tmp/bad: broken".to_string()];
+        assert_eq!(manager.unreported_skip_errors(&skips).len(), 1);
+        assert!(manager.unreported_skip_errors(&skips).is_empty());
+        assert!(manager.unreported_skip_errors(&skips).is_empty());
+    }
+
+    #[test]
+    fn changed_skip_error_is_reported_again() {
+        let manager = ConfigManager::with_config_dir(temp_dir("dedupe-skip-changed"));
+        let first = vec!["Skipping repo bad at /tmp/bad: broken".to_string()];
+        assert_eq!(manager.unreported_skip_errors(&first).len(), 1);
+        let second = vec!["Skipping repo bad at /tmp/bad: worse".to_string()];
+        let fresh = manager.unreported_skip_errors(&second);
+        assert_eq!(fresh.len(), 1);
+        assert!(fresh[0].contains("worse"));
+    }
+
+    #[test]
+    fn fixed_then_broken_skip_error_is_reported_again() {
+        let manager = ConfigManager::with_config_dir(temp_dir("dedupe-skip-fixed"));
+        let broken = vec!["Skipping repo bad at /tmp/bad: broken".to_string()];
+        assert_eq!(manager.unreported_skip_errors(&broken).len(), 1);
+        assert!(manager.unreported_skip_errors(&[]).is_empty());
+        assert_eq!(manager.unreported_skip_errors(&broken).len(), 1);
     }
 
     #[test]

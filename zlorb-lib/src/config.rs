@@ -68,6 +68,16 @@ impl RepositoryConfiguration {
         Ok(())
     }
 
+    pub fn validate_remote_name(&self) -> Result<(), ZlorbError> {
+        if !is_usable_remote_name(&self.remote) {
+            return Err(ZlorbError::InvalidConfig(format!(
+                "repo '{}' has invalid remote '{}' in repositories.toml; set remote to a valid remote name",
+                self.name, self.remote
+            )));
+        }
+        Ok(())
+    }
+
     pub fn resolved_restart_command(&self) -> Option<&str> {
         self.restart_command
             .as_deref()
@@ -122,8 +132,13 @@ impl RepositoryConfiguration {
     }
 }
 
+fn is_usable_remote_name(value: &str) -> bool {
+    !value.is_empty() && !value.contains('\0') && git2::Remote::is_valid_name(value)
+}
+
 fn is_usable_branch_name(value: &str) -> bool {
     value != "HEAD"
+        && !value.contains('\0')
         && !value.starts_with("refs/")
         && git2::Reference::is_valid_name(&format!("refs/heads/{}", value))
 }
@@ -538,6 +553,68 @@ mod tests {
         let mut bad = config(None, "");
         bad.branch = String::new();
         assert!(bad.validate_branch_names().is_err());
+    }
+
+    #[test]
+    fn valid_remote_names_pass_validation() {
+        assert!(config(None, "").validate_remote_name().is_ok());
+        let mut other = config(None, "");
+        other.remote = "upstream".to_string();
+        assert!(other.validate_remote_name().is_ok());
+        other.remote = "my-remote".to_string();
+        assert!(other.validate_remote_name().is_ok());
+    }
+
+    #[test]
+    fn invalid_remote_fails_validation_naming_the_repo_and_value() {
+        let mut bad = config(None, "");
+        bad.remote = "foo bar".to_string();
+        let err = bad.validate_remote_name().unwrap_err();
+        let ZlorbError::InvalidConfig(message) = err else {
+            panic!("expected InvalidConfig, got {:?}", err);
+        };
+        assert!(message.contains("demo"), "missing repo name in: {}", message);
+        assert!(
+            message.contains("invalid remote 'foo bar'"),
+            "missing value in: {}",
+            message
+        );
+        assert!(
+            message.contains("repositories.toml"),
+            "missing file in: {}",
+            message
+        );
+    }
+
+    #[test]
+    fn empty_remote_fails_validation() {
+        let mut bad = config(None, "");
+        bad.remote = String::new();
+        assert!(bad.validate_remote_name().is_err());
+    }
+
+    #[test]
+    fn remote_with_double_dot_fails_validation() {
+        let mut bad = config(None, "");
+        bad.remote = "foo..bar".to_string();
+        assert!(bad.validate_remote_name().is_err());
+    }
+
+    #[test]
+    fn nul_in_remote_fails_validation_without_panicking() {
+        let mut bad = config(None, "");
+        bad.remote = "foo\0bar".to_string();
+        assert!(bad.validate_remote_name().is_err());
+    }
+
+    #[test]
+    fn nul_in_branch_fails_validation_without_panicking() {
+        let mut bad = config(None, "");
+        bad.branch = "foo\0bar".to_string();
+        assert!(bad.validate_branch_names().is_err());
+        let mut bad_remote = config(None, "");
+        bad_remote.remote_branch = Some("foo\0bar".to_string());
+        assert!(bad_remote.validate_branch_names().is_err());
     }
 
     #[test]
