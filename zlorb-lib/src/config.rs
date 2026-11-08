@@ -51,6 +51,23 @@ impl RepositoryConfiguration {
             .unwrap_or(&self.branch)
     }
 
+    pub fn validate_branch_names(&self) -> Result<(), ZlorbError> {
+        if !is_usable_branch_name(&self.branch) {
+            return Err(ZlorbError::InvalidConfig(format!(
+                "repo '{}' has invalid branch '{}' in repositories.toml; set branch to a valid branch name",
+                self.name, self.branch
+            )));
+        }
+        let remote_branch = self.resolved_remote_branch();
+        if !is_usable_branch_name(remote_branch) {
+            return Err(ZlorbError::InvalidConfig(format!(
+                "repo '{}' has invalid remote_branch '{}' in repositories.toml; set remote_branch to a valid branch name or remove it to track branch '{}'",
+                self.name, remote_branch, self.branch
+            )));
+        }
+        Ok(())
+    }
+
     pub fn resolved_restart_command(&self) -> Option<&str> {
         self.restart_command
             .as_deref()
@@ -103,6 +120,12 @@ impl RepositoryConfiguration {
             ))),
         }
     }
+}
+
+fn is_usable_branch_name(value: &str) -> bool {
+    value != "HEAD"
+        && !value.starts_with("refs/")
+        && git2::Reference::is_valid_name(&format!("refs/heads/{}", value))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -389,6 +412,132 @@ mod tests {
         assert_eq!(parsed.remote_branch.as_deref(), Some("main"));
         assert_eq!(parsed.resolved_remote_branch(), "main");
         assert_eq!(parsed.branch, "dev");
+    }
+
+    #[test]
+    fn valid_branch_names_pass_validation() {
+        assert!(config(None, "").validate_branch_names().is_ok());
+        let mut nested = config(None, "");
+        nested.branch = "feature/foo".to_string();
+        nested.remote_branch = Some("release/1.2".to_string());
+        assert!(nested.validate_branch_names().is_ok());
+    }
+
+    #[test]
+    fn blank_remote_branch_is_validated_as_the_local_branch() {
+        let mut blank = config(None, "");
+        blank.remote_branch = Some("  ".to_string());
+        assert!(blank.validate_branch_names().is_ok());
+        blank.branch = "foo..bar".to_string();
+        let err = blank.validate_branch_names().unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("invalid branch 'foo..bar'"),
+            "unexpected error: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn invalid_branch_fails_validation_naming_the_repo_and_value() {
+        let mut bad = config(None, "");
+        bad.branch = "foo..bar".to_string();
+        let err = bad.validate_branch_names().unwrap_err();
+        let ZlorbError::InvalidConfig(message) = err else {
+            panic!("expected InvalidConfig, got {:?}", err);
+        };
+        assert!(message.contains("demo"), "missing repo name in: {}", message);
+        assert!(
+            message.contains("invalid branch 'foo..bar'"),
+            "missing value in: {}",
+            message
+        );
+        assert!(
+            message.contains("repositories.toml"),
+            "missing file in: {}",
+            message
+        );
+    }
+
+    #[test]
+    fn invalid_remote_branch_fails_validation_naming_the_repo_and_value() {
+        let mut bad = config(None, "");
+        bad.remote_branch = Some("foo..bar".to_string());
+        let err = bad.validate_branch_names().unwrap_err();
+        let ZlorbError::InvalidConfig(message) = err else {
+            panic!("expected InvalidConfig, got {:?}", err);
+        };
+        assert!(message.contains("demo"), "missing repo name in: {}", message);
+        assert!(
+            message.contains("invalid remote_branch 'foo..bar'"),
+            "missing value in: {}",
+            message
+        );
+        assert!(
+            message.contains("remove it"),
+            "missing fallback advice in: {}",
+            message
+        );
+    }
+
+    #[test]
+    fn padded_invalid_remote_branch_is_validated_after_trimming() {
+        let mut bad = config(None, "");
+        bad.remote_branch = Some(" foo..bar ".to_string());
+        let err = bad.validate_branch_names().unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("invalid remote_branch 'foo..bar'"),
+            "unexpected error: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn ref_prefixed_branch_names_fail_validation() {
+        let mut bad = config(None, "");
+        bad.branch = "refs/heads/main".to_string();
+        let err = bad.validate_branch_names().unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("invalid branch 'refs/heads/main'"),
+            "unexpected error: {:?}",
+            err
+        );
+        let mut bad_remote = config(None, "");
+        bad_remote.remote_branch = Some("refs/heads/main".to_string());
+        let err = bad_remote.validate_branch_names().unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("invalid remote_branch 'refs/heads/main'"),
+            "unexpected error: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn head_fails_validation_as_a_branch_name() {
+        let mut bad = config(None, "");
+        bad.branch = "HEAD".to_string();
+        assert!(bad.validate_branch_names().is_err());
+        let mut bad_remote = config(None, "");
+        bad_remote.remote_branch = Some("HEAD".to_string());
+        let err = bad_remote.validate_branch_names().unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("invalid remote_branch 'HEAD'"),
+            "unexpected error: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn branch_name_with_a_space_fails_validation() {
+        let mut bad = config(None, "");
+        bad.branch = "my branch".to_string();
+        assert!(bad.validate_branch_names().is_err());
+    }
+
+    #[test]
+    fn empty_branch_fails_validation() {
+        let mut bad = config(None, "");
+        bad.branch = String::new();
+        assert!(bad.validate_branch_names().is_err());
     }
 
     #[test]

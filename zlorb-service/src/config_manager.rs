@@ -223,6 +223,46 @@ mod tests {
     }
 
     #[test]
+    fn repo_with_invalid_remote_branch_is_skipped_and_good_repo_still_loads() {
+        let root = temp_dir("skip-invalid-remote-branch");
+        let config_dir = root.join("config");
+        let good = root.join("good");
+        let bad = root.join("bad");
+        init_repo(&good);
+        init_repo(&bad);
+        let bad_entry = format!(
+            "[[repository]]\nname = \"bad\"\npath = \"{}\"\nremote = \"origin\"\nbranch = \"master\"\nremote_branch = \"foo..bar\"\nbuild_command = \"cargo build\"\n",
+            bad.display()
+        );
+        let contents = format!("{}{}", repo_entry("good", &good), bad_entry);
+        write_repos(&config_dir, &contents);
+        let manager = ConfigManager::with_config_dir(config_dir);
+        let repos = manager.load_all_repo_configs().unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].config.name, "good");
+    }
+
+    #[test]
+    fn repo_with_invalid_branch_is_skipped_and_good_repo_still_loads() {
+        let root = temp_dir("skip-invalid-branch");
+        let config_dir = root.join("config");
+        let good = root.join("good");
+        let bad = root.join("bad");
+        init_repo(&good);
+        init_repo(&bad);
+        let bad_entry = format!(
+            "[[repository]]\nname = \"bad\"\npath = \"{}\"\nremote = \"origin\"\nbranch = \"foo..bar\"\nbuild_command = \"cargo build\"\n",
+            bad.display()
+        );
+        let contents = format!("{}{}", repo_entry("good", &good), bad_entry);
+        write_repos(&config_dir, &contents);
+        let manager = ConfigManager::with_config_dir(config_dir);
+        let repos = manager.load_all_repo_configs().unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].config.name, "good");
+    }
+
+    #[test]
     fn reload_picks_up_repos_added_after_first_load() {
         let root = temp_dir("reload-add");
         let config_dir = root.join("config");
