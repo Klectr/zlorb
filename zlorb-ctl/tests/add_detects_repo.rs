@@ -171,7 +171,7 @@ fn init_repo_with_origin(path: &Path, branch: &str) {
 }
 
 #[test]
-fn add_same_repo_twice_fails_as_a_path_duplicate() {
+fn add_same_repo_twice_is_a_no_op_success() {
     let root = temp_dir("duplicate-path");
     let config_dir = root.join("config");
     let repo_path = root.join("my-app");
@@ -187,8 +187,9 @@ fn add_same_repo_twice_fails_as_a_path_duplicate() {
     );
     let second = run_add(&subdir, &config_dir);
     assert!(
-        !second.status.success(),
-        "second add of the same repo unexpectedly succeeded"
+        second.status.success(),
+        "second add of the same repo should be a no-op success, got: {}",
+        String::from_utf8_lossy(&second.stderr)
     );
     let combined = format!(
         "{}{}",
@@ -197,12 +198,12 @@ fn add_same_repo_twice_fails_as_a_path_duplicate() {
     );
     assert!(
         combined.contains("already in the configuration as 'my-app'"),
-        "duplicate error should name the tracked name, got: {}",
+        "duplicate add should name the tracked name, got: {}",
         combined
     );
     assert!(
         combined.contains(&repo_path.display().to_string()),
-        "duplicate error should name the path, got: {}",
+        "duplicate add should name the path, got: {}",
         combined
     );
     let repos = std::fs::read_to_string(config_dir.join("repositories.toml")).unwrap();
@@ -216,7 +217,7 @@ fn add_same_repo_twice_fails_as_a_path_duplicate() {
 }
 
 #[test]
-fn add_fails_when_a_seeded_entry_aliases_the_same_path() {
+fn add_is_a_no_op_success_when_a_seeded_entry_aliases_the_same_path() {
     let root = temp_dir("duplicate-alias");
     let config_dir = root.join("config");
     let repo_path = root.join("my-app");
@@ -234,8 +235,9 @@ fn add_fails_when_a_seeded_entry_aliases_the_same_path() {
 
     let output = run_add(&repo_path, &config_dir);
     assert!(
-        !output.status.success(),
-        "add unexpectedly succeeded for a canonically identical path"
+        output.status.success(),
+        "add of a canonically identical path should be a no-op success, got: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
     let combined = format!(
         "{}{}",
@@ -244,7 +246,7 @@ fn add_fails_when_a_seeded_entry_aliases_the_same_path() {
     );
     assert!(
         combined.contains("already in the configuration as 'seeded-app'"),
-        "alias duplicate error should name the tracked name, got: {}",
+        "alias duplicate add should name the tracked name, got: {}",
         combined
     );
     let repos = std::fs::read_to_string(config_dir.join("repositories.toml")).unwrap();
@@ -459,5 +461,45 @@ fn add_outside_a_repo_fails() {
         !output.status.success(),
         "zlorb-ctl add unexpectedly succeeded outside a repo"
     );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn re_add_of_a_tracked_repo_whose_remote_was_removed_is_a_no_op_success() {
+    let root = temp_dir("tracked-remote-removed");
+    let config_dir = root.join("config");
+    let repo_path = root.join("my-app");
+    init_repo_with_origin(&repo_path, "main");
+
+    let first = run_add(&repo_path, &config_dir);
+    assert!(
+        first.status.success(),
+        "first add failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let before = std::fs::read(config_dir.join("repositories.toml")).unwrap();
+
+    let repo = git2::Repository::open(&repo_path).unwrap();
+    repo.remote_delete("origin").unwrap();
+    drop(repo);
+
+    let second = run_add(&repo_path, &config_dir);
+    assert!(
+        second.status.success(),
+        "re-add of a tracked repo without a remote should be a no-op success, got: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(
+        combined.contains("already in the configuration as 'my-app'"),
+        "no-op re-add should name the tracked name, got: {}",
+        combined
+    );
+    let after = std::fs::read(config_dir.join("repositories.toml")).unwrap();
+    assert_eq!(before, after, "no-op re-add must not modify repositories.toml");
     let _ = std::fs::remove_dir_all(&root);
 }

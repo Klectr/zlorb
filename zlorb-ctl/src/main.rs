@@ -28,6 +28,10 @@ enum Commands {
     },
     /// starts the repo watch daemon
     Start,
+    /// stops the repo watch daemon
+    Stop,
+    /// restarts the repo watch daemon
+    Restart,
     /// sets up the daemon: config dir + systemd unit, then enables and starts it
     Setup {
         /// only write the config and unit files, and print the systemctl commands instead of running them
@@ -51,6 +55,8 @@ fn main() -> Result<(), ZlorbError> {
         Commands::List => repo::list(),
         Commands::Status { json } => status::status(json),
         Commands::Start => DaemonManager::start(),
+        Commands::Stop => DaemonManager::stop(),
+        Commands::Restart => DaemonManager::restart(),
         Commands::Setup { print_only } => setup::setup(print_only),
         Commands::Remove { repo_name } => repo::remove(repo_name),
         Commands::Watch => repo::watch(),

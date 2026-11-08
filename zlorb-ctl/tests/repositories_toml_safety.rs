@@ -51,7 +51,7 @@ fn repos_file(config_dir: &Path) -> PathBuf {
 }
 
 #[test]
-fn duplicate_add_fails_and_leaves_repositories_file_byte_identical() {
+fn duplicate_add_succeeds_and_leaves_repositories_file_byte_identical() {
     let root = temp_dir("duplicate-add");
     let config_dir = root.join("config");
     let repo_path = root.join("my-app");
@@ -68,8 +68,9 @@ fn duplicate_add_fails_and_leaves_repositories_file_byte_identical() {
 
     let second = run_ctl(&["add"], &repo_path, &config_dir);
     assert!(
-        !second.status.success(),
-        "duplicate add unexpectedly succeeded"
+        second.status.success(),
+        "duplicate add should be a no-op success, got: {}",
+        String::from_utf8_lossy(&second.stderr)
     );
     let after = std::fs::read(repos_file(&config_dir)).unwrap();
     assert_eq!(before, after, "duplicate add must not modify repositories.toml");
@@ -77,7 +78,7 @@ fn duplicate_add_fails_and_leaves_repositories_file_byte_identical() {
 }
 
 #[test]
-fn remove_of_unknown_repo_fails_and_leaves_repositories_file_byte_identical() {
+fn remove_of_unknown_repo_succeeds_and_leaves_repositories_file_byte_identical() {
     let root = temp_dir("unknown-remove");
     let config_dir = root.join("config");
     let repo_path = root.join("my-app");
@@ -90,13 +91,24 @@ fn remove_of_unknown_repo_fails_and_leaves_repositories_file_byte_identical() {
 
     let removed = run_ctl(&["remove", "--repo-name", "no-such-repo"], &repo_path, &config_dir);
     assert!(
-        !removed.status.success(),
-        "remove of unknown repo unexpectedly succeeded"
+        removed.status.success(),
+        "remove of unknown repo should be a no-op success, got: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&removed.stdout),
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(
+        combined.contains("repo 'no-such-repo' is not tracked"),
+        "no-op remove should name the untracked repo, got: {}",
+        combined
     );
     let after = std::fs::read(repos_file(&config_dir)).unwrap();
     assert_eq!(
         before, after,
-        "failed remove must not modify repositories.toml"
+        "no-op remove must not modify repositories.toml"
     );
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -177,5 +189,30 @@ fn remove_of_watched_repo_succeeds_and_updates_the_file() {
             .contains("my-app"),
         "removed repo still present in repositories.toml"
     );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn second_remove_of_the_same_repo_is_a_no_op_success() {
+    let root = temp_dir("remove-twice");
+    let config_dir = root.join("config");
+    let repo_path = root.join("my-app");
+    init_repo(&repo_path, "main");
+
+    let added = run_ctl(&["add"], &repo_path, &config_dir);
+    assert!(added.status.success());
+
+    let removed = run_ctl(&["remove", "--repo-name", "my-app"], &repo_path, &config_dir);
+    assert!(removed.status.success());
+    let before = std::fs::read(repos_file(&config_dir)).unwrap();
+
+    let removed_again = run_ctl(&["remove", "--repo-name", "my-app"], &repo_path, &config_dir);
+    assert!(
+        removed_again.status.success(),
+        "second remove should be a no-op success, got: {}",
+        String::from_utf8_lossy(&removed_again.stderr)
+    );
+    let after = std::fs::read(repos_file(&config_dir)).unwrap();
+    assert_eq!(before, after, "second remove must not modify repositories.toml");
     let _ = std::fs::remove_dir_all(&root);
 }

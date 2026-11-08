@@ -42,7 +42,17 @@ pub(crate) fn watch() -> Result<(), ZlorbError> {
 pub(crate) fn remove(repo_name: String) -> Result<(), ZlorbError> {
     let _config_lock = lock_repo_config()?;
     let mut config = load_config_from_toml()?;
-    throw_if_repo_not_found(&repo_name, &config)?;
+    if !config
+        .repositories
+        .iter()
+        .any(|repo| repo.name == repo_name)
+    {
+        Logger::info(format!(
+            "repo '{}' is not tracked; nothing to remove",
+            repo_name
+        ));
+        return Ok(());
+    }
 
     let filtered_repos = config
         .repositories
@@ -56,7 +66,30 @@ pub(crate) fn remove(repo_name: String) -> Result<(), ZlorbError> {
 
 pub(crate) fn add() -> Result<(), ZlorbError> {
     let cwd = env::current_dir()?;
-    let detected = detect_repo(&cwd)?;
+    let detected = match detect_repo(&cwd) {
+        Ok(detected) => detected,
+        Err(detect_error) => {
+            let Some(root) = git2::Repository::discover(&cwd)
+                .ok()
+                .and_then(|repo| repo.workdir().map(|dir| dir.to_path_buf()))
+            else {
+                return Err(detect_error);
+            };
+            let Some(root_str) = root.to_str() else {
+                return Err(detect_error);
+            };
+            let _config_lock = lock_repo_config()?;
+            let config = load_config_from_toml()?;
+            if let Some(tracked_name) = tracked_name_for_path(root_str, &config) {
+                Logger::info(format!(
+                    "{} is already in the configuration as '{}'; nothing to add",
+                    root_str, tracked_name
+                ));
+                return Ok(());
+            }
+            return Err(detect_error);
+        }
+    };
     let path_str = detected
         .root
         .to_str()
@@ -83,7 +116,13 @@ pub(crate) fn add() -> Result<(), ZlorbError> {
     let _config_lock = lock_repo_config()?;
     let mut config = load_config_from_toml()?;
 
-    throw_if_path_tracked(&path_str, &config)?;
+    if let Some(tracked_name) = tracked_name_for_path(&path_str, &config) {
+        Logger::info(format!(
+            "{} is already in the configuration as '{}'; nothing to add",
+            path_str, tracked_name
+        ));
+        return Ok(());
+    }
 
     let name_collision = config
         .repositories
@@ -130,23 +169,15 @@ pub(crate) fn list() -> Result<(), ZlorbError> {
     Ok(())
 }
 
-fn throw_if_path_tracked(
+fn tracked_name_for_path(
     path: &str,
     config: &RepositoriesConfigurationFile,
-) -> Result<(), ZlorbError> {
-    if let Some(found) = config
+) -> Option<String> {
+    config
         .repositories
         .iter()
         .find(|item| same_path(&item.path, path))
-    {
-        let err = format!(
-            "{} is already in the configuration as '{}'",
-            path, found.name
-        );
-        return Err(ZlorbError::Other(err));
-    }
-
-    Ok(())
+        .map(|item| item.name.clone())
 }
 
 fn same_path(a: &str, b: &str) -> bool {
@@ -190,19 +221,4 @@ fn unique_repo_name(
     }
 }
 
-fn throw_if_repo_not_found(
-    repo_name: &String,
-    config: &RepositoriesConfigurationFile,
-) -> Result<(), ZlorbError> {
-    if config
-        .repositories
-        .iter()
-        .find(|repo| &repo.name == repo_name)
-        .is_none()
-    {
-        let err = format!("repo '{}' not found in tracked repos", repo_name);
-        return Err(ZlorbError::Other(err));
-    };
 
-    Ok(())
-}

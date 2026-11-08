@@ -5,12 +5,24 @@ pub struct DaemonManager {}
 impl DaemonManager {
     pub fn start() -> Result<(), ZlorbError> {
         let out_status = DaemonManager::run_process_check()?;
-        let is_running = out_status.success();
-        match is_running {
-            true => DaemonManager::run_service_restart_cmd()?,
-            false => DaemonManager::run_service_start_cmd()?,
-        };
-        Ok(())
+        if out_status.success() {
+            Logger::info("Daemon already running; nothing to start".into());
+            return Ok(());
+        }
+        DaemonManager::run_service_start_cmd()
+    }
+
+    pub fn stop() -> Result<(), ZlorbError> {
+        let out_status = DaemonManager::run_process_check()?;
+        if !out_status.success() {
+            Logger::info("Daemon is not running; nothing to stop".into());
+            return Ok(());
+        }
+        DaemonManager::run_service_stop_cmd()
+    }
+
+    pub fn restart() -> Result<(), ZlorbError> {
+        DaemonManager::run_service_restart_cmd()
     }
 
     pub fn is_running() -> Result<bool, ZlorbError> {
@@ -42,8 +54,23 @@ impl DaemonManager {
         Ok(())
     }
 
+    fn run_service_stop_cmd() -> Result<(), ZlorbError> {
+        Logger::info("Stopping the daemon".into());
+        let mut cmd = Command::new("systemctl");
+        if !is_root() {
+            cmd.arg("--user");
+        }
+        let status = cmd
+            .args(["stop", "zlorb"])
+            .status()
+            .map_err(ZlorbError::Io)?;
+        ensure_daemon_action_succeeded(status, "stop")?;
+        Logger::info("...Stopped".into());
+        Ok(())
+    }
+
     fn run_service_restart_cmd() -> Result<(), ZlorbError> {
-        Logger::info("Daemon already running, restarting it".into());
+        Logger::info("Restarting the daemon".into());
         let mut cmd = Command::new("systemctl");
         if !is_root() {
             cmd.arg("--user");
@@ -96,9 +123,22 @@ mod tests {
     }
 
     #[test]
-    fn successful_start_and_restart_statuses_pass() {
+    fn successful_start_stop_and_restart_statuses_pass() {
         assert!(ensure_daemon_action_succeeded_in_scope(status(0), "start", "--user ").is_ok());
+        assert!(ensure_daemon_action_succeeded_in_scope(status(0), "stop", "--user ").is_ok());
         assert!(ensure_daemon_action_succeeded_in_scope(status(0), "restart", "").is_ok());
+    }
+
+    #[test]
+    fn failed_stop_status_is_an_error_naming_the_action_and_the_inspect_command() {
+        let err = format!(
+            "{:?}",
+            ensure_daemon_action_succeeded_in_scope(status(3), "stop", "--user ").unwrap_err()
+        );
+        assert!(err.contains("systemctl --user stop zlorb failed"), "{}", err);
+        assert!(err.contains("exit status: 3"), "{}", err);
+        assert!(err.contains("the daemon did not stop"), "{}", err);
+        assert!(err.contains("systemctl --user status zlorb"), "{}", err);
     }
 
     #[test]
