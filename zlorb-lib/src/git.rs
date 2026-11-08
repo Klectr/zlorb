@@ -33,22 +33,44 @@ pub fn detect_repo(path: &Path) -> Result<DetectedRepo, ZlorbError> {
         ))
     })?;
     let root: PathBuf = workdir.components().collect();
-    let head = repo.head().map_err(ZlorbError::Git)?;
-    if !head.is_branch() {
-        return Err(ZlorbError::Other(format!(
-            "{} has a detached HEAD; check out the branch zlorb should watch and add again",
-            root.display()
-        )));
-    }
-    let branch = head
-        .shorthand()
-        .ok_or_else(|| {
-            ZlorbError::Other(format!(
-                "could not read the current branch of {}",
-                root.display()
-            ))
-        })?
-        .to_string();
+    let branch = match repo.head() {
+        Ok(head) => {
+            if !head.is_branch() {
+                return Err(ZlorbError::Other(format!(
+                    "{} has a detached HEAD; check out the branch zlorb should watch and add again",
+                    root.display()
+                )));
+            }
+            head.shorthand()
+                .ok_or_else(|| {
+                    ZlorbError::Other(format!(
+                        "could not read the current branch of {}",
+                        root.display()
+                    ))
+                })?
+                .to_string()
+        }
+        Err(e) if e.code() == git2::ErrorCode::UnbornBranch => {
+            let head_ref = repo.find_reference("HEAD").map_err(ZlorbError::Git)?;
+            let target = head_ref.symbolic_target().ok_or_else(|| {
+                ZlorbError::Other(format!(
+                    "could not read the current branch of {}",
+                    root.display()
+                ))
+            })?;
+            target
+                .strip_prefix("refs/heads/")
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| {
+                    ZlorbError::Other(format!(
+                        "could not read the current branch of {}",
+                        root.display()
+                    ))
+                })?
+                .to_string()
+        }
+        Err(e) => return Err(ZlorbError::Git(e)),
+    };
     let remotes = repo.remotes().map_err(ZlorbError::Git)?;
     let names: Vec<&str> = remotes.iter().flatten().collect();
     let remote = if names.contains(&"origin") {
@@ -381,6 +403,57 @@ mod tests {
         let err = detect_repo(&root).unwrap_err();
         assert!(
             format!("{:?}", err).contains("is not a valid git repository"),
+            "unexpected error: {:?}",
+            err
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_repo_reads_the_branch_of_an_unborn_head() {
+        let root = temp_dir("unborn");
+        let repo = init_repo(&root, "main");
+        add_origin(&repo);
+        drop(repo);
+        let detected = detect_repo(&root).unwrap();
+        assert_eq!(detected.branch, "main");
+        assert_eq!(detected.root, root);
+        assert_eq!(detected.remote, "origin");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_repo_reads_a_non_initial_branch_of_an_unborn_head() {
+        let root = temp_dir("unborn-non-initial");
+        let repo = init_repo(&root, "main");
+        repo.set_head("refs/heads/trunk").unwrap();
+        add_origin(&repo);
+        drop(repo);
+        let detected = detect_repo(&root).unwrap();
+        assert_eq!(detected.branch, "trunk");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_repo_reads_a_nested_branch_of_an_unborn_head() {
+        let root = temp_dir("unborn-nested-branch");
+        let repo = init_repo(&root, "main");
+        repo.set_head("refs/heads/feature/foo").unwrap();
+        add_origin(&repo);
+        drop(repo);
+        let detected = detect_repo(&root).unwrap();
+        assert_eq!(detected.branch, "feature/foo");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_repo_rejects_an_unborn_head_with_no_remote() {
+        let root = temp_dir("unborn-no-remote");
+        let repo = init_repo(&root, "main");
+        drop(repo);
+        let err = detect_repo(&root).unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("has no git remote"),
             "unexpected error: {:?}",
             err
         );
