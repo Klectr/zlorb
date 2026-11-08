@@ -104,7 +104,7 @@ fn concurrent_adds_of_distinct_repos_all_land() {
 }
 
 #[test]
-fn concurrent_adds_of_the_same_repo_add_it_exactly_once() {
+fn concurrent_adds_of_the_same_repo_all_succeed_and_add_it_exactly_once() {
     let root = temp_dir("same-adds");
     let config_dir = root.join("config");
     let repo_path = root.join("my-app");
@@ -120,7 +120,10 @@ fn concurrent_adds_of_the_same_repo_add_it_exactly_once() {
             successes += 1;
         }
     }
-    assert_eq!(successes, 1, "exactly one concurrent add may succeed");
+    assert_eq!(
+        successes, 4,
+        "every concurrent add should succeed: one adds, the rest are no-ops"
+    );
 
     let contents = std::fs::read_to_string(repos_file(&config_dir)).unwrap();
     assert_eq!(

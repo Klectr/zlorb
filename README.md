@@ -102,7 +102,14 @@ zlorb-ctl status --json
 
 # Remove a repository
 zlorb-ctl remove --repo-name my-repo
+
+# Start, stop, or restart the daemon
+zlorb-ctl start
+zlorb-ctl stop
+zlorb-ctl restart
 ```
+
+These commands are idempotent: re-running one that has already reached its target state is a no-op success, not an error. Adding an already-tracked repository, removing one that is not tracked, starting an already-running daemon, and stopping an already-stopped daemon all succeed without changing anything.
 
 `status --json` prints one JSON document: `daemon_running` (plus `daemon_error` when systemctl itself cannot be run), and per repo its config, local `head_oid`, `last_fetch_oid` (the `FETCH_HEAD` line for the tracked branch, from the repo's common git dir; null when that file has no line for it) and `last_fetch_unix` (that file's modification time; null when the repo was never fetched), and `error` — the first current problem found (invalid branch/remote/strategy, missing path, unreadable HEAD, unopenable repo, unreadable remote) or null. When the config itself cannot be loaded, the document instead carries the problem in a top-level `error` with an empty repo list, and the command still exits non-zero. The daemon keeps build outcomes only in memory and persists no status file, so `status` does not report a build status; inventing one from the config would not be truthful.
 
