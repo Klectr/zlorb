@@ -13,6 +13,10 @@ impl DaemonManager {
         Ok(())
     }
 
+    pub fn is_running() -> Result<bool, ZlorbError> {
+        Ok(DaemonManager::run_process_check()?.success())
+    }
+
     fn run_process_check() -> Result<ExitStatus, ZlorbError> {
         let mut cmd = Command::new("systemctl");
         if !is_root() {

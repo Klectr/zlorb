@@ -5,11 +5,9 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.5.48", features = ["derive"] }
+git2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 zlorb-lib = { path = "../zlorb-lib" }
 zlorb-web = { path = "../zlorb-web" }
-
-[dev-dependencies]
-git2 = { workspace = true }

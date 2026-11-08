@@ -1,5 +1,5 @@
 mod utils;
-use crate::utils::{daemon::DaemonManager, repo, setup};
+use crate::utils::{daemon::DaemonManager, repo, setup, status};
 use clap::{Parser, Subcommand};
 use zlorb_lib::error::ZlorbError;
 
@@ -21,6 +21,11 @@ enum Commands {
     Add,
     /// list repos currently watched by the daemon @ ~/.config/zlorb/configs
     List,
+    /// report daemon and per-repo state; --json prints it as one JSON document
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
     /// starts the repo watch daemon
     Start,
     /// sets up the daemon: config dir + systemd unit, then enables and starts it
@@ -44,6 +49,7 @@ fn main() -> Result<(), ZlorbError> {
     let res = match args.cmd {
         Commands::Add => repo::add(),
         Commands::List => repo::list(),
+        Commands::Status { json } => status::status(json),
         Commands::Start => DaemonManager::start(),
         Commands::Setup { print_only } => setup::setup(print_only),
         Commands::Remove { repo_name } => repo::remove(repo_name),
