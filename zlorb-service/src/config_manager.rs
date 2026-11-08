@@ -625,6 +625,40 @@ mod tests {
     }
 
     #[test]
+    fn empty_repositories_file_clears_the_reported_parse_error() {
+        let root = temp_dir("parse-wiring-empty");
+        let config_dir = root.join("config");
+        let good = root.join("good");
+        let bad = root.join("bad");
+        init_repo(&good);
+        init_repo(&bad);
+        write_repos(&config_dir, &bad_entry_contents(&good, &bad));
+        let manager = ConfigManager::with_config_dir(config_dir.clone());
+        let expected = expected_parse_skip(&config_dir);
+        assert_eq!(manager.load_repo_configurations().unwrap().len(), 1);
+        write_repos(&config_dir, "");
+        assert!(manager.load_repo_configurations().unwrap().is_empty());
+        assert_eq!(manager.unreported_parse_errors(&[expected]).len(), 1);
+    }
+
+    #[test]
+    fn repositories_file_without_repository_key_clears_the_reported_parse_error() {
+        let root = temp_dir("parse-wiring-no-key");
+        let config_dir = root.join("config");
+        let good = root.join("good");
+        let bad = root.join("bad");
+        init_repo(&good);
+        init_repo(&bad);
+        write_repos(&config_dir, &bad_entry_contents(&good, &bad));
+        let manager = ConfigManager::with_config_dir(config_dir.clone());
+        let expected = expected_parse_skip(&config_dir);
+        assert_eq!(manager.load_repo_configurations().unwrap().len(), 1);
+        write_repos(&config_dir, "# no repos yet\n");
+        assert!(manager.load_repo_configurations().unwrap().is_empty());
+        assert_eq!(manager.unreported_parse_errors(&[expected]).len(), 1);
+    }
+
+    #[test]
     fn malformed_repositories_file_leaves_the_reported_parse_error_alone() {
         let root = temp_dir("parse-wiring-malformed");
         let config_dir = root.join("config");
