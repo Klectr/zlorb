@@ -55,8 +55,17 @@ pub fn detect_repo(path: &Path) -> Result<DetectedRepo, ZlorbError> {
         "origin".to_string()
     } else if names.len() == 1 {
         names[0].to_string()
+    } else if names.is_empty() {
+        return Err(ZlorbError::Other(format!(
+            "{} has no git remote; add one with 'git remote add origin <url>' in that repo and add again",
+            root.display()
+        )));
     } else {
-        "origin".to_string()
+        return Err(ZlorbError::Other(format!(
+            "{} has multiple git remotes ({}) but none named origin; rename the remote zlorb should track with 'git remote rename <name> origin' and add again",
+            root.display(),
+            names.join(", ")
+        )));
     };
     Ok(DetectedRepo {
         root,
@@ -102,6 +111,10 @@ mod tests {
         let mut opts = RepositoryInitOptions::new();
         opts.initial_head(branch);
         Repository::init_opts(path, &opts).unwrap()
+    }
+
+    fn add_origin(repo: &Repository) {
+        repo.remote("origin", "https://example.com/repo.git").unwrap();
     }
 
     fn commit_all(repo: &Repository, message: &str) -> git2::Oid {
@@ -165,6 +178,7 @@ mod tests {
         let root = temp_dir("main-branch");
         let repo = init_repo(&root, "main");
         commit_all(&repo, "v1");
+        add_origin(&repo);
         drop(repo);
         let detected = detect_repo(&root).unwrap();
         assert_eq!(detected.branch, "main");
@@ -178,6 +192,7 @@ mod tests {
         let root = temp_dir("master-branch");
         let repo = init_repo(&root, "master");
         commit_all(&repo, "v1");
+        add_origin(&repo);
         drop(repo);
         let detected = detect_repo(&root).unwrap();
         assert_eq!(detected.branch, "master");
@@ -193,6 +208,7 @@ mod tests {
         repo.branch("dev", &commit, false).unwrap();
         drop(commit);
         repo.set_head("refs/heads/dev").unwrap();
+        add_origin(&repo);
         drop(repo);
         let detected = detect_repo(&root).unwrap();
         assert_eq!(detected.branch, "dev");
@@ -204,6 +220,7 @@ mod tests {
         let root = temp_dir("subdir");
         let repo = init_repo(&root, "main");
         commit_all(&repo, "v1");
+        add_origin(&repo);
         drop(repo);
         let subdir = root.join("nested").join("inner");
         fs::create_dir_all(&subdir).unwrap();
@@ -218,11 +235,13 @@ mod tests {
         let root = temp_dir("nested-root");
         let parent = init_repo(&root, "main");
         commit_all(&parent, "parent v1");
+        add_origin(&parent);
         drop(parent);
         let nested_path = root.join("vendor").join("child");
         fs::create_dir_all(nested_path.parent().unwrap()).unwrap();
         let nested = init_repo(&nested_path, "release");
         commit_all(&nested, "child v1");
+        add_origin(&nested);
         drop(nested);
         let detected = detect_repo(&nested_path).unwrap();
         assert_eq!(detected.root, nested_path);
@@ -243,6 +262,7 @@ mod tests {
         fs::create_dir_all(nested_path.parent().unwrap()).unwrap();
         let nested = init_repo(&nested_path, "release");
         commit_all(&nested, "child v1");
+        add_origin(&nested);
         drop(nested);
         let subdir = nested_path.join("src").join("deep");
         fs::create_dir_all(&subdir).unwrap();
@@ -261,6 +281,7 @@ mod tests {
         let staging = temp_dir("submodule-staging");
         let child = init_repo(&staging, "release");
         commit_all(&child, "child v1");
+        add_origin(&child);
         drop(child);
         let modules_dir = root.join(".git").join("modules");
         fs::create_dir_all(&modules_dir).unwrap();
@@ -315,6 +336,42 @@ mod tests {
         drop(repo);
         let detected = detect_repo(&root).unwrap();
         assert_eq!(detected.remote, "origin");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_repo_rejects_a_repo_with_no_remotes() {
+        let root = temp_dir("no-remote");
+        let repo = init_repo(&root, "main");
+        commit_all(&repo, "v1");
+        drop(repo);
+        let err = detect_repo(&root).unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("has no git remote"),
+            "unexpected error: {:?}",
+            err
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_repo_rejects_multiple_remotes_without_origin() {
+        let root = temp_dir("multi-no-origin");
+        let repo = init_repo(&root, "main");
+        commit_all(&repo, "v1");
+        repo.remote("upstream", "https://example.com/repo.git")
+            .unwrap();
+        repo.remote("fork", "https://example.com/fork.git").unwrap();
+        drop(repo);
+        let err = detect_repo(&root).unwrap_err();
+        let text = format!("{:?}", err);
+        assert!(
+            text.contains("multiple git remotes")
+                && text.contains("upstream")
+                && text.contains("fork"),
+            "unexpected error: {:?}",
+            err
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

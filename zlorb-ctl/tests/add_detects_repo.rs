@@ -88,6 +88,34 @@ fn add_records_the_repos_branch_remote_and_root() {
 }
 
 #[test]
+fn add_without_a_remote_fails_with_an_actionable_message() {
+    let root = temp_dir("no-remote");
+    let config_dir = root.join("config");
+    let repo_path = root.join("my-app");
+    init_repo(&repo_path, "main");
+    let output = run_add(&repo_path, &config_dir);
+    assert!(
+        !output.status.success(),
+        "zlorb-ctl add unexpectedly succeeded for a repo with no remote"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("has no git remote"),
+        "add error should explain the missing remote, got: {}",
+        combined
+    );
+    assert!(
+        !config_dir.join("repositories.toml").exists(),
+        "failed add must not create repositories.toml"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn add_outside_a_repo_fails() {
     let root = temp_dir("not-a-repo");
     let config_dir = root.join("config");

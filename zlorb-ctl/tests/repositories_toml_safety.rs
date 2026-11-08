@@ -33,6 +33,8 @@ fn init_repo(path: &Path, branch: &str) {
     let sig = Signature::now("zlorb-test", "zlorb-test@example.com").unwrap();
     repo.commit(Some("HEAD"), &sig, &sig, "v1", &tree, &[])
         .unwrap();
+    repo.remote("origin", "https://example.com/repo.git")
+        .unwrap();
 }
 
 fn run_ctl(args: &[&str], cwd: &Path, config_dir: &Path) -> std::process::Output {
