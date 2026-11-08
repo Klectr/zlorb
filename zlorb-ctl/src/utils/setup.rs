@@ -76,10 +76,15 @@ pub fn resolve_service_binary(current_exe: &Path, home_dir: &Path) -> PathBuf {
 pub fn ensure_config(config_dir: &Path) -> Result<(), ZlorbError> {
     std::fs::create_dir_all(config_dir).map_err(ZlorbError::Io)?;
     let repos = config_dir.join("repositories.toml");
-    if !repos.exists() {
-        std::fs::write(&repos, "").map_err(ZlorbError::Io)?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&repos)
+    {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(ZlorbError::Io(e)),
     }
-    Ok(())
 }
 
 fn systemctl(is_root_user: bool, args: &[&str]) -> std::io::Result<std::process::ExitStatus> {

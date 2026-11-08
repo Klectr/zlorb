@@ -4,8 +4,8 @@ pub mod git;
 pub mod log;
 
 use std::{
-    fs::{self, File, OpenOptions},
-    path::PathBuf,
+    fs::{self},
+    path::{Path, PathBuf},
 };
 
 use crate::{config::RepositoriesConfigurationFile, error::ZlorbError, log::Logger};
@@ -98,30 +98,74 @@ pub fn check_file_exist(path: PathBuf) -> bool {
     std::fs::exists(path).unwrap_or_default()
 }
 
-/// This function creates the config file if needed, and returns toml
-///
-/// The toml can be empty, or populated depending on the state of the file
-pub fn create_config_from_toml(
-    truncate: bool,
-) -> Result<(RepositoriesConfigurationFile, File), ZlorbError> {
-    let config_path_dir = get_zlorb_config_dir();
-    let config_file_path = config_path_dir.join("repositories.toml");
-    fs::create_dir_all(&config_path_dir)?;
-    let file_contents = fs::read_to_string(&config_file_path).unwrap_or_default();
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(truncate)
-        .open(config_file_path)?;
-
-    let config_loaded = toml::from_str::<RepositoriesConfigurationFile>(&file_contents).unwrap_or(
-        RepositoriesConfigurationFile {
+pub fn load_config_from_path(
+    config_file_path: &Path,
+) -> Result<RepositoriesConfigurationFile, ZlorbError> {
+    let file_contents = match fs::read_to_string(config_file_path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RepositoriesConfigurationFile {
+                repositories: vec![],
+            });
+        }
+        Err(e) => return Err(ZlorbError::Io(e)),
+    };
+    if file_contents.trim().is_empty() {
+        return Ok(RepositoriesConfigurationFile {
             repositories: vec![],
-        },
-    );
+        });
+    }
+    toml::from_str::<RepositoriesConfigurationFile>(&file_contents).map_err(|e| {
+        ZlorbError::ConfigParseError(format!("{}: {}", config_file_path.display(), e))
+    })
+}
 
-    Ok((config_loaded, file))
+pub fn load_config_from_toml() -> Result<RepositoriesConfigurationFile, ZlorbError> {
+    load_config_from_path(&get_zlorb_repo_config_file())
+}
+
+pub fn save_config_to_path(
+    config_file_path: &Path,
+    config: &RepositoriesConfigurationFile,
+) -> Result<(), ZlorbError> {
+    let out_toml = toml::to_string(config).map_err(ZlorbError::TomlSerializationError)?;
+    if let Some(parent) = config_file_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file_name = config_file_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "repositories.toml".to_string());
+    let tmp_path = config_file_path.with_file_name(format!(
+        "{}.tmp-{}",
+        file_name,
+        std::process::id()
+    ));
+    let existing_permissions = fs::metadata(config_file_path)
+        .map(|metadata| metadata.permissions())
+        .ok();
+    let write_result = (|| -> Result<(), ZlorbError> {
+        let mut tmp_file = fs::File::create(&tmp_path).map_err(ZlorbError::Io)?;
+        std::io::Write::write_all(&mut tmp_file, out_toml.as_bytes())
+            .map_err(ZlorbError::Io)?;
+        tmp_file.sync_all().map_err(ZlorbError::Io)?;
+        drop(tmp_file);
+        if let Some(permissions) = existing_permissions {
+            fs::set_permissions(&tmp_path, permissions).map_err(ZlorbError::Io)?;
+        }
+        fs::rename(&tmp_path, config_file_path).map_err(ZlorbError::Io)?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    write_result
+}
+
+pub fn save_config_to_toml(
+    config: &RepositoriesConfigurationFile,
+) -> Result<(), ZlorbError> {
+    save_config_to_path(&get_zlorb_repo_config_file(), config)
 }
 
 #[cfg(test)]
@@ -171,5 +215,116 @@ mod tests {
     fn blank_explicit_dir_falls_through_to_xdg() {
         let dir = resolve_config_dir_from(Some("  "), Some("/xdg"), Path::new("/home/u"));
         assert_eq!(dir, PathBuf::from("/xdg/zlorb"));
+    }
+
+    fn temp_config_path(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "zlorb-lib-config-test-{}-{}-{}",
+            std::process::id(),
+            label,
+            n
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir.join("repositories.toml")
+    }
+
+    fn sample_config() -> RepositoriesConfigurationFile {
+        RepositoriesConfigurationFile {
+            repositories: vec![crate::config::RepositoryConfiguration {
+                name: "demo".to_string(),
+                path: "/tmp/demo".to_string(),
+                remote: "origin".to_string(),
+                branch: "master".to_string(),
+                build_strategy: None,
+                build_command: String::new(),
+                restart_command: None,
+                out_dir: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn missing_config_file_loads_as_empty() {
+        let path = temp_config_path("missing");
+        let loaded = load_config_from_path(&path).unwrap();
+        assert!(loaded.repositories.is_empty());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn empty_and_comment_only_config_load_as_empty() {
+        let path = temp_config_path("empty");
+        fs::write(&path, "").unwrap();
+        assert!(load_config_from_path(&path).unwrap().repositories.is_empty());
+        fs::write(&path, "# no repos yet\n").unwrap();
+        assert!(load_config_from_path(&path).unwrap().repositories.is_empty());
+    }
+
+    #[test]
+    fn malformed_config_is_an_error_naming_the_file_and_leaves_it_unchanged() {
+        let path = temp_config_path("malformed");
+        let bad = "this is not = valid = toml [[\n";
+        fs::write(&path, bad).unwrap();
+        let err = load_config_from_path(&path).unwrap_err();
+        let rendered = format!("{:?}", err);
+        assert!(
+            rendered.contains("repositories.toml"),
+            "error should name the file: {}",
+            rendered
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), bad);
+    }
+
+    #[test]
+    fn config_with_a_wrong_table_name_is_an_error_not_an_empty_config() {
+        let path = temp_config_path("wrong-key");
+        let contents = "[[repositories]]\nname = \"demo\"\npath = \"/tmp/demo\"\nremote = \"origin\"\nbranch = \"master\"\n";
+        fs::write(&path, contents).unwrap();
+        assert!(load_config_from_path(&path).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), contents);
+    }
+
+    #[test]
+    fn config_entry_with_an_unknown_field_is_an_error_not_silently_dropped() {
+        let path = temp_config_path("unknown-field");
+        let contents = "[[repository]]\nname = \"demo\"\npath = \"/tmp/demo\"\nremote = \"origin\"\nbranch = \"master\"\ncustom_thing = \"keepme\"\n";
+        fs::write(&path, contents).unwrap();
+        assert!(load_config_from_path(&path).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), contents);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_preserves_the_existing_files_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_config_path("permissions");
+        fs::write(&path, "").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        save_config_to_path(&path, &sample_config()).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn save_then_load_roundtrips_and_fully_replaces_previous_contents() {
+        let path = temp_config_path("roundtrip");
+        save_config_to_path(&path, &sample_config()).unwrap();
+        let loaded = load_config_from_path(&path).unwrap();
+        assert_eq!(loaded.repositories.len(), 1);
+        assert_eq!(loaded.repositories[0].name, "demo");
+        let empty = RepositoriesConfigurationFile {
+            repositories: vec![],
+        };
+        save_config_to_path(&path, &empty).unwrap();
+        let loaded = load_config_from_path(&path).unwrap();
+        assert!(loaded.repositories.is_empty());
+        assert!(
+            !fs::read_to_string(&path).unwrap().contains("demo"),
+            "stale contents survived a full replace"
+        );
     }
 }
