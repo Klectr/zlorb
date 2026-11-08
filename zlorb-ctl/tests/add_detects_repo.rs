@@ -88,6 +88,54 @@ fn add_records_the_repos_branch_remote_and_root() {
 }
 
 #[test]
+fn add_records_the_branch_upstream_when_configured() {
+    let root = temp_dir("upstream-repo");
+    let config_dir = root.join("config");
+    let repo_path = root.join("my-app");
+    init_repo(&repo_path, "main");
+    let repo = git2::Repository::open(&repo_path).unwrap();
+    let oid = repo.head().unwrap().target().unwrap();
+    let commit = repo.find_commit(oid).unwrap();
+    repo.branch("dev", &commit, false).unwrap();
+    drop(commit);
+    repo.set_head("refs/heads/dev").unwrap();
+    repo.remote("origin", "https://example.com/fork.git").unwrap();
+    repo.remote("upstream", "https://example.com/repo.git")
+        .unwrap();
+    let mut config = repo.config().unwrap();
+    config.set_str("branch.dev.remote", "upstream").unwrap();
+    config
+        .set_str("branch.dev.merge", "refs/heads/main")
+        .unwrap();
+    drop(config);
+    drop(repo);
+
+    let output = run_add(&repo_path, &config_dir);
+    assert!(
+        output.status.success(),
+        "zlorb-ctl add failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let repos = std::fs::read_to_string(config_dir.join("repositories.toml")).unwrap();
+    assert!(
+        repos.contains("branch = \"dev\""),
+        "local branch missing: {}",
+        repos
+    );
+    assert!(
+        repos.contains("remote_branch = \"main\""),
+        "tracked branch missing: {}",
+        repos
+    );
+    assert!(
+        repos.contains("remote = \"upstream\""),
+        "upstream remote missing: {}",
+        repos
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn add_without_a_remote_fails_with_an_actionable_message() {
     let root = temp_dir("no-remote");
     let config_dir = root.join("config");

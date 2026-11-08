@@ -3852,9 +3852,10 @@ impl RepoProcessor {
     }
 
     fn _download_new_data(&self, remote: &mut Remote) -> Result<(), ZlorbError> {
+        let remote_branch = self.config.resolved_remote_branch().to_string();
         remote
             .fetch(
-                std::slice::from_ref(&self.config.branch),
+                std::slice::from_ref(&remote_branch),
                 Some(&mut self._setup_fetchoptions_with_creds()),
                 None,
             )
@@ -4320,7 +4321,8 @@ impl RepoProcessor {
             .repo
             .resolve_reference_from_short_name(&format!(
                 "{}/{}",
-                self.config.remote, self.config.branch
+                self.config.remote,
+                self.config.resolved_remote_branch()
             ))
             .map_err(ZlorbError::Git)?;
 
@@ -4439,6 +4441,7 @@ mod tests {
             path: watched.to_string_lossy().into_owned(),
             remote: "origin".to_string(),
             branch: "master".to_string(),
+            remote_branch: None,
             build_strategy: Some("rust".to_string()),
             build_command: String::new(),
             restart_command: None,
@@ -4557,6 +4560,65 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).contains("fixture-version-two")
         );
         drop(statuses);
+        drop(watched);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fast_forward_follows_the_remote_branch_when_it_differs_from_the_local_branch() {
+        let root = temp_dir("fast-forward-remote-branch");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("main");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        let v1 = commit_all(&upstream, "v1");
+        drop(upstream);
+        let watched = git2::Repository::clone(
+            upstream_path.to_string_lossy().as_ref(),
+            &watched_path,
+        )
+        .unwrap();
+        assert_eq!(head_oid(&watched), v1);
+        let v1_commit = watched.find_commit(v1).unwrap();
+        watched.branch("dev", &v1_commit, false).unwrap();
+        drop(v1_commit);
+        watched.set_head("refs/heads/dev").unwrap();
+        watched
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .delete()
+            .unwrap();
+        drop(watched);
+
+        let upstream = git2::Repository::open(&upstream_path).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-two");
+        let v2 = commit_all(&upstream, "v2");
+        drop(upstream);
+
+        let processor = RepoProcessor::new(RepositoryConfiguration {
+            name: "watched".to_string(),
+            path: watched_path.to_string_lossy().into_owned(),
+            remote: "origin".to_string(),
+            branch: "dev".to_string(),
+            remote_branch: Some("main".to_string()),
+            build_strategy: Some("rust".to_string()),
+            build_command: String::new(),
+            restart_command: None,
+            out_dir: None,
+        })
+        .unwrap();
+        processor.update_from_remote().unwrap();
+
+        let watched = git2::Repository::open(&watched_path).unwrap();
+        assert_eq!(head_oid(&watched), v2);
+        let head_name = watched.head().unwrap().shorthand().map(str::to_string);
+        assert_eq!(head_name.as_deref(), Some("dev"));
+        let source = std::fs::read_to_string(watched_path.join("src/main.rs")).unwrap();
+        assert!(source.contains("fixture-version-two"));
+        let artifact = fixture_artifact(&watched_path);
+        assert!(artifact.exists());
         drop(watched);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -13182,6 +13244,7 @@ mod tests {
             path: watched.to_string_lossy().into_owned(),
             remote: "origin".to_string(),
             branch: "master".to_string(),
+            remote_branch: None,
             build_strategy: strategy.map(|s| s.to_string()),
             build_command: String::new(),
             restart_command: None,
@@ -14338,6 +14401,7 @@ mod tests {
             path,
             remote: "origin".to_string(),
             branch: "master".to_string(),
+            remote_branch: None,
             build_strategy: Some("rust".to_string()),
             build_command: String::new(),
             restart_command: None,

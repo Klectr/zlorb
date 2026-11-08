@@ -297,6 +297,7 @@ mod tests {
                 path: "/tmp/demo".to_string(),
                 remote: "origin".to_string(),
                 branch: "master".to_string(),
+                remote_branch: None,
                 build_strategy: None,
                 build_command: String::new(),
                 restart_command: None,
