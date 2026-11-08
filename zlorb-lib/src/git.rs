@@ -14,6 +14,7 @@ pub struct DetectedRepo {
     pub root: PathBuf,
     pub branch: String,
     pub remote: String,
+    pub remote_branch: String,
 }
 
 pub fn detect_repo(path: &Path) -> Result<DetectedRepo, ZlorbError> {
@@ -73,6 +74,25 @@ pub fn detect_repo(path: &Path) -> Result<DetectedRepo, ZlorbError> {
     };
     let remotes = repo.remotes().map_err(ZlorbError::Git)?;
     let names: Vec<&str> = remotes.iter().flatten().collect();
+    if let Some((upstream_remote, tracked_branch)) = upstream_target(&repo, &branch, &root)? {
+        if !names.contains(&upstream_remote.as_str()) {
+            return Err(ZlorbError::Other(format!(
+                "{} branch {} tracks {} via remote {}, but that remote does not exist; add it with 'git remote add {} <url>' or fix the branch upstream with 'git branch --unset-upstream {}' and add again",
+                root.display(),
+                branch,
+                tracked_branch,
+                upstream_remote,
+                upstream_remote,
+                branch
+            )));
+        }
+        return Ok(DetectedRepo {
+            root,
+            branch,
+            remote: upstream_remote,
+            remote_branch: tracked_branch,
+        });
+    }
     let remote = if names.contains(&"origin") {
         "origin".to_string()
     } else if names.len() == 1 {
@@ -90,10 +110,62 @@ pub fn detect_repo(path: &Path) -> Result<DetectedRepo, ZlorbError> {
         )));
     };
     Ok(DetectedRepo {
-        root,
-        branch,
+        root: root.clone(),
+        branch: branch.clone(),
         remote,
+        remote_branch: branch,
     })
+}
+
+fn upstream_target(
+    repo: &Repository,
+    branch: &str,
+    root: &Path,
+) -> Result<Option<(String, String)>, ZlorbError> {
+    let config = repo.config().map_err(ZlorbError::Git)?;
+    let remote = match config.get_string(&format!("branch.{}.remote", branch)) {
+        Ok(value) => value,
+        Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(None),
+        Err(e) => return Err(ZlorbError::Git(e)),
+    };
+    if remote.is_empty() || remote == "." {
+        return Ok(None);
+    }
+    if remote.starts_with('/')
+        || remote.starts_with('.')
+        || remote.starts_with('~')
+        || remote.contains("://")
+        || remote.contains(':')
+    {
+        return Err(ZlorbError::Other(format!(
+            "{} branch {} tracks {}, which is a path or URL, not a named git remote; zlorb can only watch a named remote, so add one with 'git remote add <name> <url>', point the branch at it with 'git branch --set-upstream-to=<name>/<branch> {}', and add again",
+            root.display(),
+            branch,
+            remote,
+            branch
+        )));
+    }
+    let merge = match config.get_string(&format!("branch.{}.merge", branch)) {
+        Ok(value) => value,
+        Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(None),
+        Err(e) => return Err(ZlorbError::Git(e)),
+    };
+    let Some(tracked) = merge.strip_prefix("refs/heads/") else {
+        return Ok(None);
+    };
+    if tracked.is_empty() {
+        return Ok(None);
+    }
+    if !git2::Reference::is_valid_name(&format!("refs/heads/{}", tracked)) {
+        return Err(ZlorbError::Other(format!(
+            "{} branch {} has an upstream merge ref {} that is not a valid branch name; fix it with 'git branch --unset-upstream {}' or set a valid upstream and add again",
+            root.display(),
+            branch,
+            merge,
+            branch
+        )));
+    }
+    Ok(Some((remote, tracked.to_string())))
 }
 
 pub fn fetch_update(repo_path: String) {
@@ -137,6 +209,27 @@ mod tests {
 
     fn add_origin(repo: &Repository) {
         repo.remote("origin", "https://example.com/repo.git").unwrap();
+    }
+
+    fn set_upstream(repo: &Repository, branch: &str, remote: &str, merge: &str) {
+        let mut config = repo.config().unwrap();
+        config
+            .set_str(&format!("branch.{}.remote", branch), remote)
+            .unwrap();
+        config
+            .set_str(
+                &format!("branch.{}.merge", branch),
+                &format!("refs/heads/{}", merge),
+            )
+            .unwrap();
+    }
+
+    fn checkout_branch(repo: &Repository, branch: &str) {
+        let oid = repo.head().unwrap().target().unwrap();
+        let commit = repo.find_commit(oid).unwrap();
+        repo.branch(branch, &commit, false).unwrap();
+        drop(commit);
+        repo.set_head(&format!("refs/heads/{}", branch)).unwrap();
     }
 
     fn commit_all(repo: &Repository, message: &str) -> git2::Oid {
@@ -206,6 +299,7 @@ mod tests {
         assert_eq!(detected.branch, "main");
         assert_eq!(detected.root, root);
         assert_eq!(detected.remote, "origin");
+        assert_eq!(detected.remote_branch, "main");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -358,6 +452,239 @@ mod tests {
         drop(repo);
         let detected = detect_repo(&root).unwrap();
         assert_eq!(detected.remote, "origin");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_repo_honours_the_branch_upstream_over_origin() {
+        let root = temp_dir("upstream-fork");
+        let repo = init_repo(&root, "main");
+        commit_all(&repo, "v1");
+        checkout_branch(&repo, "dev");
+        repo.remote("origin", "https://example.com/fork.git").unwrap();
+        repo.remote("upstream", "https://example.com/repo.git")
+            .unwrap();
+        set_upstream(&repo, "dev", "upstream", "main");
+        drop(repo);
+        let detected = detect_repo(&root).unwrap();
+        assert_eq!(detected.remote, "upstream");
+        assert_eq!(detected.branch, "dev");
+        assert_eq!(detected.remote_branch, "main");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_repo_honours_an_upstream_with_the_same_branch_name() {
+        let root = temp_dir("upstream-same-name");
+        let repo = init_repo(&root, "main");
+        commit_all(&repo, "v1");
+        checkout_branch(&repo, "dev");
+        add_origin(&repo);
+        set_upstream(&repo, "dev", "origin", "dev");
+        drop(repo);
+        let detected = detect_repo(&root).unwrap();
+        assert_eq!(detected.remote, "origin");
+        assert_eq!(detected.branch, "dev");
+        assert_eq!(detected.remote_branch, "dev");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_repo_honours_a_nested_upstream_merge_branch() {
+        let root = temp_dir("upstream-nested-merge");
+        let repo = init_repo(&root, "main");
+        commit_all(&repo, "v1");
+        checkout_branch(&repo, "work");
+        add_origin(&repo);
+        set_upstream(&repo, "work", "origin", "feature/foo");
+        drop(repo);
+        let detected = detect_repo(&root).unwrap();
+        assert_eq!(detected.remote, "origin");
+        assert_eq!(detected.branch, "work");
+        assert_eq!(detected.remote_branch, "feature/foo");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_repo_rejects_an_upstream_remote_that_does_not_exist() {
+        let root = temp_dir("upstream-missing-remote");
+        let repo = init_repo(&root, "main");
+        commit_all(&repo, "v1");
+        add_origin(&repo);
+        set_upstream(&repo, "main", "ghost", "main");
+        drop(repo);
+        let err = detect_repo(&root).unwrap_err();
+        let text = format!("{:?}", err);
+        assert!(
+            text.contains("ghost") && text.contains("does not exist"),
+            "unexpected error: {:?}",
+            err
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_repo_ignores_a_local_upstream() {
+        let root = temp_dir("upstream-local");
+        let repo = init_repo(&root, "main");
+        commit_all(&repo, "v1");
+        checkout_branch(&repo, "dev");
+        add_origin(&repo);
+        set_upstream(&repo, "dev", ".", "main");
+        drop(repo);
+        let detected = detect_repo(&root).unwrap();
+        assert_eq!(detected.remote, "origin");
+        assert_eq!(detected.branch, "dev");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_repo_ignores_an_incomplete_upstream() {
+        let root = temp_dir("upstream-incomplete");
+        let repo = init_repo(&root, "main");
+        commit_all(&repo, "v1");
+        checkout_branch(&repo, "dev");
+        repo.remote("upstream", "https://example.com/repo.git")
+            .unwrap();
+        add_origin(&repo);
+        repo.config()
+            .unwrap()
+            .set_str("branch.dev.remote", "upstream")
+            .unwrap();
+        drop(repo);
+        let detected = detect_repo(&root).unwrap();
+        assert_eq!(detected.remote, "origin");
+        assert_eq!(detected.branch, "dev");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_repo_ignores_an_upstream_merge_outside_heads() {
+        let root = temp_dir("upstream-merge-outside-heads");
+        let repo = init_repo(&root, "main");
+        commit_all(&repo, "v1");
+        add_origin(&repo);
+        let mut config = repo.config().unwrap();
+        config.set_str("branch.main.remote", "origin").unwrap();
+        config
+            .set_str("branch.main.merge", "refs/remotes/origin/main")
+            .unwrap();
+        drop(config);
+        drop(repo);
+        let detected = detect_repo(&root).unwrap();
+        assert_eq!(detected.remote, "origin");
+        assert_eq!(detected.branch, "main");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_repo_honours_the_upstream_of_an_unborn_head() {
+        let root = temp_dir("unborn-upstream");
+        let repo = init_repo(&root, "main");
+        repo.remote("upstream", "https://example.com/repo.git")
+            .unwrap();
+        set_upstream(&repo, "main", "upstream", "trunk");
+        drop(repo);
+        let detected = detect_repo(&root).unwrap();
+        assert_eq!(detected.remote, "upstream");
+        assert_eq!(detected.branch, "main");
+        assert_eq!(detected.remote_branch, "trunk");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_repo_ignores_an_upstream_set_on_another_branch() {
+        let root = temp_dir("upstream-other-branch");
+        let repo = init_repo(&root, "main");
+        commit_all(&repo, "v1");
+        checkout_branch(&repo, "dev");
+        repo.remote("upstream", "https://example.com/repo.git")
+            .unwrap();
+        add_origin(&repo);
+        set_upstream(&repo, "main", "upstream", "main");
+        drop(repo);
+        let detected = detect_repo(&root).unwrap();
+        assert_eq!(detected.remote, "origin");
+        assert_eq!(detected.branch, "dev");
+        assert_eq!(detected.remote_branch, "dev");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_repo_honours_an_upstream_on_a_dotted_branch() {
+        let root = temp_dir("upstream-dotted-branch");
+        let repo = init_repo(&root, "main");
+        commit_all(&repo, "v1");
+        checkout_branch(&repo, "release/1.2");
+        repo.remote("upstream", "https://example.com/repo.git")
+            .unwrap();
+        add_origin(&repo);
+        drop(repo);
+        let config_path = root.join(".git").join("config");
+        let mut text = fs::read_to_string(&config_path).unwrap();
+        text.push_str("[branch \"release/1.2\"]\n\tremote = upstream\n\tmerge = refs/heads/main\n");
+        fs::write(&config_path, text).unwrap();
+        let detected = detect_repo(&root).unwrap();
+        assert_eq!(detected.remote, "upstream");
+        assert_eq!(detected.branch, "release/1.2");
+        assert_eq!(detected.remote_branch, "main");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_repo_rejects_an_upstream_merge_that_is_not_a_valid_branch() {
+        let root = temp_dir("upstream-invalid-merge");
+        let repo = init_repo(&root, "main");
+        commit_all(&repo, "v1");
+        add_origin(&repo);
+        let mut config = repo.config().unwrap();
+        config.set_str("branch.main.remote", "origin").unwrap();
+        config
+            .set_str("branch.main.merge", "refs/heads/foo..bar")
+            .unwrap();
+        drop(config);
+        drop(repo);
+        let err = detect_repo(&root).unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("not a valid branch name"),
+            "unexpected error: {:?}",
+            err
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_repo_rejects_a_path_upstream_as_unsupported() {
+        let root = temp_dir("upstream-path");
+        let repo = init_repo(&root, "main");
+        commit_all(&repo, "v1");
+        add_origin(&repo);
+        set_upstream(&repo, "main", "/srv/repo", "main");
+        drop(repo);
+        let err = detect_repo(&root).unwrap_err();
+        let text = format!("{:?}", err);
+        assert!(
+            text.contains("path or URL") && text.contains("named git remote"),
+            "unexpected error: {:?}",
+            err
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_repo_rejects_a_url_upstream_as_unsupported() {
+        let root = temp_dir("upstream-url");
+        let repo = init_repo(&root, "main");
+        commit_all(&repo, "v1");
+        add_origin(&repo);
+        set_upstream(&repo, "main", "https://example.com/repo.git", "main");
+        drop(repo);
+        let err = detect_repo(&root).unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("path or URL"),
+            "unexpected error: {:?}",
+            err
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -316,6 +316,7 @@ mod tests {
             path: "/tmp/demo".to_string(),
             remote: "origin".to_string(),
             branch: "master".to_string(),
+            remote_branch: None,
             build_strategy: build_strategy.map(|s| s.to_string()),
             build_command: build_command.to_string(),
             restart_command: None,

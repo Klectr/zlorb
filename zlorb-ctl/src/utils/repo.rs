@@ -79,7 +79,12 @@ pub(crate) fn add() -> Result<(), ZlorbError> {
         name: repo_name,
         path: path_str,
         remote: detected.remote,
-        branch: detected.branch,
+        branch: detected.branch.clone(),
+        remote_branch: if detected.remote_branch != detected.branch {
+            Some(detected.remote_branch)
+        } else {
+            None
+        },
         build_strategy: None,
         build_command: String::new(),
         restart_command: None,

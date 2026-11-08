@@ -32,6 +32,8 @@ pub struct RepositoryConfiguration {
     pub remote: String,
     pub branch: String,
     #[serde(default)]
+    pub remote_branch: Option<String>,
+    #[serde(default)]
     pub build_strategy: Option<String>,
     #[serde(default)]
     pub build_command: String,
@@ -41,6 +43,14 @@ pub struct RepositoryConfiguration {
 }
 
 impl RepositoryConfiguration {
+    pub fn resolved_remote_branch(&self) -> &str {
+        self.remote_branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|branch| !branch.is_empty())
+            .unwrap_or(&self.branch)
+    }
+
     pub fn resolved_restart_command(&self) -> Option<&str> {
         self.restart_command
             .as_deref()
@@ -112,6 +122,7 @@ mod tests {
             path: "/tmp/demo".to_string(),
             remote: "origin".to_string(),
             branch: "master".to_string(),
+            remote_branch: None,
             build_strategy: build_strategy.map(|s| s.to_string()),
             build_command: build_command.to_string(),
             restart_command: None,
@@ -354,6 +365,30 @@ mod tests {
         let mut blank = config(None, "");
         blank.restart_command = Some("  ".to_string());
         assert_eq!(blank.resolved_restart_command(), None);
+    }
+
+    #[test]
+    fn remote_branch_defaults_to_the_local_branch() {
+        let parsed: RepositoryConfiguration = toml::from_str(
+            "name = \"demo\"\npath = \"/tmp/demo\"\nremote = \"origin\"\nbranch = \"dev\"\nbuild_strategy = \"rust\"\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.remote_branch, None);
+        assert_eq!(parsed.resolved_remote_branch(), "dev");
+        let mut blank = config(None, "");
+        blank.remote_branch = Some("  ".to_string());
+        assert_eq!(blank.resolved_remote_branch(), "master");
+    }
+
+    #[test]
+    fn toml_with_remote_branch_parses_and_resolves_it() {
+        let parsed: RepositoryConfiguration = toml::from_str(
+            "name = \"demo\"\npath = \"/tmp/demo\"\nremote = \"upstream\"\nbranch = \"dev\"\nremote_branch = \"main\"\nbuild_strategy = \"rust\"\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.remote_branch.as_deref(), Some("main"));
+        assert_eq!(parsed.resolved_remote_branch(), "main");
+        assert_eq!(parsed.branch, "dev");
     }
 
     #[test]

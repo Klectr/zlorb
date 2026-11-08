@@ -1319,6 +1319,7 @@ fn repo_config(repo_dir: &Path) -> RepositoryConfiguration {
         path: repo_dir.to_string_lossy().into_owned(),
         remote: "origin".to_string(),
         branch: "master".to_string(),
+        remote_branch: None,
         build_strategy: None,
         build_command: "".to_string(),
         restart_command: None,
