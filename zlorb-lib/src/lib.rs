@@ -168,6 +168,64 @@ pub fn save_config_to_toml(
     save_config_to_path(&get_zlorb_repo_config_file(), config)
 }
 
+pub struct ConfigFileLock {
+    #[cfg(unix)]
+    file: fs::File,
+}
+
+pub fn config_lock_path(config_file_path: &Path) -> PathBuf {
+    let file_name = config_file_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "repositories.toml".to_string());
+    config_file_path.with_file_name(format!("{}.lock", file_name))
+}
+
+pub fn lock_config_file(config_file_path: &Path) -> Result<ConfigFileLock, ZlorbError> {
+    if let Some(parent) = config_file_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let lock_path = config_lock_path(config_file_path);
+        let file = match fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                fs::File::open(&lock_path).map_err(ZlorbError::Io)?
+            }
+            Err(e) => return Err(ZlorbError::Io(e)),
+        };
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(ZlorbError::Io(std::io::Error::last_os_error()));
+        }
+        Ok(ConfigFileLock { file })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(ConfigFileLock {})
+    }
+}
+
+pub fn lock_repo_config() -> Result<ConfigFileLock, ZlorbError> {
+    lock_config_file(&get_zlorb_repo_config_file())
+}
+
+#[cfg(unix)]
+impl Drop for ConfigFileLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,5 +384,72 @@ mod tests {
             !fs::read_to_string(&path).unwrap().contains("demo"),
             "stale contents survived a full replace"
         );
+    }
+
+    #[test]
+    fn config_lock_path_is_a_sidecar_next_to_the_config_file() {
+        let path = Path::new("/tmp/example/repositories.toml");
+        assert_eq!(
+            config_lock_path(path),
+            PathBuf::from("/tmp/example/repositories.toml.lock")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_lock_is_exclusive_until_the_guard_is_dropped() {
+        use std::sync::mpsc;
+        let path = temp_config_path("lock-exclusive");
+        let first = lock_config_file(&path).unwrap();
+        assert!(config_lock_path(&path).exists());
+
+        let (acquired_tx, acquired_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let contender_path = path.clone();
+        let contender = std::thread::spawn(move || {
+            let _second = lock_config_file(&contender_path).unwrap();
+            acquired_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        assert!(
+            acquired_rx
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "second lock was granted while the first guard was still held"
+        );
+        drop(first);
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("second lock was not granted after the first guard dropped");
+        release_tx.send(()).unwrap();
+        contender.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_lock_survives_the_config_file_being_replaced_by_a_save() {
+        use std::sync::mpsc;
+        let path = temp_config_path("lock-survives-save");
+        let first = lock_config_file(&path).unwrap();
+        save_config_to_path(&path, &sample_config()).unwrap();
+
+        let (acquired_tx, acquired_rx) = mpsc::channel::<()>();
+        let contender_path = path.clone();
+        let contender = std::thread::spawn(move || {
+            let _second = lock_config_file(&contender_path).unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+        assert!(
+            acquired_rx
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "saving the config (rename) released the lock"
+        );
+        drop(first);
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("second lock was not granted after the first guard dropped");
+        contender.join().unwrap();
     }
 }

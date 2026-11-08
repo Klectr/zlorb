@@ -2220,6 +2220,7 @@ name = "zlorb-lib"
 version = "0.1.0"
 dependencies = [
  "git2",
+ "libc",
  "serde",
  "serde_json",
  "toml",
