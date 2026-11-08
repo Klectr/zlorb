@@ -3846,11 +3846,41 @@ impl RepoProcessor {
     }
 
     fn _get_remote(&self) -> Result<Remote<'_>, ZlorbError> {
-        let remote = self
-            .repo
-            .find_remote(&self.config.remote)
-            .map_err(ZlorbError::Git)?;
-        Ok(remote)
+        let find_error = match self.repo.find_remote(&self.config.remote) {
+            Ok(remote) => return Ok(remote),
+            Err(e) => e,
+        };
+        if find_error.code() != git2::ErrorCode::NotFound {
+            return Err(ZlorbError::Git(find_error));
+        }
+        let remotes = match self.repo.remotes() {
+            Ok(remotes) => remotes,
+            Err(list_error) => {
+                Logger::error(format!(
+                    "Could not list the remotes of {} at {} to check the configured remote '{}': {}",
+                    self.config.name, self.config.path, self.config.remote, list_error
+                ));
+                return Err(ZlorbError::Git(find_error));
+            }
+        };
+        let available: Vec<String> =
+            remotes.iter().flatten().map(str::to_string).collect();
+        if available.is_empty() {
+            Err(ZlorbError::InvalidConfig(format!(
+                "repo '{}' has remote '{}' in repositories.toml, but the repository at {} has no remotes; add one with 'git remote add {} <url>' in that repo ({})",
+                self.config.name, self.config.remote, self.config.path, self.config.remote, find_error
+            )))
+        } else {
+            Err(ZlorbError::InvalidConfig(format!(
+                "repo '{}' has remote '{}' in repositories.toml, but that remote does not exist in the repository at {} (available remotes: {}); set remote in repositories.toml to one of those, or add it with 'git remote add {} <url>' in that repo ({})",
+                self.config.name,
+                self.config.remote,
+                self.config.path,
+                available.join(", "),
+                self.config.remote,
+                find_error
+            )))
+        }
     }
 
     fn _download_new_data(&self, remote: &mut Remote) -> Result<(), ZlorbError> {
@@ -4833,7 +4863,7 @@ mod tests {
             err
         );
         assert!(
-            format!("{:?}", err).contains("Git("),
+            format!("{:?}", err).contains("InvalidConfig("),
             "the surfaced error must be the missing-remote failure itself, got: {:?}",
             err
         );
@@ -4901,7 +4931,7 @@ mod tests {
             err
         );
         assert!(
-            format!("{:?}", err).contains("Git("),
+            format!("{:?}", err).contains("InvalidConfig("),
             "the surfaced error must be the missing-remote failure itself, got: {:?}",
             err
         );
@@ -4977,7 +5007,7 @@ mod tests {
             err
         );
         assert!(
-            format!("{:?}", err).contains("Git("),
+            format!("{:?}", err).contains("InvalidConfig("),
             "the surfaced error must be the missing-remote failure itself, got: {:?}",
             err
         );
@@ -5012,9 +5042,19 @@ mod tests {
         let mut processor = processor_for(&watched_path);
         processor.config.remote = "missing-remote".to_string();
         let err = processor.update_from_remote().unwrap_err();
+        let text = format!("{:?}", err);
         assert!(
-            format!("{:?}", err).contains("Git("),
+            text.contains("InvalidConfig("),
             "the surfaced error must be the missing-remote failure itself, got: {:?}",
+            err
+        );
+        assert!(
+            text.contains("'watched'")
+                && text.contains("'missing-remote'")
+                && text.contains("repositories.toml")
+                && text.contains("available remotes: origin")
+                && text.contains("git remote add missing-remote"),
+            "the missing-remote error must name the repo, the configured value, the file, and the available remotes, got: {:?}",
             err
         );
         assert!(
@@ -5024,6 +5064,70 @@ mod tests {
         let watched = git2::Repository::open(&watched_path).unwrap();
         assert_eq!(head_oid(&watched), v1);
         drop(watched);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn repo_with_no_remotes_surfaces_an_actionable_missing_remote_error() {
+        let root = temp_dir("no-remotes-at-all");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let watched = git2::Repository::init_opts(&watched_path, &init_opts).unwrap();
+        write_fixture_crate(&watched_path, "fixture-version-one");
+        commit_all(&watched, "v1");
+        drop(watched);
+
+        let processor = processor_for(&watched_path);
+        let err = processor.update_from_remote().unwrap_err();
+        let text = format!("{:?}", err);
+        assert!(
+            text.contains("InvalidConfig(")
+                && text.contains("'watched'")
+                && text.contains("'origin'")
+                && text.contains("repositories.toml")
+                && text.contains("has no remotes")
+                && text.contains("git remote add origin"),
+            "a repo with no remotes must surface an actionable error naming the repo, value, and fix, got: {:?}",
+            err
+        );
+        assert!(
+            !text.contains("set remote in repositories.toml to a remote that exists there"),
+            "a repo with no remotes must not be told to pick an existing remote, got: {:?}",
+            err
+        );
+        assert!(!fixture_artifact(&watched_path).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn non_notfound_remote_lookup_failure_surfaces_the_git_error_not_a_missing_remote_claim() {
+        let root = temp_dir("invalid-remote-lookup");
+        let upstream_path = root.join("upstream");
+        let watched_path = root.join("watched");
+        let mut init_opts = RepositoryInitOptions::new();
+        init_opts.initial_head("master");
+        let upstream = git2::Repository::init_opts(&upstream_path, &init_opts).unwrap();
+        write_fixture_crate(&upstream_path, "fixture-version-one");
+        commit_all(&upstream, "v1");
+        drop(upstream);
+        git2::Repository::clone(upstream_path.to_string_lossy().as_ref(), &watched_path)
+            .unwrap();
+
+        let mut processor = processor_for(&watched_path);
+        processor.config.remote = "foo bar".to_string();
+        let err = processor.update_from_remote().unwrap_err();
+        let text = format!("{:?}", err);
+        assert!(
+            text.contains("Git("),
+            "a lookup failure that is not NotFound must surface the raw git error, got: {:?}",
+            err
+        );
+        assert!(
+            !text.contains("does not exist") && !text.contains("has no remotes"),
+            "a non-NotFound lookup failure must not be claimed as a missing remote, got: {:?}",
+            err
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
