@@ -57,12 +57,22 @@ pub(crate) fn remove(repo_name: String) -> Result<(), ZlorbError> {
 pub(crate) fn add() -> Result<(), ZlorbError> {
     let cwd = env::current_dir()?;
     let detected = detect_repo(&cwd)?;
-    let path_str = detected.root.to_string_lossy().to_string();
+    let path_str = detected
+        .root
+        .to_str()
+        .ok_or_else(|| {
+            ZlorbError::Other(format!(
+                "{} is not valid UTF-8; zlorb stores repository paths as text, so it cannot watch a repository whose path is not valid UTF-8 — rename or move the repository and add again",
+                detected.root.display()
+            ))
+        })?
+        .to_string();
 
     let repo_name = detected
         .root
         .file_name()
-        .map(|s| s.to_string_lossy().to_string())
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
         .ok_or_else(|| {
             ZlorbError::Other(format!(
                 "could not read a repository name from {}",
@@ -164,7 +174,8 @@ fn unique_repo_name(
     let stem = root
         .parent()
         .and_then(|parent| parent.file_name())
-        .map(|parent| format!("{}-{}", parent.to_string_lossy(), base))
+        .and_then(|parent| parent.to_str())
+        .map(|parent| format!("{}-{}", parent, base))
         .unwrap_or_else(|| base.to_string());
     if stem != base && !taken(&stem) {
         return stem;

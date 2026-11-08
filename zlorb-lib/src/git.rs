@@ -20,10 +20,11 @@ pub struct DetectedRepo {
 pub fn detect_repo(path: &Path) -> Result<DetectedRepo, ZlorbError> {
     let repo = match Repository::open(path) {
         Ok(repo) => repo,
-        Err(_) => Repository::discover(path).map_err(|_| {
+        Err(_) => Repository::discover(path).map_err(|e| {
             ZlorbError::Other(format!(
-                "{} is not a valid git repository",
-                path.display()
+                "{} is not a valid git repository: {}",
+                path.display(),
+                e
             ))
         })?,
     };
@@ -34,6 +35,12 @@ pub fn detect_repo(path: &Path) -> Result<DetectedRepo, ZlorbError> {
         ))
     })?;
     let root: PathBuf = workdir.components().collect();
+    if root.to_str().is_none() {
+        return Err(ZlorbError::Other(format!(
+            "{} is not valid UTF-8; zlorb stores repository paths as text, so it cannot watch a repository whose path is not valid UTF-8 — rename or move the repository and add again",
+            root.display()
+        )));
+    }
     let branch = match repo.head() {
         Ok(head) => {
             if !head.is_branch() {
@@ -734,6 +741,40 @@ mod tests {
             err
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_repo_preserves_the_underlying_discover_error() {
+        let root = temp_dir("not-a-repo-detail");
+        let err = detect_repo(&root).unwrap_err();
+        let text = format!("{:?}", err);
+        assert!(
+            text.contains("is not a valid git repository")
+                && text.contains("could not find repository"),
+            "error should preserve the underlying git2 message, got: {:?}",
+            err
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_repo_rejects_a_non_utf8_path() {
+        use std::os::unix::ffi::OsStringExt;
+        let base = temp_dir("non-utf8");
+        let root = base.join(std::ffi::OsString::from_vec(b"bad-\xff-repo".to_vec()));
+        fs::create_dir_all(&root).unwrap();
+        let repo = init_repo(&root, "main");
+        commit_all(&repo, "v1");
+        add_origin(&repo);
+        drop(repo);
+        let err = detect_repo(&root).unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("not valid UTF-8"),
+            "unexpected error: {:?}",
+            err
+        );
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

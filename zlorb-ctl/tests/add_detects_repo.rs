@@ -395,6 +395,61 @@ fn add_disambiguation_falls_back_to_a_numeric_suffix() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[cfg(unix)]
+#[test]
+fn add_a_repo_with_a_non_utf8_path_fails_and_writes_nothing() {
+    use std::os::unix::ffi::OsStringExt;
+    let root = temp_dir("non-utf8");
+    let config_dir = root.join("config");
+    let repo_path = root.join(std::ffi::OsString::from_vec(b"bad-\xff-app".to_vec()));
+    std::fs::create_dir_all(&repo_path).unwrap();
+    init_repo_with_origin(&repo_path, "main");
+
+    let output = run_add(&repo_path, &config_dir);
+    assert!(
+        !output.status.success(),
+        "zlorb-ctl add unexpectedly succeeded for a non-UTF-8 path"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("not valid UTF-8"),
+        "add error should explain the UTF-8 problem, got: {}",
+        combined
+    );
+    assert!(
+        !config_dir.join("repositories.toml").exists(),
+        "failed add must not create repositories.toml"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn add_outside_a_repo_preserves_the_underlying_git_error() {
+    let root = temp_dir("not-a-repo-detail");
+    let config_dir = root.join("config");
+    let output = run_add(&root, &config_dir);
+    assert!(
+        !output.status.success(),
+        "zlorb-ctl add unexpectedly succeeded outside a repo"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("is not a valid git repository")
+            && combined.contains("could not find repository"),
+        "add error should preserve the underlying git2 message, got: {}",
+        combined
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn add_outside_a_repo_fails() {
     let root = temp_dir("not-a-repo");
