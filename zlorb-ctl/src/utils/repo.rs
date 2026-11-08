@@ -1,4 +1,4 @@
-use std::{env, process};
+use std::{env, path::Path, process};
 use zlorb_lib::{
     config::{RepositoriesConfigurationFile, RepositoryConfiguration},
     error::ZlorbError,
@@ -73,7 +73,22 @@ pub(crate) fn add() -> Result<(), ZlorbError> {
     let _config_lock = lock_repo_config()?;
     let mut config = load_config_from_toml()?;
 
-    throw_if_repo_exists(&repo_name, &config)?;
+    throw_if_path_tracked(&path_str, &config)?;
+
+    let name_collision = config
+        .repositories
+        .iter()
+        .find(|item| item.name == repo_name)
+        .map(|item| (item.name.clone(), item.path.clone()));
+    let repo_name = unique_repo_name(&repo_name, &detected.root, &config);
+    if let Some((colliding_name, colliding_path)) = name_collision {
+        if repo_name != colliding_name {
+            Logger::info(format!(
+                "a different repository named '{}' is already tracked at {}; adding this one as '{}'",
+                colliding_name, colliding_path, repo_name
+            ));
+        }
+    }
 
     let new_repo = RepositoryConfiguration {
         name: repo_name,
@@ -105,20 +120,63 @@ pub(crate) fn list() -> Result<(), ZlorbError> {
     Ok(())
 }
 
-fn throw_if_repo_exists(
-    repo_name: &String,
+fn throw_if_path_tracked(
+    path: &str,
     config: &RepositoriesConfigurationFile,
 ) -> Result<(), ZlorbError> {
-    if let Some(found_el) = config
+    if let Some(found) = config
         .repositories
         .iter()
-        .find(|item| &item.name == repo_name)
+        .find(|item| same_path(&item.path, path))
     {
-        let err = format!("{} is already in the configuration", found_el.name);
+        let err = format!(
+            "{} is already in the configuration as '{}'",
+            path, found.name
+        );
         return Err(ZlorbError::Other(err));
     }
 
     Ok(())
+}
+
+fn same_path(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (
+        std::fs::canonicalize(a),
+        std::fs::canonicalize(b),
+    ) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn unique_repo_name(
+    base: &str,
+    root: &Path,
+    config: &RepositoriesConfigurationFile,
+) -> String {
+    let taken = |name: &str| config.repositories.iter().any(|item| item.name == name);
+    if !taken(base) {
+        return base.to_string();
+    }
+    let stem = root
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .map(|parent| format!("{}-{}", parent.to_string_lossy(), base))
+        .unwrap_or_else(|| base.to_string());
+    if stem != base && !taken(&stem) {
+        return stem;
+    }
+    let mut n = 2;
+    loop {
+        let candidate = format!("{}-{}", stem, n);
+        if !taken(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 fn throw_if_repo_not_found(
