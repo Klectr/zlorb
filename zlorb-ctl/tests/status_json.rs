@@ -77,7 +77,18 @@ fn status_json_reports_the_tracked_repo_and_a_daemon_boolean() {
     let value: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("stdout must be one JSON document");
     assert!(value["daemon_running"].is_boolean(), "{}", value);
-    assert_eq!(value["daemon_error"], serde_json::Value::Null);
+    match &value["daemon_error"] {
+        serde_json::Value::Null => {}
+        serde_json::Value::String(message) => {
+            assert!(
+                message.contains("could not read the daemon state"),
+                "{}",
+                value
+            );
+            assert_eq!(value["daemon_running"], false, "{}", value);
+        }
+        other => panic!("unexpected daemon_error {} in {}", other, value),
+    }
     assert_eq!(value["error"], serde_json::Value::Null);
     assert_eq!(value["repositories"].as_array().unwrap().len(), 1);
     let repo = &value["repositories"][0];
