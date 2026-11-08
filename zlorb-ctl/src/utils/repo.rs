@@ -5,6 +5,7 @@ use zlorb_lib::{
     git::detect_repo,
     is_root,
     load_config_from_toml,
+    lock_repo_config,
     log::Logger,
     save_config_to_toml,
 };
@@ -39,6 +40,7 @@ pub(crate) fn watch() -> Result<(), ZlorbError> {
 }
 
 pub(crate) fn remove(repo_name: String) -> Result<(), ZlorbError> {
+    let _config_lock = lock_repo_config()?;
     let mut config = load_config_from_toml()?;
     throw_if_repo_not_found(&repo_name, &config)?;
 
@@ -68,6 +70,7 @@ pub(crate) fn add() -> Result<(), ZlorbError> {
             ))
         })?;
 
+    let _config_lock = lock_repo_config()?;
     let mut config = load_config_from_toml()?;
 
     throw_if_repo_exists(&repo_name, &config)?;
