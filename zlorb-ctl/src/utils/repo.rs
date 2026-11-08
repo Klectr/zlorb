@@ -1,11 +1,12 @@
-use std::{env, io::Write, process};
+use std::{env, process};
 use zlorb_lib::{
     config::{RepositoriesConfigurationFile, RepositoryConfiguration},
-    create_config_from_toml,
     error::ZlorbError,
     git::detect_repo,
     is_root,
+    load_config_from_toml,
     log::Logger,
+    save_config_to_toml,
 };
 
 pub(crate) fn watch() -> Result<(), ZlorbError> {
@@ -38,8 +39,7 @@ pub(crate) fn watch() -> Result<(), ZlorbError> {
 }
 
 pub(crate) fn remove(repo_name: String) -> Result<(), ZlorbError> {
-    let (mut config, mut file) = create_config_from_toml(true)?;
-    // check if repo exists before attempting remove
+    let mut config = load_config_from_toml()?;
     throw_if_repo_not_found(&repo_name, &config)?;
 
     let filtered_repos = config
@@ -48,8 +48,7 @@ pub(crate) fn remove(repo_name: String) -> Result<(), ZlorbError> {
         .filter(|repo| repo.name != repo_name)
         .collect();
     config.repositories = filtered_repos;
-    let out_toml = toml::to_string(&config).map_err(ZlorbError::TomlSerializationError)?;
-    file.write_all(out_toml.as_bytes())?;
+    save_config_to_toml(&config)?;
     Ok(())
 }
 
@@ -69,7 +68,7 @@ pub(crate) fn add() -> Result<(), ZlorbError> {
             ))
         })?;
 
-    let (mut config, mut file) = create_config_from_toml(true)?;
+    let mut config = load_config_from_toml()?;
 
     throw_if_repo_exists(&repo_name, &config)?;
 
@@ -85,13 +84,12 @@ pub(crate) fn add() -> Result<(), ZlorbError> {
     };
 
     config.repositories.push(new_repo);
-    let out_toml = toml::to_string(&config).map_err(ZlorbError::TomlSerializationError)?;
-    file.write_all(out_toml.as_bytes())?;
+    save_config_to_toml(&config)?;
     Ok(())
 }
 
 pub(crate) fn list() -> Result<(), ZlorbError> {
-    let (config, _) = create_config_from_toml(false)?;
+    let config = load_config_from_toml()?;
     Logger::info(format!("config: {:#?}", config));
 
     let mapped_repos = config.repositories.iter().map(|item| item.path.clone());

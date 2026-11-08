@@ -6,7 +6,7 @@ use axum::{
     response::{Html, IntoResponse},
     routing::get,
 };
-use zlorb_lib::create_config_from_toml;
+use zlorb_lib::load_config_from_toml;
 
 use crate::template::Index;
 
@@ -26,8 +26,13 @@ pub async fn run() {
 
 async fn get_root() -> impl IntoResponse {
     let mut index = Index::new();
-    let config = create_config_from_toml(false).unwrap().0;
-    let repos = config.repositories;
+    let repos = match load_config_from_toml() {
+        Ok(config) => config.repositories,
+        Err(e) => {
+            e.print();
+            Vec::new()
+        }
+    };
     let mapped_repos: Vec<String> = repos.iter().map(|x| x.path.clone()).collect();
 
     index.repos = if mapped_repos.len() < 1 {

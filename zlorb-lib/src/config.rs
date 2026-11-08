@@ -25,6 +25,7 @@ macro_rules! build_strategy_kinds {
 build_strategy_kinds!(Bun => "bun", Rust => "rust");
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepositoryConfiguration {
     pub name: String,
     pub path: String,
@@ -95,8 +96,9 @@ impl RepositoryConfiguration {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepositoriesConfigurationFile {
-    #[serde(rename = "repository")]
+    #[serde(default, rename = "repository")]
     pub repositories: Vec<RepositoryConfiguration>,
 }
 
