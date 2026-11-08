@@ -10,6 +10,7 @@ pub struct ConfigManager {
     config_dir: PathBuf,
     reported_strategy_errors: RefCell<HashSet<String>>,
     reported_skip_errors: RefCell<HashSet<String>>,
+    reported_parse_errors: RefCell<HashSet<String>>,
 }
 
 impl ConfigManager {
@@ -22,6 +23,7 @@ impl ConfigManager {
             config_dir,
             reported_strategy_errors: RefCell::new(HashSet::new()),
             reported_skip_errors: RefCell::new(HashSet::new()),
+            reported_parse_errors: RefCell::new(HashSet::new()),
         }
     }
 
@@ -30,6 +32,22 @@ impl ConfigManager {
         let mut fresh = Vec::new();
         {
             let mut reported = self.reported_skip_errors.borrow_mut();
+            for skip in skips {
+                current.insert(skip.clone());
+                if reported.insert(skip.clone()) {
+                    fresh.push(skip.clone());
+                }
+            }
+            reported.retain(|key| current.contains(key));
+        }
+        fresh
+    }
+
+    fn unreported_parse_errors(&self, skips: &[String]) -> Vec<String> {
+        let mut current = HashSet::new();
+        let mut fresh = Vec::new();
+        {
+            let mut reported = self.reported_parse_errors.borrow_mut();
             for skip in skips {
                 current.insert(skip.clone());
                 if reported.insert(skip.clone()) {
@@ -111,31 +129,45 @@ impl ConfigManager {
         let path = self.repositories_path();
         let contents = match std::fs::read_to_string(&path) {
             Ok(contents) => contents,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.unreported_parse_errors(&[]);
+                return Ok(Vec::new());
+            }
             Err(e) => return Err(ZlorbError::Io(e)),
         };
         if contents.trim().is_empty() {
+            self.unreported_parse_errors(&[]);
             return Ok(Vec::new());
         }
-        let document = toml::from_str::<toml::Value>(&contents)
-            .map_err(ZlorbError::TomlDeserializationError)?;
+        let document = match toml::from_str::<toml::Value>(&contents) {
+            Ok(document) => document,
+            Err(e) => return Err(ZlorbError::TomlDeserializationError(e)),
+        };
         let entries = match document.get("repository") {
-            None => return Ok(Vec::new()),
+            None => {
+                self.unreported_parse_errors(&[]);
+                return Ok(Vec::new());
+            }
             Some(toml::Value::Array(entries)) => entries.clone(),
             Some(single) => vec![single.clone()],
         };
         let mut configs = Vec::new();
-        for entry in entries {
+        let mut skips = Vec::new();
+        for (index, entry) in entries.into_iter().enumerate() {
             match entry.try_into::<RepositoryConfiguration>() {
                 Ok(config) => configs.push(config),
                 Err(e) => {
-                    Logger::error(format!(
-                        "Skipping invalid repository entry in {}: {}",
+                    skips.push(format!(
+                        "Skipping invalid repository entry #{} in {}: {}",
+                        index + 1,
                         path.display(),
-                        e
+                        e.to_string().trim_end()
                     ));
                 }
             }
+        }
+        for message in self.unreported_parse_errors(&skips) {
+            Logger::error(message);
         }
         Ok(configs)
     }
@@ -473,6 +505,145 @@ mod tests {
         assert!(manager.unreported_skip_errors(&[]).is_empty());
         assert_eq!(manager.unreported_skip_errors(&broken).len(), 1);
     }
+
+    #[test]
+    fn parse_error_is_reported_once_across_reloads() {
+        let manager = ConfigManager::with_config_dir(temp_dir("dedupe-parse-once"));
+        let skips = vec![
+            "Skipping invalid repository entry in /tmp/repositories.toml: missing field `branch`"
+                .to_string(),
+        ];
+        assert_eq!(manager.unreported_parse_errors(&skips).len(), 1);
+        assert!(manager.unreported_parse_errors(&skips).is_empty());
+        assert!(manager.unreported_parse_errors(&skips).is_empty());
+    }
+
+    #[test]
+    fn changed_parse_error_is_reported_again() {
+        let manager = ConfigManager::with_config_dir(temp_dir("dedupe-parse-changed"));
+        let first = vec![
+            "Skipping invalid repository entry in /tmp/repositories.toml: missing field `branch`"
+                .to_string(),
+        ];
+        assert_eq!(manager.unreported_parse_errors(&first).len(), 1);
+        let second = vec![
+            "Skipping invalid repository entry in /tmp/repositories.toml: missing field `remote`"
+                .to_string(),
+        ];
+        let fresh = manager.unreported_parse_errors(&second);
+        assert_eq!(fresh.len(), 1);
+        assert!(fresh[0].contains("remote"));
+    }
+
+    #[test]
+    fn fixed_then_broken_parse_error_is_reported_again() {
+        let manager = ConfigManager::with_config_dir(temp_dir("dedupe-parse-fixed"));
+        let broken = vec![
+            "Skipping invalid repository entry in /tmp/repositories.toml: missing field `branch`"
+                .to_string(),
+        ];
+        assert_eq!(manager.unreported_parse_errors(&broken).len(), 1);
+        assert!(manager.unreported_parse_errors(&[]).is_empty());
+        assert_eq!(manager.unreported_parse_errors(&broken).len(), 1);
+    }
+
+    fn bad_entry_contents(good: &Path, bad: &Path) -> String {
+        let bad_entry = format!(
+            "[[repository]]\nname = \"bad\"\npath = \"{}\"\nremote = \"origin\"\nbuild_command = \"cargo build\"\n",
+            bad.display()
+        );
+        format!("{}{}", repo_entry("good", good), bad_entry)
+    }
+
+    fn expected_parse_skip(config_dir: &Path) -> String {
+        format!(
+            "Skipping invalid repository entry #2 in {}: missing field `branch`",
+            config_dir.join("repositories.toml").display()
+        )
+    }
+
+    #[test]
+    fn load_reports_parse_error_through_the_dedupe_set() {
+        let root = temp_dir("parse-wiring-once");
+        let config_dir = root.join("config");
+        let good = root.join("good");
+        let bad = root.join("bad");
+        init_repo(&good);
+        init_repo(&bad);
+        write_repos(&config_dir, &bad_entry_contents(&good, &bad));
+        let manager = ConfigManager::with_config_dir(config_dir.clone());
+        let expected = expected_parse_skip(&config_dir);
+        assert_eq!(manager.load_repo_configurations().unwrap().len(), 1);
+        assert!(manager
+            .unreported_parse_errors(&[expected.clone()])
+            .is_empty());
+        assert_eq!(manager.load_repo_configurations().unwrap().len(), 1);
+        assert!(manager.unreported_parse_errors(&[expected]).is_empty());
+    }
+
+    #[test]
+    fn fixed_entry_clears_the_reported_parse_error() {
+        let root = temp_dir("parse-wiring-fixed");
+        let config_dir = root.join("config");
+        let good = root.join("good");
+        let bad = root.join("bad");
+        init_repo(&good);
+        init_repo(&bad);
+        write_repos(&config_dir, &bad_entry_contents(&good, &bad));
+        let manager = ConfigManager::with_config_dir(config_dir.clone());
+        let expected = expected_parse_skip(&config_dir);
+        assert_eq!(manager.load_repo_configurations().unwrap().len(), 1);
+        let fixed = format!(
+            "{}{}",
+            repo_entry("good", &good),
+            repo_entry("bad", &bad)
+        );
+        write_repos(&config_dir, &fixed);
+        assert_eq!(manager.load_repo_configurations().unwrap().len(), 2);
+        assert_eq!(
+            manager.unreported_parse_errors(&[expected]).len(),
+            1,
+            "a parse error that cleared must be reportable again"
+        );
+    }
+
+    #[test]
+    fn removed_repositories_file_clears_the_reported_parse_error() {
+        let root = temp_dir("parse-wiring-removed");
+        let config_dir = root.join("config");
+        let good = root.join("good");
+        let bad = root.join("bad");
+        init_repo(&good);
+        init_repo(&bad);
+        write_repos(&config_dir, &bad_entry_contents(&good, &bad));
+        let manager = ConfigManager::with_config_dir(config_dir.clone());
+        let expected = expected_parse_skip(&config_dir);
+        assert_eq!(manager.load_repo_configurations().unwrap().len(), 1);
+        std::fs::remove_file(config_dir.join("repositories.toml")).unwrap();
+        assert!(manager.load_repo_configurations().unwrap().is_empty());
+        assert_eq!(manager.unreported_parse_errors(&[expected]).len(), 1);
+    }
+
+    #[test]
+    fn malformed_repositories_file_leaves_the_reported_parse_error_alone() {
+        let root = temp_dir("parse-wiring-malformed");
+        let config_dir = root.join("config");
+        let good = root.join("good");
+        let bad = root.join("bad");
+        init_repo(&good);
+        init_repo(&bad);
+        write_repos(&config_dir, &bad_entry_contents(&good, &bad));
+        let manager = ConfigManager::with_config_dir(config_dir.clone());
+        let expected = expected_parse_skip(&config_dir);
+        assert_eq!(manager.load_repo_configurations().unwrap().len(), 1);
+        write_repos(&config_dir, "this is not = valid = toml [[");
+        assert!(manager.load_repo_configurations().is_err());
+        assert!(
+            manager.unreported_parse_errors(&[expected]).is_empty(),
+            "an errored load must not clear the reported set, matching the skip and strategy dedupes"
+        );
+    }
+
 
     #[test]
     fn blank_ctl_state_is_flagged_blank_and_unknown_strategy_is_not() {
