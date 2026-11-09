@@ -8,5 +8,5 @@ mod service_config;
 mod service_coordinator;
 
 fn main() -> Result<(), ZlorbError> {
-    ServiceCoordinator::new().run_loop()
+    ServiceCoordinator::new()?.run_loop()
 }

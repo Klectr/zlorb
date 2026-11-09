@@ -17,8 +17,8 @@ pub struct ServiceCoordinator {
 }
 
 impl ServiceCoordinator {
-    pub fn new() -> Self {
-        Self::with_config_manager(ConfigManager::new())
+    pub fn new() -> Result<Self, ZlorbError> {
+        Ok(Self::with_config_manager(ConfigManager::try_new()?))
     }
 
     pub fn with_config_manager(config_manager: ConfigManager) -> Self {
@@ -101,7 +101,6 @@ impl ServiceCoordinator {
                 Ok(_) => Logger::info(format!("Successfully updated {}", repo.config.name)),
                 Err(e) => {
                     Logger::error(format!("Failed to update {}: {:?}. This may be a configuration issue for this branch; ensure the details in ~/.config/zlorb/repositories.toml are accurate.", repo.config.name, e));
-                    e.print();
                 }
             }
         }

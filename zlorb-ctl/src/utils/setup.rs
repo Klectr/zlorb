@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use zlorb_lib::{error::ZlorbError, get_home_dir, get_zlorb_config_dir, is_root, log::Logger};
+use zlorb_lib::{
+    error::ZlorbError, is_root, log::Logger, try_get_home_dir, try_get_zlorb_config_dir,
+};
 
 fn escape_unit_value(value: &str) -> String {
     value
@@ -130,8 +132,8 @@ fn enable_linger() {
 
 pub fn setup(print_only: bool) -> Result<(), ZlorbError> {
     let root = is_root();
-    let home_dir = get_home_dir();
-    let config_dir = get_zlorb_config_dir();
+    let home_dir = try_get_home_dir()?;
+    let config_dir = try_get_zlorb_config_dir()?;
     ensure_config(&config_dir)?;
     let current_exe = std::env::current_exe().map_err(ZlorbError::Io)?;
     let service_bin = resolve_service_binary(&current_exe, &home_dir);
@@ -144,7 +146,6 @@ pub fn setup(print_only: bool) -> Result<(), ZlorbError> {
     println!("config dir: {}", config_dir.display());
     println!("service binary: {}", service_bin.display());
     println!("systemd unit: {}", unit_path.display());
-    warn_if_other_scope_unit_exists(root, &home_dir);
     if print_only {
         println!("--- unit ---\n{}", unit);
         println!("next: {}", manual_steps(root));
@@ -154,6 +155,7 @@ pub fn setup(print_only: bool) -> Result<(), ZlorbError> {
                 service_bin.display()
             )));
         }
+        warn_if_other_scope_unit_exists(root, &home_dir);
         return Ok(());
     }
     if !service_bin.exists() {
@@ -163,6 +165,7 @@ pub fn setup(print_only: bool) -> Result<(), ZlorbError> {
             manual_steps(root)
         )));
     }
+    warn_if_other_scope_unit_exists(root, &home_dir);
     let reloaded = systemctl(root, &["daemon-reload"]);
     let enabled = match reloaded {
         Ok(status) if status.success() => systemctl(root, &["enable", "--now", "zlorb.service"]),

@@ -17,15 +17,34 @@ pub enum ZlorbError {
     Other(String),
 }
 
+fn strip_escape_sequences(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.next() == Some('[') {
+                for next in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&next) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 impl ZlorbError {
     pub fn error_line(&self) -> String {
-        let rendered = self.to_string();
+        let rendered = strip_escape_sequences(&self.to_string());
         let parts: Vec<&str> = rendered
             .split(['\n', '\r'])
             .map(str::trim)
             .filter(|part| !part.is_empty())
             .collect();
-        format!("error: {}", parts.join(" "))
+        format!("error: {}", parts.join(" | "))
     }
 
     pub fn print(&self) {
@@ -102,10 +121,16 @@ mod tests {
         let line = err.error_line();
         assert_eq!(
             line,
-            "error: Failed to parse config: first line second line third"
+            "error: Failed to parse config: first line | second line | third"
         );
         assert!(!line.contains('\n'), "{}", line);
         assert!(!line.contains('\x1b'), "{}", line);
+    }
+
+    #[test]
+    fn error_line_strips_escape_sequences_embedded_in_the_message() {
+        let err = ZlorbError::Other("\x1b[31mboom\x1b[0m".to_string());
+        assert_eq!(err.error_line(), "error: Other error occured: boom");
     }
 
     #[test]

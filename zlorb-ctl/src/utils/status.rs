@@ -207,7 +207,7 @@ fn print_json_report(report: &StatusReport) {
     match serde_json::to_string_pretty(report) {
         Ok(rendered) => println!("{}", rendered),
         Err(e) => {
-            eprintln!("could not serialize the status report: {}", e);
+            eprintln!("error: could not serialize the status report: {}", e);
             std::process::exit(1);
         }
     }
@@ -218,6 +218,7 @@ pub(crate) fn status(json: bool) -> Result<(), ZlorbError> {
         Ok(config) => config,
         Err(e) if json => {
             print_json_report(&error_report(error_text(&e)));
+            e.print();
             std::process::exit(1);
         }
         Err(e) => return Err(e),
