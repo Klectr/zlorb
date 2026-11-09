@@ -232,6 +232,7 @@ fn add_is_a_no_op_success_when_a_seeded_entry_aliases_the_same_path() {
         ),
     )
     .unwrap();
+    let before = std::fs::read(config_dir.join("repositories.toml")).unwrap();
 
     let output = run_add(&repo_path, &config_dir);
     assert!(
@@ -255,6 +256,11 @@ fn add_is_a_no_op_success_when_a_seeded_entry_aliases_the_same_path() {
         1,
         "alias duplicate must leave exactly one entry: {}",
         repos
+    );
+    let after = std::fs::read(config_dir.join("repositories.toml")).unwrap();
+    assert_eq!(
+        before, after,
+        "alias duplicate must leave repositories.toml byte-identical, preserving the seeded path spelling"
     );
     let _ = std::fs::remove_dir_all(&root);
 }
