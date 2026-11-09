@@ -172,7 +172,25 @@ impl ConfigManager {
         Ok(configs)
     }
 
+    #[cfg(test)]
     pub fn load_all_repo_configs(&self) -> Result<Vec<RepoProcessor>, ZlorbError> {
+        let credentials = match self.load_service_config() {
+            Ok(config) => config.credentials(),
+            Err(e) => {
+                Logger::error(format!(
+                    "Failed to load service config for fetch credentials, continuing without them: {:?}",
+                    e
+                ));
+                None
+            }
+        };
+        self.load_all_repo_configs_with_credentials(credentials)
+    }
+
+    pub fn load_all_repo_configs_with_credentials(
+        &self,
+        credentials: Option<(String, String)>,
+    ) -> Result<Vec<RepoProcessor>, ZlorbError> {
         let repos = self.load_repo_configurations()?;
         for (message, blank) in self.unreported_strategy_errors(&repos) {
             if blank {
@@ -185,7 +203,10 @@ impl ConfigManager {
         let mut skips = Vec::new();
         for repo in repos {
             match RepoProcessor::new(repo.clone()) {
-                Ok(processor) => processors.push(processor),
+                Ok(mut processor) => {
+                    processor.set_credentials(credentials.clone());
+                    processors.push(processor);
+                }
                 Err(e) => {
                     skips.push(format!(
                         "Skipping repo {} at {}: {:?}",
@@ -395,6 +416,78 @@ mod tests {
             zlorb_lib::config::BuildStrategyKind::Rust
         );
         assert_eq!(manager.load_service_config().unwrap().sleep_time, 7);
+    }
+
+    #[test]
+    fn processors_get_credentials_from_service_config() {
+        let root = temp_dir("processor-credentials");
+        let config_dir = root.join("config");
+        let repo_path = root.join("repo");
+        init_repo(&repo_path);
+        write_repos(&config_dir, &repo_entry("repo", &repo_path));
+        std::fs::write(
+            config_dir.join("service-config.toml"),
+            "sleep_time = 5\nusername = \"alice\"\ntoken = \"secret\"\n",
+        )
+        .unwrap();
+        let manager = ConfigManager::with_config_dir(config_dir);
+        let repos = manager.load_all_repo_configs().unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(
+            repos[0].credentials(),
+            Some(&("alice".to_string(), "secret".to_string()))
+        );
+    }
+
+    #[test]
+    fn processors_have_no_credentials_when_service_config_has_placeholders() {
+        let root = temp_dir("processor-no-credentials");
+        let config_dir = root.join("config");
+        let repo_path = root.join("repo");
+        init_repo(&repo_path);
+        write_repos(&config_dir, &repo_entry("repo", &repo_path));
+        std::fs::write(
+            config_dir.join("service-config.toml"),
+            "sleep_time = 5\nusername = \"NO USERNAME PROVIDED\"\ntoken = \"NO TOKEN PROVIDED\"\n",
+        )
+        .unwrap();
+        let manager = ConfigManager::with_config_dir(config_dir.clone());
+        let repos = manager.load_all_repo_configs().unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].credentials(), None);
+        std::fs::remove_file(config_dir.join("service-config.toml")).unwrap();
+        let repos = manager.load_all_repo_configs().unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].credentials(), None);
+    }
+
+    #[test]
+    fn explicit_credentials_survive_a_malformed_service_config_file() {
+        let root = temp_dir("processor-explicit-credentials");
+        let config_dir = root.join("config");
+        let repo_path = root.join("repo");
+        init_repo(&repo_path);
+        write_repos(&config_dir, &repo_entry("repo", &repo_path));
+        std::fs::write(
+            config_dir.join("service-config.toml"),
+            "sleep_time = \"nope\"\n",
+        )
+        .unwrap();
+        let manager = ConfigManager::with_config_dir(config_dir);
+        let repos = manager
+            .load_all_repo_configs_with_credentials(Some((
+                "alice".to_string(),
+                "secret".to_string(),
+            )))
+            .unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(
+            repos[0].credentials(),
+            Some(&("alice".to_string(), "secret".to_string()))
+        );
+        let repos = manager.load_all_repo_configs().unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].credentials(), None);
     }
 
     #[test]
