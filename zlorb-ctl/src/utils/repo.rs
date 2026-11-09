@@ -116,10 +116,34 @@ pub(crate) fn add() -> Result<(), ZlorbError> {
     let _config_lock = lock_repo_config()?;
     let mut config = load_config_from_toml()?;
 
-    if let Some(tracked_name) = tracked_name_for_path(&path_str, &config) {
+    let refreshed_remote_branch = if detected.remote_branch != detected.branch {
+        Some(detected.remote_branch.clone())
+    } else {
+        None
+    };
+    if let Some(tracked) = config
+        .repositories
+        .iter_mut()
+        .find(|item| same_path(&item.path, &path_str))
+    {
+        if tracked.branch == detected.branch
+            && tracked.remote == detected.remote
+            && tracked.remote_branch == refreshed_remote_branch
+        {
+            Logger::info(format!(
+                "{} is already in the configuration as '{}'; nothing to add",
+                path_str, tracked.name
+            ));
+            return Ok(());
+        }
+        let tracked_name = tracked.name.clone();
+        tracked.branch = detected.branch.clone();
+        tracked.remote = detected.remote.clone();
+        tracked.remote_branch = refreshed_remote_branch;
+        save_config_to_toml(&config)?;
         Logger::info(format!(
-            "{} is already in the configuration as '{}'; nothing to add",
-            path_str, tracked_name
+            "{} is already in the configuration as '{}'; updated its tracked branch to '{}' and remote to '{}'",
+            path_str, tracked_name, detected.branch, detected.remote
         ));
         return Ok(());
     }
@@ -144,11 +168,7 @@ pub(crate) fn add() -> Result<(), ZlorbError> {
         path: path_str,
         remote: detected.remote,
         branch: detected.branch.clone(),
-        remote_branch: if detected.remote_branch != detected.branch {
-            Some(detected.remote_branch)
-        } else {
-            None
-        },
+        remote_branch: refreshed_remote_branch,
         build_strategy: None,
         build_command: String::new(),
         restart_command: None,
