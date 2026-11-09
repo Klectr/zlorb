@@ -109,7 +109,15 @@ zlorb-ctl stop
 zlorb-ctl restart
 ```
 
-These commands are idempotent: re-running one that has already reached its target state is a no-op success, not an error. Adding an already-tracked repository, removing one that is not tracked, starting an already-running daemon, and stopping an already-stopped daemon all succeed without changing anything.
+Most of these commands are idempotent: re-running one that has already reached its target state is a no-op success, not an error. Adding an already-tracked repository and removing one that is not tracked leave `repositories.toml` unchanged (a no-op `remove` still takes the config lock file next to it). `restart` is the exception: it always acts, so it is never a no-op.
+
+The daemon commands follow one contract: a no-op happens only on a state read positively from `systemctl is-active`, and a state that cannot be read is an error, never a guessed no-op.
+
+- `start` on a running daemon succeeds without touching it — it does not restart the daemon; run `restart` to restart it. On a stopped daemon, or one in a failed or transitional state, it issues the start, and a failed start exits non-zero with the `systemctl status` command to inspect the unit.
+- `stop` on a stopped daemon (state `inactive`) succeeds without acting. On any other positively read state it issues the stop, with the same verified-result error on failure.
+- `restart` always runs: on a stopped daemon it starts it.
+- When the state cannot be read — for example the unit is not installed (`setup` has not run, or the command runs at the other scope), or D-Bus is unreachable — `start` and `stop` exit non-zero naming the inspect command, and issue no start or stop at all. `restart` in that situation fails from the restart itself, with the same inspect command in the error. `status` surfaces the same failure: `--json` output carries it in `daemon_error` (with `daemon_running: false`), and text output adds a `daemon check failed` line next to the daemon line.
+- `remove --repo-name <name>` for a name that is not tracked exits 0. That makes `remove` safe to re-run, at an accepted cost: a typo in the name also exits 0 and removes nothing — only the log line says the name is not tracked. Check the spelling against `zlorb-ctl list` when a removal seems to have had no effect.
 
 `status --json` prints one JSON document: `daemon_running` (plus `daemon_error` when systemctl itself cannot be run), and per repo its config, local `head_oid`, `last_fetch_oid` (the `FETCH_HEAD` line for the tracked branch, from the repo's common git dir; null when that file has no line for it) and `last_fetch_unix` (that file's modification time; null when the repo was never fetched), and `error` — the first current problem found (invalid branch/remote/strategy, missing path, unreadable HEAD, unopenable repo, unreadable remote) or null. When the config itself cannot be loaded, the document instead carries the problem in a top-level `error` with an empty repo list, and the command still exits non-zero. The daemon keeps build outcomes only in memory and persists no status file, so `status` does not report a build status; inventing one from the config would not be truthful.
 
