@@ -1,7 +1,5 @@
 use std::{error::Error, fmt, path::PathBuf};
 
-use crate::log::Logger;
-
 #[derive(Debug)]
 pub enum ZlorbError {
     Io(std::io::Error),
@@ -20,65 +18,52 @@ pub enum ZlorbError {
 }
 
 impl ZlorbError {
+    pub fn error_line(&self) -> String {
+        let rendered = self.to_string();
+        let parts: Vec<&str> = rendered
+            .split(['\n', '\r'])
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .collect();
+        format!("error: {}", parts.join(" "))
+    }
+
     pub fn print(&self) {
-        println!("{}", self);
+        eprintln!("{}", self.error_line());
     }
 }
 
 impl fmt::Display for ZlorbError {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ZlorbError::Io(error) => {
-                Logger::error(format!("IO error: {error}"));
-                Ok(())
-            }
-            ZlorbError::HomeDirNotFound => {
-                Logger::error("Could not find home directory".into());
-                Ok(())
-            }
+            ZlorbError::Io(error) => write!(f, "IO error: {error}"),
+            ZlorbError::HomeDirNotFound => write!(f, "Could not find home directory"),
             ZlorbError::ConfigNotFound(path) => {
-                Logger::error(format!("Config file not found: {path:?}"));
-                Ok(())
+                write!(f, "Config file not found: {path:?}")
             }
             ZlorbError::ConfigParseError(msg) => {
-                Logger::error(format!("Failed to parse config: {msg}"));
-                Ok(())
+                write!(f, "Failed to parse config: {msg}")
             }
             ZlorbError::InvalidConfig(msg) => {
-                Logger::error(format!("Invalid configuration: {msg}"));
-                Ok(())
+                write!(f, "Invalid configuration: {msg}")
             }
-            ZlorbError::FileNotFound(path) => {
-                Logger::error(format!("File not found: {path:?}"));
-                Ok(())
-            }
+            ZlorbError::FileNotFound(path) => write!(f, "File not found: {path:?}"),
             ZlorbError::PermissionDenied(path) => {
-                Logger::error(format!("Permission denied: {path:?}"));
-                Ok(())
+                write!(f, "Permission denied: {path:?}")
             }
             ZlorbError::SerializationErrorGeneric(msg) => {
-                Logger::error(format!("Generic Serialization error: {msg}"));
-                Ok(())
+                write!(f, "Generic Serialization error: {msg}")
             }
-            ZlorbError::Other(msg) => {
-                Logger::error(format!("Other error occured: {msg}"));
-                Ok(())
-            }
-            ZlorbError::Git(git) => {
-                Logger::error(format!("Recieved git error: {git}"));
-                Ok(())
-            }
+            ZlorbError::Other(msg) => write!(f, "Other error occured: {msg}"),
+            ZlorbError::Git(git) => write!(f, "Recieved git error: {git}"),
             ZlorbError::SerializationError(error) => {
-                Logger::error(format!("Serialization error: {error}"));
-                Ok(())
+                write!(f, "Serialization error: {error}")
             }
             ZlorbError::TomlSerializationError(error) => {
-                Logger::error(format!("Toml Serialization error: {error}"));
-                Ok(())
+                write!(f, "Toml Serialization error: {error}")
             }
             ZlorbError::TomlDeserializationError(error) => {
-                Logger::error(format!("Toml Deserialization error: {error}"));
-                Ok(())
+                write!(f, "Toml Deserialization error: {error}")
             }
         }
     }
@@ -96,5 +81,36 @@ impl Error for ZlorbError {
 impl From<std::io::Error> for ZlorbError {
     fn from(value: std::io::Error) -> Self {
         ZlorbError::Io(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_writes_the_message_itself() {
+        let err = ZlorbError::Other("boom".to_string());
+        assert_eq!(format!("{}", err), "Other error occured: boom");
+        let err = ZlorbError::InvalidConfig("bad branch".to_string());
+        assert_eq!(format!("{}", err), "Invalid configuration: bad branch");
+    }
+
+    #[test]
+    fn error_line_is_one_plain_line_even_for_a_multiline_message() {
+        let err = ZlorbError::ConfigParseError("first line\nsecond line\r\nthird".to_string());
+        let line = err.error_line();
+        assert_eq!(
+            line,
+            "error: Failed to parse config: first line second line third"
+        );
+        assert!(!line.contains('\n'), "{}", line);
+        assert!(!line.contains('\x1b'), "{}", line);
+    }
+
+    #[test]
+    fn error_line_prefixes_a_single_line_message() {
+        let err = ZlorbError::Other("boom".to_string());
+        assert_eq!(err.error_line(), "error: Other error occured: boom");
     }
 }

@@ -3,10 +3,11 @@ mod template;
 use askama::Template;
 use axum::{
     Router,
+    http::StatusCode,
     response::{Html, IntoResponse},
     routing::get,
 };
-use zlorb_lib::load_config_from_toml;
+use zlorb_lib::{error::ZlorbError, load_config_from_toml};
 
 use crate::template::Index;
 
@@ -14,14 +15,16 @@ const IP: &str = "0.0.0.0";
 const PORT: &str = "3000";
 
 #[tokio::main]
-pub async fn run() {
+pub async fn run() -> Result<(), ZlorbError> {
     let app = Router::new().route("/", get(get_root));
 
     let binding = format!("{IP}:{PORT}");
-    let listener = tokio::net::TcpListener::bind(&binding).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(&binding)
+        .await
+        .map_err(ZlorbError::Io)?;
     println!("Listening on http://{}", binding);
 
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app).await.map_err(ZlorbError::Io)
 }
 
 async fn get_root() -> impl IntoResponse {
@@ -41,6 +44,12 @@ async fn get_root() -> impl IntoResponse {
         Some(mapped_repos)
     };
 
-    let index_render = index.render().unwrap();
-    Html(index_render)
+    match index.render() {
+        Ok(rendered) => Html(rendered).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not render the page: {e}"),
+        )
+            .into_response(),
+    }
 }

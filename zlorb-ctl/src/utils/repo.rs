@@ -12,7 +12,7 @@ use zlorb_lib::{
 
 pub(crate) fn watch() -> Result<(), ZlorbError> {
     let is_root = is_root();
-    
+
     let mut cmd = process::Command::new("journalctl");
     cmd.arg("-f");
     if is_root {
@@ -21,21 +21,19 @@ pub(crate) fn watch() -> Result<(), ZlorbError> {
         cmd.arg("--user").arg("-u").arg("zlorb");
     }
 
-    let out = cmd.status().map_err(ZlorbError::Io);
-    match out {
-        Ok(status) => {
-            if status.success() {
-                println!("End");
-                Ok(())
-            } else {
-                println!("End: Fail");
-                Ok(())
-            }
-        }
-        Err(e) => {
-            e.print();
-            Err(e)
-        }
+    watch_with(cmd.status().map_err(ZlorbError::Io))
+}
+
+fn watch_with(outcome: Result<process::ExitStatus, ZlorbError>) -> Result<(), ZlorbError> {
+    let status = outcome?;
+    if status.success() {
+        println!("End");
+        Ok(())
+    } else {
+        Err(ZlorbError::Other(format!(
+            "journalctl exited with {}; the log stream did not end cleanly",
+            status
+        )))
     }
 }
 
@@ -250,6 +248,43 @@ fn unique_repo_name(
             return candidate;
         }
         n += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status(exit_code: i32) -> process::ExitStatus {
+        process::Command::new("sh")
+            .args(["-c", &format!("exit {}", exit_code)])
+            .status()
+            .unwrap()
+    }
+
+    #[test]
+    fn watch_succeeds_only_when_journalctl_exits_cleanly() {
+        assert!(watch_with(Ok(status(0))).is_ok());
+    }
+
+    #[test]
+    fn watch_fails_when_journalctl_exits_non_zero() {
+        let err = format!("{:?}", watch_with(Ok(status(3))).unwrap_err());
+        assert!(err.contains("journalctl exited with"), "{}", err);
+        assert!(err.contains("exit status: 3"), "{}", err);
+    }
+
+    #[test]
+    fn watch_propagates_a_spawn_failure() {
+        let err = format!(
+            "{:?}",
+            watch_with(Err(ZlorbError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no journalctl",
+            ))))
+            .unwrap_err()
+        );
+        assert!(err.contains("no journalctl"), "{}", err);
     }
 }
 

@@ -110,10 +110,10 @@ fn warn_if_other_scope_unit_exists(is_root_user: bool, home_dir: &Path) {
         system_unit_path()
     };
     if other.exists() {
-        println!(
-            "warning: another zlorb unit already exists at {}; two daemons in different scopes can watch different config dirs — remove the one you do not use",
+        Logger::warn(format!(
+            "another zlorb unit already exists at {}; two daemons in different scopes can watch different config dirs — remove the one you do not use",
             other.display()
-        );
+        ));
     }
 }
 
@@ -121,8 +121,9 @@ fn enable_linger() {
     let out = Command::new("loginctl").args(["enable-linger"]).status();
     match out {
         Ok(status) if status.success() => {}
-        _ => println!(
-            "warning: could not enable linger; the user daemon will stop at logout until you run: sudo loginctl enable-linger $USER"
+        _ => Logger::warn(
+            "could not enable linger; the user daemon will stop at logout until you run: sudo loginctl enable-linger $USER"
+                .to_string(),
         ),
     }
 }

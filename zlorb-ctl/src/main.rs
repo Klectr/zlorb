@@ -60,10 +60,7 @@ fn main() -> Result<(), ZlorbError> {
         Commands::Setup { print_only } => setup::setup(print_only),
         Commands::Remove { repo_name } => repo::remove(repo_name),
         Commands::Watch => repo::watch(),
-        Commands::Web => {
-            zlorb_web::run();
-            Ok(())
-        }
+        Commands::Web => zlorb_web::run(),
     };
 
     if let Err(e) = res {
