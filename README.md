@@ -129,6 +129,8 @@ The daemon commands follow one contract: a no-op happens only on a state read po
 
 No `zlorb-ctl` command prompts or reads stdin, so every command runs unattended. When a command itself fails it exits non-zero and prints exactly one `error: …` line to stderr (warnings go to stderr too); data output goes to stdout, and log lines carry no colour codes when their stream is not a terminal, so piped output stays parseable. `status` is the reporting exception: daemon and per-repo problems are its data — text lines, or the `--json` document's `daemon_error`/`error` fields — so finding a problem there still exits 0, because the report itself succeeded (a config it cannot load at all is a command failure: `--json` still prints the document, plus the `error:` line on stderr, and exits non-zero). Argument errors are clap's: a multi-line usage message on stderr and exit 2.
 
+The commands, flags, exit codes, and the `status --json` / `health --json` schemas are the stable contract documented in [docs/cli-contract.md](docs/cli-contract.md) — scripts and agents can rely on that surface.
+
 ## 🚀 Deployment
 
 The daemon is the systemd service registered by `zlorb-ctl setup`: a per-user service for normal installs, running in the foreground with automatic recovery on failure.
