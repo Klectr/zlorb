@@ -649,6 +649,108 @@ pub struct RepoProcessor {
     pub failed_builds: FailedBuilds,
     pub failed_restarts: FailedRestarts,
     tracker_key: String,
+    credentials: Option<(String, String)>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum CredentialAction {
+    Plaintext { username: String, password: String },
+    SshAgent { username: String },
+    Username { username: String },
+    Rejected,
+    Fail,
+}
+
+impl Debug for CredentialAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CredentialAction::Plaintext { username, .. } => f
+                .debug_struct("Plaintext")
+                .field("username", username)
+                .field("password", &"redacted")
+                .finish(),
+            CredentialAction::SshAgent { username } => f
+                .debug_struct("SshAgent")
+                .field("username", username)
+                .finish(),
+            CredentialAction::Username { username } => f
+                .debug_struct("Username")
+                .field("username", username)
+                .finish(),
+            CredentialAction::Rejected => write!(f, "Rejected"),
+            CredentialAction::Fail => write!(f, "Fail"),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CredentialTried {
+    ssh_agent: bool,
+    plaintext: bool,
+    username: bool,
+}
+
+impl CredentialTried {
+    fn mark(&mut self, action: &CredentialAction) {
+        match action {
+            CredentialAction::SshAgent { .. } => self.ssh_agent = true,
+            CredentialAction::Plaintext { .. } => self.plaintext = true,
+            CredentialAction::Username { .. } => self.username = true,
+            CredentialAction::Rejected | CredentialAction::Fail => {}
+        }
+    }
+}
+
+fn url_is_http(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+fn resolve_credential_action(
+    cred_type: git2::CredentialType,
+    url: Option<&str>,
+    url_username: Option<&str>,
+    configured: Option<&(String, String)>,
+    tried: CredentialTried,
+) -> CredentialAction {
+    if cred_type.contains(git2::CredentialType::SSH_KEY) {
+        if tried.ssh_agent {
+            return CredentialAction::Rejected;
+        }
+        let username = url_username
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .or_else(|| configured.map(|(username, _)| username.clone()))
+            .unwrap_or_else(|| "git".to_string());
+        return CredentialAction::SshAgent { username };
+    }
+    if cred_type.contains(git2::CredentialType::USER_PASS_PLAINTEXT) {
+        if !url.is_some_and(url_is_http) {
+            return CredentialAction::Fail;
+        }
+        if let Some((username, token)) = configured {
+            if tried.plaintext {
+                return CredentialAction::Rejected;
+            }
+            return CredentialAction::Plaintext {
+                username: username.clone(),
+                password: token.clone(),
+            };
+        }
+        return CredentialAction::Fail;
+    }
+    if cred_type.contains(git2::CredentialType::USERNAME) {
+        if tried.username {
+            return CredentialAction::Rejected;
+        }
+        let username = url_username
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .or_else(|| configured.map(|(username, _)| username.clone()))
+            .unwrap_or_else(|| "git".to_string());
+        return CredentialAction::Username { username };
+    }
+    CredentialAction::Fail
 }
 
 impl Debug for RepoProcessor {
@@ -763,7 +865,17 @@ impl RepoProcessor {
             failed_builds: new_failed_builds(),
             failed_restarts: new_failed_restarts(),
             tracker_key,
+            credentials: None,
         })
+    }
+
+    pub fn set_credentials(&mut self, credentials: Option<(String, String)>) {
+        self.credentials = credentials;
+    }
+
+    #[cfg(test)]
+    pub fn credentials(&self) -> Option<&(String, String)> {
+        self.credentials.as_ref()
     }
 
     pub fn update_from_remote(&self) -> Result<(), ZlorbError> {
@@ -3818,8 +3930,35 @@ impl RepoProcessor {
 
     fn _setup_fetchoptions_with_creds(&self) -> FetchOptions<'_> {
         let mut callbacks = RemoteCallbacks::new();
-        //TODO: Complete the credential stuff
-        callbacks.credentials(|_, _, _| Cred::userpass_plaintext("", ""));
+        let configured = self.credentials.clone();
+        let mut tried = CredentialTried::default();
+        callbacks.credentials(move |url, username_from_url, cred_type| {
+            let action = resolve_credential_action(
+                cred_type,
+                Some(url),
+                username_from_url,
+                configured.as_ref(),
+                tried,
+            );
+            tried.mark(&action);
+            match action {
+                CredentialAction::Plaintext { username, password } => {
+                    Cred::userpass_plaintext(&username, &password)
+                }
+                CredentialAction::SshAgent { username } => Cred::ssh_key_from_agent(&username),
+                CredentialAction::Username { username } => Cred::username(&username),
+                CredentialAction::Rejected => Err(git2::Error::new(
+                    git2::ErrorCode::Auth,
+                    git2::ErrorClass::Net,
+                    "the remote rejected the credentials offered for this fetch (the ssh-agent key or the configured username/token); not offering them again in this fetch",
+                )),
+                CredentialAction::Fail => Err(git2::Error::new(
+                    git2::ErrorCode::Auth,
+                    git2::ErrorClass::Net,
+                    "no credentials available for this remote: set username and token in service-config.toml for HTTPS remotes, or run an ssh-agent for SSH remotes",
+                )),
+            }
+        });
         let mut fetch_options = FetchOptions::new();
         fetch_options.remote_callbacks(callbacks);
         fetch_options
@@ -4480,6 +4619,220 @@ mod tests {
             out_dir: None,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn credential_action_ssh_uses_agent_with_url_username() {
+        let configured = ("alice".to_string(), "secret".to_string());
+        assert_eq!(
+            resolve_credential_action(
+                git2::CredentialType::SSH_KEY,
+                Some("ssh://git@github.com/Klectr/zimer.git"),
+                Some("bob"),
+                Some(&configured),
+                CredentialTried::default()
+            ),
+            CredentialAction::SshAgent {
+                username: "bob".to_string()
+            }
+        );
+        assert_eq!(
+            resolve_credential_action(
+                git2::CredentialType::SSH_KEY,
+                None,
+                None,
+                Some(&configured),
+                CredentialTried::default()
+            ),
+            CredentialAction::SshAgent {
+                username: "alice".to_string()
+            }
+        );
+        assert_eq!(
+            resolve_credential_action(
+                git2::CredentialType::SSH_KEY,
+                None,
+                None,
+                None,
+                CredentialTried::default()
+            ),
+            CredentialAction::SshAgent {
+                username: "git".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn credential_action_handles_realistic_combined_masks() {
+        let configured = ("alice".to_string(), "secret".to_string());
+        let ssh_mask = git2::CredentialType::SSH_KEY
+            | git2::CredentialType::SSH_CUSTOM
+            | git2::CredentialType::SSH_MEMORY
+            | git2::CredentialType::USER_PASS_PLAINTEXT;
+        assert_eq!(
+            resolve_credential_action(
+                ssh_mask,
+                Some("git@github.com:Klectr/zimer.git"),
+                Some("git"),
+                Some(&configured),
+                CredentialTried::default()
+            ),
+            CredentialAction::SshAgent {
+                username: "git".to_string()
+            }
+        );
+        let username_ssh_mask = git2::CredentialType::USERNAME | git2::CredentialType::SSH_KEY;
+        assert_eq!(
+            resolve_credential_action(
+                username_ssh_mask,
+                None,
+                None,
+                None,
+                CredentialTried::default()
+            ),
+            CredentialAction::SshAgent {
+                username: "git".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn credential_action_userpass_uses_configured_pair_or_fails() {
+        let configured = ("alice".to_string(), "secret".to_string());
+        assert_eq!(
+            resolve_credential_action(
+                git2::CredentialType::USER_PASS_PLAINTEXT,
+                Some("https://github.com/Klectr/zimer.git"),
+                Some("bob"),
+                Some(&configured),
+                CredentialTried::default()
+            ),
+            CredentialAction::Plaintext {
+                username: "alice".to_string(),
+                password: "secret".to_string()
+            }
+        );
+        assert_eq!(
+            resolve_credential_action(
+                git2::CredentialType::USER_PASS_PLAINTEXT,
+                Some("https://github.com/Klectr/zimer.git"),
+                None,
+                None,
+                CredentialTried::default()
+            ),
+            CredentialAction::Fail
+        );
+    }
+
+    #[test]
+    fn credential_action_never_offers_the_configured_pair_to_ssh_urls() {
+        let configured = ("alice".to_string(), "secret".to_string());
+        for url in [
+            "ssh://git@github.com/Klectr/zimer.git",
+            "git://github.com/Klectr/zimer.git",
+            "git@github.com:Klectr/zimer.git",
+            "git+ssh://git@github.com/Klectr/zimer.git",
+            "ssh+git://git@github.com/Klectr/zimer.git",
+            "SSH://git@github.com/Klectr/zimer.git",
+            "github.com:Klectr/zimer.git",
+            "/srv/repos/zimer.git",
+            "file:///srv/repos/zimer.git",
+        ] {
+            assert_eq!(
+                resolve_credential_action(
+                    git2::CredentialType::USER_PASS_PLAINTEXT,
+                    Some(url),
+                    Some("git"),
+                    Some(&configured),
+                    CredentialTried::default()
+                ),
+                CredentialAction::Fail,
+                "url: {url}"
+            );
+        }
+        assert!(url_is_http("https://github.com/Klectr/zimer.git"));
+        assert!(url_is_http("HTTPS://github.com/Klectr/zimer.git"));
+        assert!(!url_is_http("ssh://git@github.com/Klectr/zimer.git"));
+    }
+
+    #[test]
+    fn credential_action_repeat_offers_are_rejected() {
+        let configured = ("alice".to_string(), "secret".to_string());
+        let mut tried = CredentialTried::default();
+        let first = resolve_credential_action(
+            git2::CredentialType::SSH_KEY,
+            None,
+            None,
+            None,
+            tried,
+        );
+        tried.mark(&first);
+        assert_eq!(
+            resolve_credential_action(git2::CredentialType::SSH_KEY, None, None, None, tried),
+            CredentialAction::Rejected
+        );
+        let mut tried = CredentialTried::default();
+        let first = resolve_credential_action(
+            git2::CredentialType::USER_PASS_PLAINTEXT,
+            Some("https://github.com/Klectr/zimer.git"),
+            None,
+            Some(&configured),
+            tried,
+        );
+        tried.mark(&first);
+        assert_eq!(
+            resolve_credential_action(
+                git2::CredentialType::USER_PASS_PLAINTEXT,
+                Some("https://github.com/Klectr/zimer.git"),
+                None,
+                Some(&configured),
+                tried
+            ),
+            CredentialAction::Rejected
+        );
+    }
+
+    #[test]
+    fn credential_action_username_only_request() {
+        let configured = ("alice".to_string(), "secret".to_string());
+        assert_eq!(
+            resolve_credential_action(
+                git2::CredentialType::USERNAME,
+                None,
+                None,
+                Some(&configured),
+                CredentialTried::default()
+            ),
+            CredentialAction::Username {
+                username: "alice".to_string()
+            }
+        );
+        assert_eq!(
+            resolve_credential_action(
+                git2::CredentialType::USERNAME,
+                None,
+                Some("bob"),
+                None,
+                CredentialTried::default()
+            ),
+            CredentialAction::Username {
+                username: "bob".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn processor_credentials_default_to_none_and_can_be_set() {
+        let root = temp_dir("processor-credentials");
+        std::fs::create_dir_all(&root).unwrap();
+        git2::Repository::init(&root).unwrap();
+        let mut processor = processor_for(&root);
+        assert_eq!(processor.credentials(), None);
+        processor.set_credentials(Some(("alice".to_string(), "secret".to_string())));
+        assert_eq!(
+            processor.credentials(),
+            Some(&("alice".to_string(), "secret".to_string()))
+        );
     }
 
     #[test]

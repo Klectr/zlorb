@@ -58,7 +58,10 @@ impl ServiceCoordinator {
                 e
             )),
         }
-        match self.config_manager.load_all_repo_configs() {
+        match self
+            .config_manager
+            .load_all_repo_configs_with_credentials(self.service_config.credentials())
+        {
             Ok(mut repos) => {
                 for repo in &mut repos {
                     repo.failed_builds = self.failed_builds.clone();
