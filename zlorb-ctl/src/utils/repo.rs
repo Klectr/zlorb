@@ -128,7 +128,7 @@ pub(crate) fn add() -> Result<(), ZlorbError> {
     {
         if tracked.branch == detected.branch
             && tracked.remote == detected.remote
-            && tracked.remote_branch == refreshed_remote_branch
+            && tracked.resolved_remote_branch() == detected.remote_branch
         {
             Logger::info(format!(
                 "{} is already in the configuration as '{}'; nothing to add",
@@ -137,13 +137,25 @@ pub(crate) fn add() -> Result<(), ZlorbError> {
             return Ok(());
         }
         let tracked_name = tracked.name.clone();
+        let mut changes = Vec::new();
+        if tracked.branch != detected.branch {
+            changes.push(format!("branch to '{}'", detected.branch));
+        }
+        if tracked.remote != detected.remote {
+            changes.push(format!("remote to '{}'", detected.remote));
+        }
+        if tracked.resolved_remote_branch() != detected.remote_branch {
+            changes.push(format!("remote branch to '{}'", detected.remote_branch));
+        }
         tracked.branch = detected.branch.clone();
         tracked.remote = detected.remote.clone();
         tracked.remote_branch = refreshed_remote_branch;
         save_config_to_toml(&config)?;
         Logger::info(format!(
-            "{} is already in the configuration as '{}'; updated its tracked branch to '{}' and remote to '{}'",
-            path_str, tracked_name, detected.branch, detected.remote
+            "{} is already in the configuration as '{}'; updated its tracked {}",
+            path_str,
+            tracked_name,
+            changes.join(", ")
         ));
         return Ok(());
     }
