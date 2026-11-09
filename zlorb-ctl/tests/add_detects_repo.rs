@@ -645,6 +645,126 @@ fn re_add_clears_a_stale_remote_branch_when_the_upstream_is_gone() {
 }
 
 #[test]
+fn re_add_with_an_explicit_remote_branch_equal_to_the_branch_is_byte_identical() {
+    let root = temp_dir("re-add-explicit-remote-branch");
+    let config_dir = root.join("config");
+    let repo_path = root.join("my-app");
+    init_repo_with_origin(&repo_path, "main");
+
+    let first = run_add(&repo_path, &config_dir);
+    assert!(first.status.success());
+    let mut seeded = std::fs::read_to_string(config_dir.join("repositories.toml")).unwrap();
+    seeded.push_str("remote_branch = \"main\"\n");
+    std::fs::write(config_dir.join("repositories.toml"), &seeded).unwrap();
+    let before = std::fs::read(config_dir.join("repositories.toml")).unwrap();
+
+    let second = run_add(&repo_path, &config_dir);
+    assert!(
+        second.status.success(),
+        "re-add failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(
+        combined.contains("nothing to add"),
+        "an explicit remote_branch equal to the branch resolves to no change, got: {}",
+        combined
+    );
+    let after = std::fs::read(config_dir.join("repositories.toml")).unwrap();
+    assert_eq!(
+        before, after,
+        "re-add must not rewrite a resolved-unchanged entry"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn re_add_with_only_a_remote_branch_change_refreshes_and_logs_only_that_change() {
+    let root = temp_dir("re-add-remote-branch-only");
+    let config_dir = root.join("config");
+    let repo_path = root.join("my-app");
+    init_repo(&repo_path, "main");
+    let repo = git2::Repository::open(&repo_path).unwrap();
+    let oid = repo.head().unwrap().target().unwrap();
+    let commit = repo.find_commit(oid).unwrap();
+    repo.branch("dev", &commit, false).unwrap();
+    drop(commit);
+    repo.set_head("refs/heads/dev").unwrap();
+    repo.remote("origin", "https://example.com/repo.git").unwrap();
+    let mut git_config = repo.config().unwrap();
+    git_config.set_str("branch.dev.remote", "origin").unwrap();
+    git_config
+        .set_str("branch.dev.merge", "refs/heads/main")
+        .unwrap();
+    drop(git_config);
+    drop(repo);
+
+    let first = run_add(&repo_path, &config_dir);
+    assert!(
+        first.status.success(),
+        "first add failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let seeded = std::fs::read_to_string(config_dir.join("repositories.toml")).unwrap();
+    assert!(
+        seeded.contains("remote_branch = \"main\""),
+        "first add should record the differing remote branch: {}",
+        seeded
+    );
+
+    let repo = git2::Repository::open(&repo_path).unwrap();
+    let mut git_config = repo.config().unwrap();
+    git_config
+        .set_str("branch.dev.merge", "refs/heads/dev")
+        .unwrap();
+    drop(git_config);
+    drop(repo);
+
+    let second = run_add(&repo_path, &config_dir);
+    assert!(
+        second.status.success(),
+        "re-add failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(
+        combined.contains("updated its tracked remote branch to 'dev'"),
+        "log should name the remote branch change, got: {}",
+        combined
+    );
+    assert!(
+        !combined.contains("updated its tracked branch"),
+        "log must not claim a branch change when only the remote branch changed, got: {}",
+        combined
+    );
+    let repos = std::fs::read_to_string(config_dir.join("repositories.toml")).unwrap();
+    assert!(
+        repos.contains("branch = \"dev\""),
+        "branch should stay dev: {}",
+        repos
+    );
+    assert!(
+        repos.contains("remote = \"origin\""),
+        "remote should stay origin: {}",
+        repos
+    );
+    assert!(
+        !repos.contains("remote_branch"),
+        "remote_branch should be cleared once it equals the branch: {}",
+        repos
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn re_add_of_a_tracked_repo_whose_remote_was_removed_is_a_no_op_success() {
     let root = temp_dir("tracked-remote-removed");
     let config_dir = root.join("config");
