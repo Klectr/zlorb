@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use zlorb_lib::{error::ZlorbError, get_home_dir, get_zlorb_config_dir, is_root, log::Logger};
+use zlorb_lib::{
+    error::ZlorbError, is_root, log::Logger, try_get_home_dir, try_get_zlorb_config_dir,
+};
 
 fn escape_unit_value(value: &str) -> String {
     value
@@ -110,10 +112,10 @@ fn warn_if_other_scope_unit_exists(is_root_user: bool, home_dir: &Path) {
         system_unit_path()
     };
     if other.exists() {
-        println!(
-            "warning: another zlorb unit already exists at {}; two daemons in different scopes can watch different config dirs — remove the one you do not use",
+        Logger::warn(format!(
+            "another zlorb unit already exists at {}; two daemons in different scopes can watch different config dirs — remove the one you do not use",
             other.display()
-        );
+        ));
     }
 }
 
@@ -121,16 +123,17 @@ fn enable_linger() {
     let out = Command::new("loginctl").args(["enable-linger"]).status();
     match out {
         Ok(status) if status.success() => {}
-        _ => println!(
-            "warning: could not enable linger; the user daemon will stop at logout until you run: sudo loginctl enable-linger $USER"
+        _ => Logger::warn(
+            "could not enable linger; the user daemon will stop at logout until you run: sudo loginctl enable-linger $USER"
+                .to_string(),
         ),
     }
 }
 
 pub fn setup(print_only: bool) -> Result<(), ZlorbError> {
     let root = is_root();
-    let home_dir = get_home_dir();
-    let config_dir = get_zlorb_config_dir();
+    let home_dir = try_get_home_dir()?;
+    let config_dir = try_get_zlorb_config_dir()?;
     ensure_config(&config_dir)?;
     let current_exe = std::env::current_exe().map_err(ZlorbError::Io)?;
     let service_bin = resolve_service_binary(&current_exe, &home_dir);
@@ -143,7 +146,6 @@ pub fn setup(print_only: bool) -> Result<(), ZlorbError> {
     println!("config dir: {}", config_dir.display());
     println!("service binary: {}", service_bin.display());
     println!("systemd unit: {}", unit_path.display());
-    warn_if_other_scope_unit_exists(root, &home_dir);
     if print_only {
         println!("--- unit ---\n{}", unit);
         println!("next: {}", manual_steps(root));
@@ -153,6 +155,7 @@ pub fn setup(print_only: bool) -> Result<(), ZlorbError> {
                 service_bin.display()
             )));
         }
+        warn_if_other_scope_unit_exists(root, &home_dir);
         return Ok(());
     }
     if !service_bin.exists() {
@@ -162,6 +165,7 @@ pub fn setup(print_only: bool) -> Result<(), ZlorbError> {
             manual_steps(root)
         )));
     }
+    warn_if_other_scope_unit_exists(root, &home_dir);
     let reloaded = systemctl(root, &["daemon-reload"]);
     let enabled = match reloaded {
         Ok(status) if status.success() => systemctl(root, &["enable", "--now", "zlorb.service"]),

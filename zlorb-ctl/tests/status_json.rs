@@ -161,5 +161,16 @@ fn status_json_fails_on_a_malformed_config() {
     assert_eq!(value["repositories"], serde_json::json!([]));
     let error = value["error"].as_str().expect("error must be reported");
     assert!(error.contains("repositories.toml"), "{}", error);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "the failure must also be one error line on stderr: {:?}",
+        stderr
+    );
+    assert!(lines[0].starts_with("error: "), "{}", lines[0]);
+    assert!(lines[0].contains("repositories.toml"), "{}", lines[0]);
+    assert!(!stderr.contains('\x1b'), "ANSI escape in stderr: {:?}", stderr);
     let _ = std::fs::remove_dir_all(&root);
 }

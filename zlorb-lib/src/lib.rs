@@ -8,16 +8,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{config::RepositoriesConfigurationFile, error::ZlorbError, log::Logger};
+use crate::{config::RepositoriesConfigurationFile, error::ZlorbError};
 
-pub fn get_home_dir() -> PathBuf {
-    match std::env::home_dir() {
-        Some(x) => x,
-        None => {
-            Logger::error("Failed to get the home directory".into());
-            panic!("Program exited due to previous error");
-        }
-    }
+pub fn try_get_home_dir() -> Result<PathBuf, ZlorbError> {
+    std::env::home_dir().ok_or(ZlorbError::HomeDirNotFound)
 }
 
 pub fn explicit_config_dir_from(
@@ -50,16 +44,26 @@ pub fn resolve_config_dir_from(
     }
 }
 
-pub fn get_zlorb_config_dir() -> PathBuf {
+pub fn config_dir_from_env(
+    zlorb_config_dir: Option<&str>,
+    xdg_config_home: Option<&str>,
+    home_dir: Option<PathBuf>,
+) -> Result<PathBuf, ZlorbError> {
+    if let Some(dir) = explicit_config_dir_from(zlorb_config_dir, xdg_config_home) {
+        return Ok(dir);
+    }
+    let home_dir = home_dir.ok_or(ZlorbError::HomeDirNotFound)?;
+    Ok(resolve_config_dir_from(None, None, &home_dir))
+}
+
+pub fn try_get_zlorb_config_dir() -> Result<PathBuf, ZlorbError> {
     let zlorb_config_dir = std::env::var("ZLORB_CONFIG_DIR").ok();
     let xdg_config_home = std::env::var("XDG_CONFIG_HOME").ok();
-    if let Some(dir) = explicit_config_dir_from(
+    config_dir_from_env(
         zlorb_config_dir.as_deref(),
         xdg_config_home.as_deref(),
-    ) {
-        return dir;
-    }
-    resolve_config_dir_from(None, None, &get_home_dir())
+        std::env::home_dir(),
+    )
 }
 
 pub fn effective_uid() -> Option<u32> {
@@ -77,8 +81,8 @@ pub fn is_root() -> bool {
 
 /// gets the toml file for zlorb repo configurations
 /// File: ~/.config/zlorb/repositories.toml
-pub fn get_zlorb_repo_config_file() -> PathBuf {
-    get_zlorb_config_dir().join("repositories.toml")
+pub fn get_zlorb_repo_config_file() -> Result<PathBuf, ZlorbError> {
+    Ok(try_get_zlorb_config_dir()?.join("repositories.toml"))
 }
 
 pub fn create_file_with_content(path: PathBuf, content: &String) -> Result<String, ZlorbError> {
@@ -121,7 +125,7 @@ pub fn load_config_from_path(
 }
 
 pub fn load_config_from_toml() -> Result<RepositoriesConfigurationFile, ZlorbError> {
-    load_config_from_path(&get_zlorb_repo_config_file())
+    load_config_from_path(&get_zlorb_repo_config_file()?)
 }
 
 pub fn save_config_to_path(
@@ -165,7 +169,7 @@ pub fn save_config_to_path(
 pub fn save_config_to_toml(
     config: &RepositoriesConfigurationFile,
 ) -> Result<(), ZlorbError> {
-    save_config_to_path(&get_zlorb_repo_config_file(), config)
+    save_config_to_path(&get_zlorb_repo_config_file()?, config)
 }
 
 pub struct ConfigFileLock {
@@ -213,7 +217,7 @@ pub fn lock_config_file(config_file_path: &Path) -> Result<ConfigFileLock, Zlorb
 }
 
 pub fn lock_repo_config() -> Result<ConfigFileLock, ZlorbError> {
-    lock_config_file(&get_zlorb_repo_config_file())
+    lock_config_file(&get_zlorb_repo_config_file()?)
 }
 
 #[cfg(unix)]
@@ -273,6 +277,28 @@ mod tests {
     fn blank_explicit_dir_falls_through_to_xdg() {
         let dir = resolve_config_dir_from(Some("  "), Some("/xdg"), Path::new("/home/u"));
         assert_eq!(dir, PathBuf::from("/xdg/zlorb"));
+    }
+
+    #[test]
+    fn config_dir_from_env_needs_no_home_when_a_dir_is_explicit() {
+        assert_eq!(
+            config_dir_from_env(Some("/srv/zlorb"), None, None).unwrap(),
+            PathBuf::from("/srv/zlorb")
+        );
+        assert_eq!(
+            config_dir_from_env(None, Some("/xdg"), None).unwrap(),
+            PathBuf::from("/xdg/zlorb")
+        );
+    }
+
+    #[test]
+    fn config_dir_from_env_without_a_home_is_an_error_not_a_panic() {
+        let err = config_dir_from_env(None, None, None).unwrap_err();
+        assert!(matches!(err, ZlorbError::HomeDirNotFound), "{:?}", err);
+        assert_eq!(
+            config_dir_from_env(None, None, Some(PathBuf::from("/home/u"))).unwrap(),
+            PathBuf::from("/home/u/.config/zlorb")
+        );
     }
 
     fn temp_config_path(label: &str) -> PathBuf {
