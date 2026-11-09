@@ -219,6 +219,53 @@ fn a_failed_daemon_start_reports_its_error_on_stderr_only() {
 }
 
 #[test]
+fn piping_status_into_a_closed_pipe_does_not_panic() {
+    let root = temp_dir("closed-pipe");
+    let config_dir = root.join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let mut contents = String::new();
+    for i in 0..2000 {
+        contents.push_str(&format!(
+            "[[repository]]\nname = \"repo-{}\"\npath = \"/nonexistent/repo-{}\"\nremote = \"origin\"\nbranch = \"main\"\n",
+            i, i
+        ));
+    }
+    std::fs::write(config_dir.join("repositories.toml"), contents).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_zlorb-ctl"))
+        .arg("status")
+        .env("ZLORB_CONFIG_DIR", &config_dir)
+        .env("PATH", "/nonexistent-bin")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut buf = [0u8; 10];
+    stdout.read_exact(&mut buf).unwrap();
+    drop(stdout);
+    let status = child.wait().unwrap();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert_ne!(
+        status.code(),
+        Some(101),
+        "status panicked on a closed pipe: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "status panicked on a closed pipe: {}",
+        stderr
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn web_on_an_occupied_port_fails_with_an_error_line_instead_of_panicking() {
     let root = temp_dir("web-occupied");
     let held = std::net::TcpListener::bind("127.0.0.1:3000")

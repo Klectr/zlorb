@@ -48,6 +48,10 @@ enum Commands {
 }
 
 fn main() -> Result<(), ZlorbError> {
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let args = Args::parse();
 
     let res = match args.cmd {
