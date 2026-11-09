@@ -16,7 +16,9 @@ const PORT: &str = "3000";
 
 #[tokio::main]
 pub async fn run() -> Result<(), ZlorbError> {
-    let app = Router::new().route("/", get(get_root));
+    let app = Router::new()
+        .route("/", get(get_root))
+        .route("/healthz", get(get_health));
 
     let binding = format!("{IP}:{PORT}");
     let listener = tokio::net::TcpListener::bind(&binding)
@@ -25,6 +27,10 @@ pub async fn run() -> Result<(), ZlorbError> {
     println!("Listening on http://{}", binding);
 
     axum::serve(listener, app).await.map_err(ZlorbError::Io)
+}
+
+async fn get_health() -> &'static str {
+    "zlorb-web ok\n"
 }
 
 async fn get_root() -> impl IntoResponse {

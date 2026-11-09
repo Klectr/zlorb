@@ -1,5 +1,5 @@
 mod utils;
-use crate::utils::{daemon::DaemonManager, repo, setup, status};
+use crate::utils::{daemon::DaemonManager, health, repo, setup, status};
 use clap::{Parser, Subcommand};
 use zlorb_lib::error::ZlorbError;
 
@@ -23,6 +23,11 @@ enum Commands {
     List,
     /// report daemon and per-repo state; --json prints it as one JSON document
     Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// verify the daemon and the web UI are actually responding; exits non-zero when either is not healthy
+    Health {
         #[arg(long)]
         json: bool,
     },
@@ -58,6 +63,7 @@ fn main() -> Result<(), ZlorbError> {
         Commands::Add => repo::add(),
         Commands::List => repo::list(),
         Commands::Status { json } => status::status(json),
+        Commands::Health { json } => health::health(json),
         Commands::Start => DaemonManager::start(),
         Commands::Stop => DaemonManager::stop(),
         Commands::Restart => DaemonManager::restart(),

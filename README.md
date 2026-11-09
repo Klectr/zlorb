@@ -100,6 +100,10 @@ zlorb-ctl list
 zlorb-ctl status
 zlorb-ctl status --json
 
+# Verify the daemon and the web UI are actually responding (add --json for the same report as JSON)
+zlorb-ctl health
+zlorb-ctl health --json
+
 # Remove a repository
 zlorb-ctl remove --repo-name my-repo
 
@@ -120,6 +124,8 @@ The daemon commands follow one contract: a no-op happens only on a state read po
 - `remove --repo-name <name>` for a name that is not tracked exits 0. That makes `remove` safe to re-run, at an accepted cost: a typo in the name also exits 0 and removes nothing — only the log line says the name is not tracked. Check the spelling against `zlorb-ctl list` when a removal seems to have had no effect.
 
 `status --json` prints one JSON document: `daemon_running` (plus `daemon_error` when systemctl itself cannot be run), and per repo its config, local `head_oid`, `last_fetch_oid` (the `FETCH_HEAD` line for the tracked branch, from the repo's common git dir; null when that file has no line for it) and `last_fetch_unix` (that file's modification time; null when the repo was never fetched), and `error` — the first current problem found (invalid branch/remote/strategy, missing path, unreadable HEAD, unopenable repo, unreadable remote) or null. When the config itself cannot be loaded, the document instead carries the problem in a top-level `error` with an empty repo list, and the command still exits non-zero. The daemon keeps build outcomes only in memory and persists no status file, so `status` does not report a build status; inventing one from the config would not be truthful.
+
+`health` is the command to gate on: it checks that the daemon is running (the same positively read `systemctl is-active` state `status` reports) and that the web UI actually answers at `127.0.0.1:3000`, the port `zlorb-ctl web` binds — it requests that server's `/healthz` route and requires that route's exact `zlorb-web ok` reply, so some other server squatting on port 3000 answering 200 does not count as the web UI. The report carries `daemon_running`/`daemon_error` and `web_responding`/`web_status`/`web_error`; `healthy` is true only when the daemon is running and the web UI answers with a 2xx status (a web process answering 500 is responding, but not healthy). Unlike `status`, whose findings are its data, `health` is a check: it exits 0 when healthy and non-zero when not, with the report still on stdout and one `error: …` line on stderr. The web UI is an on-demand `zlorb-ctl web` process, not a systemd unit, so `health` reports a stopped web UI; it does not start one.
 
 No `zlorb-ctl` command prompts or reads stdin, so every command runs unattended. When a command itself fails it exits non-zero and prints exactly one `error: …` line to stderr (warnings go to stderr too); data output goes to stdout, and log lines carry no colour codes when their stream is not a terminal, so piped output stays parseable. `status` is the reporting exception: daemon and per-repo problems are its data — text lines, or the `--json` document's `daemon_error`/`error` fields — so finding a problem there still exits 0, because the report itself succeeded (a config it cannot load at all is a command failure: `--json` still prints the document, plus the `error:` line on stderr, and exits non-zero). Argument errors are clap's: a multi-line usage message on stderr and exit 2.
 
