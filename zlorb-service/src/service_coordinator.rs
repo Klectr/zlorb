@@ -305,6 +305,44 @@ mod tests {
     }
 
     #[test]
+    fn zero_sleep_time_edit_keeps_previous_service_config() {
+        let root = temp_dir("zero-sleep-keeps");
+        let config_dir = root.join("config");
+        write_repos(&config_dir, "");
+        write_service_config(&config_dir, 33);
+        let mut coordinator =
+            ServiceCoordinator::with_config_manager(ConfigManager::with_config_dir(
+                config_dir.clone(),
+            ));
+        coordinator.reload_configs();
+        assert_eq!(coordinator.service_config.sleep_time, 33);
+        write_service_config(&config_dir, 0);
+        coordinator.reload_configs();
+        assert_eq!(coordinator.service_config.sleep_time, 33);
+    }
+
+    #[test]
+    fn first_load_with_zero_sleep_time_keeps_default_and_leaves_file_unchanged() {
+        let root = temp_dir("zero-sleep-first");
+        let config_dir = root.join("config");
+        write_repos(&config_dir, "");
+        write_service_config(&config_dir, 0);
+        let mut coordinator =
+            ServiceCoordinator::with_config_manager(ConfigManager::with_config_dir(
+                config_dir.clone(),
+            ));
+        coordinator.reload_configs();
+        assert_eq!(
+            coordinator.service_config.sleep_time,
+            ServiceConfig::default().sleep_time
+        );
+        assert_eq!(
+            std::fs::read_to_string(config_dir.join("service-config.toml")).unwrap(),
+            "sleep_time = 0\nusername = \"u\"\ntoken = \"t\"\n"
+        );
+    }
+
+    #[test]
     fn reload_shares_one_failed_builds_tracker_across_processors() {
         let root = temp_dir("tracker-shared");
         let config_dir = root.join("config");

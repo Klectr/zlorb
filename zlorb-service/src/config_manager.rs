@@ -105,6 +105,7 @@ impl ConfigManager {
             std::fs::create_dir_all(parent).map_err(ZlorbError::Io)?;
         }
         let c = ServiceConfig::default();
+        c.validate()?;
         let f = toml::to_string(&c).map_err(ZlorbError::TomlSerializationError)?;
         create_file_with_content(config_path, &f)?;
         Ok(f)
@@ -119,8 +120,10 @@ impl ConfigManager {
             }
             Err(e) => return Err(ZlorbError::Io(e)),
         };
-        toml::from_str::<ServiceConfig>(&contents)
-            .map_err(ZlorbError::TomlDeserializationError)
+        let config = toml::from_str::<ServiceConfig>(&contents)
+            .map_err(ZlorbError::TomlDeserializationError)?;
+        config.validate()?;
+        Ok(config)
     }
 
     pub fn load_repo_configurations(
@@ -416,6 +419,29 @@ mod tests {
             zlorb_lib::config::BuildStrategyKind::Rust
         );
         assert_eq!(manager.load_service_config().unwrap().sleep_time, 7);
+    }
+
+    #[test]
+    fn zero_sleep_time_service_config_is_a_load_error() {
+        let root = temp_dir("zero-sleep");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("service-config.toml"),
+            "sleep_time = 0\nusername = \"u\"\ntoken = \"t\"\n",
+        )
+        .unwrap();
+        let manager = ConfigManager::with_config_dir(config_dir.clone());
+        let err = manager.load_service_config().unwrap_err();
+        let ZlorbError::InvalidConfig(message) = err else {
+            panic!("expected InvalidConfig, got {:?}", err);
+        };
+        assert!(message.contains("sleep_time"), "{}", message);
+        assert!(message.contains("at least 1"), "{}", message);
+        assert_eq!(
+            std::fs::read_to_string(config_dir.join("service-config.toml")).unwrap(),
+            "sleep_time = 0\nusername = \"u\"\ntoken = \"t\"\n"
+        );
     }
 
     #[test]

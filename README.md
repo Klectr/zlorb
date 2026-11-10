@@ -62,7 +62,7 @@ username = "NO USERNAME PROVIDED"
 token = "NO TOKEN PROVIDED"
 ```
 
-`sleep_time` is the number of seconds the daemon waits between polling cycles. The daemon re-reads this file and `repositories.toml` every cycle, so edits take effect without a restart.
+`sleep_time` is the number of seconds the daemon waits between polling cycles, and it must be at least 1: a `sleep_time` of 0 is a config error, the daemon logs it and keeps the previous service config (the default on first load) instead of polling with no pause. The daemon re-reads this file and `repositories.toml` every cycle, so edits take effect without a restart.
 
 `username` and `token` are the credentials the daemon offers when a remote asks for plaintext (HTTPS) authentication during fetch — for a private GitHub repo, a personal access token as `token` with its account name as `username`. The shipped placeholder values (`NO USERNAME PROVIDED` / `NO TOKEN PROVIDED`) and blank values mean no credentials are configured: the daemon then offers nothing for plaintext auth and the fetch fails with an error naming this file instead of sending an empty password. SSH remotes do not use these fields; key requests are answered through ssh-agent, using the username from the remote URL (falling back to the configured `username`, then `git`), so the daemon needs an agent holding the key — for a user service, one reachable through the service's `SSH_AUTH_SOCK`. Public remotes and local-path remotes need no credentials at all.
 

@@ -8,6 +8,15 @@ pub struct ServiceConfig {
 }
 
 impl ServiceConfig {
+    pub fn validate(&self) -> Result<(), zlorb_lib::error::ZlorbError> {
+        if self.sleep_time == 0 {
+            return Err(zlorb_lib::error::ZlorbError::InvalidConfig(
+                "sleep_time must be at least 1 second in service-config.toml; got 0, which would make the daemon poll with no pause between cycles".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn credentials(&self) -> Option<(String, String)> {
         let username = self.username.trim();
         let token = self.token.trim();
@@ -55,6 +64,27 @@ mod tests {
             config("  alice ", " secret ").credentials(),
             Some(("alice".to_string(), "secret".to_string()))
         );
+    }
+
+    #[test]
+    fn zero_sleep_time_is_invalid() {
+        let mut bad = config("alice", "secret");
+        bad.sleep_time = 0;
+        let err = bad.validate().unwrap_err();
+        let zlorb_lib::error::ZlorbError::InvalidConfig(message) = err else {
+            panic!("expected InvalidConfig, got {:?}", err);
+        };
+        assert!(message.contains("sleep_time"), "{}", message);
+        assert!(message.contains("at least 1"), "{}", message);
+        assert!(message.contains("service-config.toml"), "{}", message);
+    }
+
+    #[test]
+    fn positive_sleep_time_is_valid() {
+        let mut one = config("alice", "secret");
+        one.sleep_time = 1;
+        assert!(one.validate().is_ok());
+        assert!(ServiceConfig::default().validate().is_ok());
     }
 
     #[test]
