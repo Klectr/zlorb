@@ -1,16 +1,16 @@
 # zlorb 🛠️
 
-A lightweight, systemd-managed continuous integration tool for Git-based projects. zlorb monitors repositories, detects changes, and triggers builds using Bun, 
+A lightweight, systemd-managed continuous integration tool for Git-based projects. zlorb monitors repositories, detects changes, and runs each repo's configured build strategy, 
 keeping your projects up-to-date effortlessly.
 
 ## 📖 Overview
 zlorb is a Rust-based system with three components: `zlorb-service` (the monitoring daemon), `zlorb-ctl` (a CLI for easy management), and `zlorb-lib` (shared functionality). 
-It watches Git repositories for updates, performs safe fast-forward merges, and runs build commands when changes are detected or build artifacts are missing.
+It watches Git repositories for updates, performs safe fast-forward merges, and builds with each repo's configured strategy when an update is pulled, the configured output directory is missing, or a failed build is retried.
 
 ## 🔑 Key Features
 - 🔍 **Automatic Change Detection**: Tracks repository updates using the `git2` library.
 - 🔒 **Safe Git Operations**: Ensures only fast-forward merges are applied.
-- 🏗️ **Build Triggering**: Executes Bun builds when changes occur or `dist/` is missing.
+- 🏗️ **Build Triggering**: Runs the repo's configured build strategy (`bun` or `rust`) when an update is pulled, the configured output directory is missing, or a failed build is retried.
 - ⚙️ **Systemd Integration**: Runs reliably with automatic restarts.
 - 🖥️ **CLI Management**: Easily add, remove, or list repositories without service restarts.
 
@@ -159,5 +159,5 @@ Zlorb is licensed under the [MIT License](LICENSE).
 
 ## Roadmap
 - [x] watch ctl flag that triggers journalctl log watcher
-- [ ] web output ctl flag that spins up web server
+- [x] web output ctl flag that spins up web server
 - [x] need to load configs into memory so daemon doesnt need to keep reading file system every iteration
