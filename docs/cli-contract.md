@@ -58,7 +58,7 @@ section.
 | `restart` | Restart the daemon | No — always acts |
 | `setup [--print-only]` | Create the config and the systemd unit, then enable and start the daemon | Yes |
 | `watch` | Follow the daemon's journal (`journalctl -f`) until it ends | Read-only |
-| `web` | Run the web UI in the foreground on port 3000 | No — serves until stopped |
+| `web` | Run the web UI in the foreground on port 3000 (or `$ZLORB_WEB_PORT`) | No — serves until stopped |
 
 ### add
 
@@ -162,7 +162,7 @@ non-zero `journalctl` exit, or `journalctl` missing, is a command failure.
 
 ### web
 
-Runs the web UI in the foreground, bound to `0.0.0.0:3000`, until the
+Runs the web UI in the foreground, bound to `0.0.0.0:3000` by default — set `ZLORB_WEB_PORT` to a port between 1 and 65535 to use a different one — until the
 process is stopped. It serves `/` (the repository page) and `/healthz`,
 which answers the body `zlorb-web ok` plus a trailing newline. When the port is already
 taken, `web` exits 1 with an error line instead of panicking. The web UI
@@ -286,10 +286,10 @@ passes or fails.
 | `web_error` | string \| null | Why the web probe failed (connect, timeout, non-HTTP, identity), or null when a status was read |
 | `healthy` | boolean | True only when `daemon_running` is true and `web_status` is a 2xx. The command's exit code follows this field: 0 when true, 1 when false |
 
-The web probe is one HTTP `GET /healthz` to `127.0.0.1:3000` — the
+The web probe is one HTTP `GET /healthz` to `127.0.0.1:3000` by default, or to `127.0.0.1:$ZLORB_WEB_PORT` when that variable is set — the
 address `zlorb-ctl web` binds — under one 3-second deadline, reading at
 most 8 KiB. A 2xx counts only when the response body, trimmed of surrounding
-whitespace, equals `zlorb-web ok`, so a foreign server on port 3000 answering 200 fails the
+whitespace, equals `zlorb-web ok`, so a foreign server on that port answering 200 fails the
 identity check (`web_status` null, `web_error` set) instead of passing
 as the web UI. A server answering a non-2xx status is responding but not
 healthy: `web_responding` true, `web_status` set, `healthy` false.

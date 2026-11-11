@@ -10,6 +10,43 @@ use std::{
 
 use crate::{config::RepositoriesConfigurationFile, error::ZlorbError};
 
+pub const DEFAULT_WEB_PORT: u16 = 3000;
+
+pub fn parse_web_port(raw: Option<&str>) -> Result<u16, ZlorbError> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_WEB_PORT);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(DEFAULT_WEB_PORT);
+    }
+    let port: u16 = trimmed.parse().map_err(|_| {
+        ZlorbError::InvalidConfig(format!(
+            "ZLORB_WEB_PORT '{}' is not a valid port; set it to a number between 1 and 65535 or leave it unset for {}",
+            raw, DEFAULT_WEB_PORT
+        ))
+    })?;
+    if port == 0 {
+        return Err(ZlorbError::InvalidConfig(format!(
+            "ZLORB_WEB_PORT '{}' is not a valid port; set it to a number between 1 and 65535 or leave it unset for {}",
+            raw, DEFAULT_WEB_PORT
+        )));
+    }
+    Ok(port)
+}
+
+pub fn web_port() -> Result<u16, ZlorbError> {
+    parse_web_port(std::env::var("ZLORB_WEB_PORT").ok().as_deref())
+}
+
+pub fn web_probe_addr(port: u16) -> String {
+    format!("127.0.0.1:{}", port)
+}
+
+pub fn web_bind_addr(port: u16) -> String {
+    format!("0.0.0.0:{}", port)
+}
+
 pub fn try_get_home_dir() -> Result<PathBuf, ZlorbError> {
     std::env::home_dir().ok_or(ZlorbError::HomeDirNotFound)
 }
@@ -411,6 +448,42 @@ mod tests {
             !fs::read_to_string(&path).unwrap().contains("demo"),
             "stale contents survived a full replace"
         );
+    }
+
+    #[test]
+    fn web_port_defaults_to_3000_when_unset_or_blank() {
+        assert_eq!(parse_web_port(None).unwrap(), DEFAULT_WEB_PORT);
+        assert_eq!(parse_web_port(Some("")).unwrap(), DEFAULT_WEB_PORT);
+        assert_eq!(parse_web_port(Some("  ")).unwrap(), DEFAULT_WEB_PORT);
+    }
+
+    #[test]
+    fn web_port_parses_a_configured_value() {
+        assert_eq!(parse_web_port(Some("8080")).unwrap(), 8080);
+        assert_eq!(parse_web_port(Some(" 8080 ")).unwrap(), 8080);
+        assert_eq!(parse_web_port(Some("1")).unwrap(), 1);
+        assert_eq!(parse_web_port(Some("65535")).unwrap(), 65535);
+    }
+
+    #[test]
+    fn web_port_rejects_invalid_values_naming_the_env_var() {
+        for raw in ["abc", "0", "65536", "-1", "30x00"] {
+            let err = parse_web_port(Some(raw)).unwrap_err();
+            assert!(
+                format!("{:?}", err).contains("ZLORB_WEB_PORT"),
+                "missing env var name for {:?}: {:?}",
+                raw,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn web_addrs_use_the_configured_port() {
+        assert_eq!(web_probe_addr(3000), "127.0.0.1:3000");
+        assert_eq!(web_probe_addr(49152), "127.0.0.1:49152");
+        assert_eq!(web_bind_addr(3000), "0.0.0.0:3000");
+        assert_eq!(web_bind_addr(49152), "0.0.0.0:49152");
     }
 
     #[test]

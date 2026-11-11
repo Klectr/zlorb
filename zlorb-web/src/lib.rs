@@ -7,12 +7,9 @@ use axum::{
     response::{Html, IntoResponse},
     routing::get,
 };
-use zlorb_lib::{error::ZlorbError, load_config_from_toml};
+use zlorb_lib::{error::ZlorbError, load_config_from_toml, web_bind_addr, web_port};
 
 use crate::template::Index;
-
-const IP: &str = "0.0.0.0";
-const PORT: &str = "3000";
 
 #[tokio::main]
 pub async fn run() -> Result<(), ZlorbError> {
@@ -20,7 +17,7 @@ pub async fn run() -> Result<(), ZlorbError> {
         .route("/", get(get_root))
         .route("/healthz", get(get_health));
 
-    let binding = format!("{IP}:{PORT}");
+    let binding = web_bind_addr(web_port()?);
     let listener = tokio::net::TcpListener::bind(&binding)
         .await
         .map_err(ZlorbError::Io)?;

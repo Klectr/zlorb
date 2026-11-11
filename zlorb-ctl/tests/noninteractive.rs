@@ -268,11 +268,13 @@ fn piping_status_into_a_closed_pipe_does_not_panic() {
 #[test]
 fn web_on_an_occupied_port_fails_with_an_error_line_instead_of_panicking() {
     let root = temp_dir("web-occupied");
-    let held = std::net::TcpListener::bind("127.0.0.1:3000")
-        .expect("port 3000 must be free to hold for this test");
+    let held = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind an ephemeral port to hold for this test");
+    let web_port = held.local_addr().unwrap().port();
     let mut child = Command::new(env!("CARGO_BIN_EXE_zlorb-ctl"))
         .arg("web")
         .env("ZLORB_CONFIG_DIR", root.join("config"))
+        .env("ZLORB_WEB_PORT", web_port.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -306,5 +308,19 @@ fn web_on_an_occupied_port_fails_with_an_error_line_instead_of_panicking() {
     let lines: Vec<&str> = stderr.lines().collect();
     assert_eq!(lines.len(), 1, "stderr must be one line: {:?}", stderr);
     assert!(lines[0].starts_with("error: "), "{}", lines[0]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn web_with_an_invalid_port_fails_with_an_error_line_instead_of_panicking() {
+    let root = temp_dir("web-invalid-port");
+    let output = Command::new(env!("CARGO_BIN_EXE_zlorb-ctl"))
+        .arg("web")
+        .env("ZLORB_CONFIG_DIR", root.join("config"))
+        .env("ZLORB_WEB_PORT", "not-a-port")
+        .output()
+        .unwrap();
+    let line = assert_one_error_line(&output);
+    assert!(line.contains("ZLORB_WEB_PORT"), "{}", line);
     let _ = std::fs::remove_dir_all(&root);
 }
