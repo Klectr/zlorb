@@ -6,10 +6,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
-static PORT_LOCK: Mutex<()> = Mutex::new(());
 
 const FAKE_SYSTEMCTL: &str = r#"#!/bin/sh
 if [ "$1" = "--user" ]; then
@@ -66,13 +65,26 @@ impl FakeDaemon {
         }
     }
 
-    fn run_health(&self, args: &[&str]) -> Output {
+    fn run_health_with_port_value(&self, args: &[&str], web_port: &str) -> Output {
         Command::new(env!("CARGO_BIN_EXE_zlorb-ctl"))
             .arg("health")
             .args(args)
             .env("PATH", &self.bin_dir)
             .env("ZLORB_FAKE_SYSTEMCTL_STATE", &self.state)
             .env("ZLORB_CONFIG_DIR", self.root.join("config"))
+            .env("ZLORB_WEB_PORT", web_port)
+            .output()
+            .unwrap()
+    }
+
+    fn run_health(&self, args: &[&str], web_port: u16) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_zlorb-ctl"))
+            .arg("health")
+            .args(args)
+            .env("PATH", &self.bin_dir)
+            .env("ZLORB_FAKE_SYSTEMCTL_STATE", &self.state)
+            .env("ZLORB_CONFIG_DIR", self.root.join("config"))
+            .env("ZLORB_WEB_PORT", web_port.to_string())
             .output()
             .unwrap()
     }
@@ -87,15 +99,12 @@ impl Drop for FakeDaemon {
 struct WebServer {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
-}
-
-fn port_lock() -> std::sync::MutexGuard<'static, ()> {
-    PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    port: u16,
 }
 
 fn start_web_server(status_line: &'static str) -> WebServer {
-    let listener = TcpListener::bind("127.0.0.1:3000")
-        .expect("port 3000 must be free to stand in for the web UI in this test");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral web port");
+    let port = listener.local_addr().unwrap().port();
     listener.set_nonblocking(true).unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
@@ -138,6 +147,7 @@ fn start_web_server(status_line: &'static str) -> WebServer {
     WebServer {
         stop,
         handle: Some(handle),
+        port,
     }
 }
 
@@ -161,11 +171,10 @@ fn assert_one_error_line(output: &Output) -> String {
 
 #[test]
 fn health_succeeds_when_the_daemon_is_active_and_the_web_answers_200() {
-    let _guard = port_lock();
     let daemon = FakeDaemon::new("healthy", "active");
-    let _web = start_web_server("HTTP/1.0 200 OK");
+    let web = start_web_server("HTTP/1.0 200 OK");
 
-    let text = daemon.run_health(&[]);
+    let text = daemon.run_health(&[], web.port);
     assert!(
         text.status.success(),
         "health failed on a healthy setup: {}{}",
@@ -178,7 +187,7 @@ fn health_succeeds_when_the_daemon_is_active_and_the_web_answers_200() {
     assert!(stdout.contains("healthy: yes"), "{}", stdout);
     assert!(text.stderr.is_empty(), "{}", String::from_utf8_lossy(&text.stderr));
 
-    let json = daemon.run_health(&["--json"]);
+    let json = daemon.run_health(&["--json"], web.port);
     assert!(json.status.success());
     let value: serde_json::Value =
         serde_json::from_slice(&json.stdout).expect("stdout must be one JSON document");
@@ -192,10 +201,9 @@ fn health_succeeds_when_the_daemon_is_active_and_the_web_answers_200() {
 
 #[test]
 fn health_fails_when_a_foreign_server_squats_on_the_web_port() {
-    let _guard = port_lock();
     let daemon = FakeDaemon::new("web-squatted", "active");
-    let listener = TcpListener::bind("127.0.0.1:3000")
-        .expect("port 3000 must be free to stand in for a squatter in this test");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral squatter port");
+    let squatter_port = listener.local_addr().unwrap().port();
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
     let handle = std::thread::spawn(move || {
@@ -220,13 +228,14 @@ fn health_fails_when_a_foreign_server_squats_on_the_web_port() {
     let squatter = WebServer {
         stop,
         handle: Some(handle),
+        port: squatter_port,
     };
 
-    let output = daemon.run_health(&["--json"]);
+    let output = daemon.run_health(&["--json"], squatter_port);
     drop(squatter);
     assert!(
         !output.status.success(),
-        "health succeeded on a foreign server squatting on port 3000"
+        "health succeeded on a foreign server squatting on the web port"
     );
     let value: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("stdout must be one JSON document");
@@ -244,14 +253,12 @@ fn health_fails_when_a_foreign_server_squats_on_the_web_port() {
 
 #[test]
 fn health_fails_when_the_web_is_not_listening() {
-    let _guard = port_lock();
-    let probe = TcpListener::bind("127.0.0.1:3000").expect(
-        "port 3000 must actually be free for the web-down case; something is already listening on it",
-    );
+    let probe = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral web-down port");
+    let web_port = probe.local_addr().unwrap().port();
     drop(probe);
     let daemon = FakeDaemon::new("web-down", "active");
 
-    let output = daemon.run_health(&["--json"]);
+    let output = daemon.run_health(&["--json"], web_port);
     assert!(
         !output.status.success(),
         "health succeeded with no web UI listening"
@@ -276,11 +283,10 @@ fn health_fails_when_the_web_is_not_listening() {
 
 #[test]
 fn health_fails_when_the_daemon_is_inactive_even_if_the_web_answers() {
-    let _guard = port_lock();
     let daemon = FakeDaemon::new("daemon-down", "inactive");
-    let _web = start_web_server("HTTP/1.0 200 OK");
+    let web = start_web_server("HTTP/1.0 200 OK");
 
-    let output = daemon.run_health(&[]);
+    let output = daemon.run_health(&[], web.port);
     assert!(
         !output.status.success(),
         "health succeeded with an inactive daemon"
@@ -295,11 +301,10 @@ fn health_fails_when_the_daemon_is_inactive_even_if_the_web_answers() {
 
 #[test]
 fn health_fails_when_the_web_answers_500() {
-    let _guard = port_lock();
     let daemon = FakeDaemon::new("web-500", "active");
-    let _web = start_web_server("HTTP/1.0 500 Internal Server Error");
+    let web = start_web_server("HTTP/1.0 500 Internal Server Error");
 
-    let output = daemon.run_health(&["--json"]);
+    let output = daemon.run_health(&["--json"], web.port);
     assert!(
         !output.status.success(),
         "health succeeded when the web UI answered 500"
@@ -310,4 +315,38 @@ fn health_fails_when_the_web_answers_500() {
     assert_eq!(value["healthy"], false);
     let line = assert_one_error_line(&output);
     assert!(line.contains("HTTP 500"), "{}", line);
+}
+
+#[test]
+fn health_with_an_invalid_web_port_still_prints_its_report() {
+    let daemon = FakeDaemon::new("bad-port", "active");
+
+    let output = daemon.run_health_with_port_value(&["--json"], "not-a-port");
+    assert!(
+        !output.status.success(),
+        "health succeeded with an invalid ZLORB_WEB_PORT"
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout must be one JSON document");
+    assert_eq!(value["daemon_running"], true);
+    assert_eq!(value["web_responding"], false);
+    assert_eq!(value["web_status"], serde_json::Value::Null);
+    assert!(
+        value["web_error"]
+            .as_str()
+            .expect("web_error must be reported")
+            .contains("ZLORB_WEB_PORT"),
+        "{}",
+        value
+    );
+    assert_eq!(value["healthy"], false);
+    let line = assert_one_error_line(&output);
+    assert!(line.contains("ZLORB_WEB_PORT"), "{}", line);
+
+    let text = daemon.run_health_with_port_value(&[], "not-a-port");
+    assert!(!text.status.success());
+    let stdout = String::from_utf8_lossy(&text.stdout).into_owned();
+    assert!(stdout.contains("daemon: running"), "{}", stdout);
+    assert!(stdout.contains("web: not responding"), "{}", stdout);
+    assert!(stdout.contains("healthy: no"), "{}", stdout);
 }

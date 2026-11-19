@@ -8,7 +8,6 @@ use zlorb_lib::error::ZlorbError;
 
 use crate::utils::daemon::DaemonManager;
 
-pub const WEB_PROBE_ADDR: &str = "127.0.0.1:3000";
 const WEB_HEALTH_PATH: &str = "/healthz";
 const WEB_IDENTITY_BODY: &str = "zlorb-web ok";
 const PROBE_DEADLINE: Duration = Duration::from_secs(3);
@@ -270,8 +269,19 @@ fn failure_reasons(report: &HealthReport) -> Vec<String> {
     reasons
 }
 
+pub fn web_probe_addr() -> Result<String, ZlorbError> {
+    Ok(zlorb_lib::web_probe_addr(zlorb_lib::web_port()?))
+}
+
 pub(crate) fn health(json: bool) -> Result<(), ZlorbError> {
-    let report = build_report(DaemonManager::is_running(), probe_web_at(WEB_PROBE_ADDR));
+    let web = match web_probe_addr() {
+        Ok(addr) => probe_web_at(&addr),
+        Err(e) => WebProbe {
+            status: None,
+            error: Some(error_text(&e)),
+        },
+    };
+    let report = build_report(DaemonManager::is_running(), web);
     if json {
         match serde_json::to_string_pretty(&report) {
             Ok(rendered) => println!("{}", rendered),
