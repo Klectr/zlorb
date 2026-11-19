@@ -7936,6 +7936,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(900));
             drop(donor);
         });
+        let script_started = std::time::Instant::now();
         let mut escapee = Command::new("setsid")
             .arg(&script)
             .arg(std::process::id().to_string())
@@ -7961,7 +7962,7 @@ mod tests {
                         && !process_pipe_write_targets(pid, std::slice::from_ref(&target))
                             .is_empty()
                     {
-                        holding_since = Some(started.elapsed());
+                        holding_since = Some(script_started.elapsed());
                     }
                     if holding_since.is_some() && !process_is_running(pid as i32) {
                         break;
