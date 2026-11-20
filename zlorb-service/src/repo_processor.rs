@@ -7951,6 +7951,8 @@ mod tests {
             let started = std::time::Instant::now();
             let mut late_pid = None;
             let mut holding_since = None;
+            let mut early_holding = None;
+            let mut was_holding = false;
             while started.elapsed() < std::time::Duration::from_millis(2500) {
                 if late_pid.is_none() {
                     if let Ok(text) = std::fs::read_to_string(&pid_path) {
@@ -7958,19 +7960,28 @@ mod tests {
                     }
                 }
                 if let Some(pid) = late_pid {
-                    if holding_since.is_none()
-                        && !process_pipe_write_targets(pid, std::slice::from_ref(&target))
-                            .is_empty()
-                    {
-                        holding_since = Some(script_started.elapsed());
+                    let holding =
+                        !process_pipe_write_targets(pid, std::slice::from_ref(&target)).is_empty();
+                    if holding {
+                        let elapsed = script_started.elapsed();
+                        if !was_holding {
+                            holding_since = Some(elapsed);
+                        }
+                        if early_holding.is_none()
+                            && elapsed >= std::time::Duration::from_millis(100)
+                            && elapsed < std::time::Duration::from_millis(500)
+                        {
+                            early_holding = Some(elapsed);
+                        }
                     }
+                    was_holding = holding;
                     if holding_since.is_some() && !process_is_running(pid as i32) {
                         break;
                     }
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            (late_pid, holding_since)
+            (late_pid, holding_since, early_holding)
         });
         let (mut child, pgid) = spawn_sleep_group();
         let mut drains = PipeDrains::new(out_read, closed_pipe_pair());
@@ -7992,13 +8003,17 @@ mod tests {
                 panic!("setsid process holding the pipe was not killed at the drain deadline");
             }
         }
-        let (late_pid, holding_since) = observer.join().unwrap();
+        let (late_pid, holding_since, early_holding) = observer.join().unwrap();
         let late_pid = late_pid.expect("the late holder script never recorded its pid");
         let holding_since =
             holding_since.expect("the late holder was never observed holding the target pipe");
         assert!(
             holding_since >= std::time::Duration::from_millis(500),
             "the late holder grabbed the pipe too early: {holding_since:?}"
+        );
+        assert!(
+            early_holding.is_none(),
+            "the late holder held the pipe before its scheduled grab: {early_holding:?}"
         );
         let mut late_dead = false;
         for _ in 0..60 {
