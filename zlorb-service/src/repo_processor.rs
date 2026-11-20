@@ -4531,6 +4531,17 @@ mod tests {
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    fn assert_cmd_success(output: std::process::Output, what: &str) {
+        assert!(
+            output.status.success(),
+            "{} failed: status={} stdout={} stderr={}",
+            what,
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     fn temp_dir(label: &str) -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!(
@@ -5716,23 +5727,23 @@ mod tests {
     }
 
     fn set_repo_config(watched: &Path, key: &str, value: &str) {
-        let status = std::process::Command::new("git")
+        let output = std::process::Command::new("git")
             .arg("-C")
             .arg(watched)
             .args(["config", key, value])
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success());
+        assert_cmd_success(output, &format!("git config set {}={} in {}", key, value, watched.display()));
     }
 
     fn set_index_flag(watched: &Path, flag: &str, path: &str) {
-        let status = std::process::Command::new("git")
+        let output = std::process::Command::new("git")
             .arg("-C")
             .arg(watched)
             .args(["update-index", flag, path])
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success());
+        assert_cmd_success(output, &format!("git update-index {} {} in {}", flag, path, watched.display()));
     }
 
     fn repo_reset_to_v1_with_upstream_v2(
@@ -7025,13 +7036,13 @@ mod tests {
     }
 
     fn unset_repo_config(watched: &Path, key: &str) {
-        let status = std::process::Command::new("git")
+        let output = std::process::Command::new("git")
             .arg("-C")
             .arg(watched)
             .args(["config", "--unset", key])
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success());
+        assert_cmd_success(output, &format!("git config --unset {} in {}", key, watched.display()));
     }
 
     fn process_filter_entry_id(watched: &Path) -> Oid {
@@ -7267,13 +7278,13 @@ mod tests {
         let (root, watched_path, v1, _v2) =
             external_filter_repo("external-filter-staged", "version two\n");
         std::fs::write(watched_path.join("data.txt"), "Xgoodbye\n").unwrap();
-        let status = std::process::Command::new("git")
+        let output = std::process::Command::new("git")
             .arg("-C")
             .arg(&watched_path)
             .args(["add", "data.txt"])
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success());
+        assert_cmd_success(output, &format!("git add data.txt in {}", watched_path.display()));
         let processor = processor_for(&watched_path);
         assert_eq!(
             processor._tracked_local_changes().unwrap().changes,
@@ -7518,13 +7529,13 @@ mod tests {
         drop(watched);
         set_repo_config(&watched_path, "filter.strip.clean", "head -c 0");
         std::fs::write(watched_path.join("new.txt"), "anything\n").unwrap();
-        let status = std::process::Command::new("git")
+        let output = std::process::Command::new("git")
             .arg("-C")
             .arg(&watched_path)
             .args(["add", "-N", "new.txt"])
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success());
+        assert_cmd_success(output, &format!("git add -N new.txt in {}", watched_path.display()));
         let processor = processor_for(&watched_path);
         assert_eq!(
             processor._tracked_local_changes().unwrap().changes,
@@ -12558,13 +12569,13 @@ mod tests {
         std::fs::write(source_path.join("src/main.rs"), "fn main() {}\n").unwrap();
         let v2 = commit_all(&source, "v2");
         drop(source);
-        let status = std::process::Command::new("git")
+        let output = std::process::Command::new("git")
             .args(["clone", "--bare"])
             .arg(&source_path)
             .arg(&bare_path)
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success());
+        assert_cmd_success(output, &format!("git clone --bare {} {}", source_path.display(), bare_path.display()));
         let bare = git2::Repository::open(&bare_path).unwrap();
         assert!(bare.workdir().is_none());
         assert!(bare.find_commit(v1).unwrap().tree().is_ok());
@@ -12876,13 +12887,13 @@ mod tests {
 
     fn bare_clone_at_gitlink(watched_path: &Path, root: &Path) {
         let bare_tmp = root.join("bare-clone");
-        let status = std::process::Command::new("git")
+        let output = std::process::Command::new("git")
             .args(["clone", "--bare"])
             .arg(watched_path.join("sub"))
             .arg(&bare_tmp)
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success());
+        assert_cmd_success(output, &format!("git clone --bare {} {}", watched_path.join("sub").display(), bare_tmp.display()));
         std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
         std::fs::rename(&bare_tmp, watched_path.join("sub")).unwrap();
     }
@@ -12965,13 +12976,13 @@ mod tests {
         std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
         let gitdir = watched_path.join(".git/modules/sub");
         std::fs::create_dir_all(watched_path.join(".git/modules")).unwrap();
-        let status = std::process::Command::new("git")
+        let output = std::process::Command::new("git")
             .args(["init", "-b", "master", "--separate-git-dir"])
             .arg(&gitdir)
             .arg(watched_path.join("sub"))
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success());
+        assert_cmd_success(output, &format!("git init --separate-git-dir {} {}", gitdir.display(), watched_path.join("sub").display()));
     }
 
     #[test]
@@ -13853,11 +13864,11 @@ mod tests {
         std::fs::remove_file(watched_path.join("stale-link.txt")).unwrap();
         std::os::unix::fs::symlink("src/main.rs", watched_path.join("stale-link.txt")).unwrap();
         std::fs::remove_file(watched_path.join("fifo.txt")).unwrap();
-        let mkfifo = std::process::Command::new("mkfifo")
+        let output = std::process::Command::new("mkfifo")
             .arg(watched_path.join("fifo.txt"))
-            .status()
+            .output()
             .unwrap();
-        assert!(mkfifo.success());
+        assert_cmd_success(output, &format!("mkfifo {}", watched_path.join("fifo.txt").display()));
 
         processor_for(&watched_path)._remove_partial_update_files(v1, v2);
 
