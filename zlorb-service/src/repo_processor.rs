@@ -6246,7 +6246,49 @@ mod tests {
         }
 
         let processor = processor_for(&watched_path);
-        assert!(processor._tracked_local_changes().unwrap().changes.is_empty());
+        let tracked = processor._tracked_local_changes().unwrap();
+        if !tracked.changes.is_empty() {
+            use std::os::unix::fs::MetadataExt;
+            let stat_desc = if tracked.changes.contains(&PathBuf::from("src/main.rs")) {
+                let entry_desc = match git2::Repository::open(&watched_path)
+                    .and_then(|watched| watched.index())
+                {
+                    Ok(index) => match index.get_path(Path::new("src/main.rs"), 0) {
+                        Some(entry) => format!(
+                            "ino={} size={} mtime={}.{:09} ctime={}.{:09}",
+                            entry.ino,
+                            entry.file_size,
+                            entry.mtime.seconds(),
+                            entry.mtime.nanoseconds(),
+                            entry.ctime.seconds(),
+                            entry.ctime.nanoseconds(),
+                        ),
+                        None => "missing".to_string(),
+                    },
+                    Err(e) => format!("unreadable: {e}"),
+                };
+                let file_desc = match std::fs::symlink_metadata(watched_path.join("src/main.rs")) {
+                    Ok(metadata) => format!(
+                        "ino={} size={} mode={:o} mtime={}.{:09} ctime={}.{:09}",
+                        metadata.ino() as u32,
+                        metadata.len(),
+                        metadata.mode(),
+                        metadata.mtime(),
+                        metadata.mtime_nsec(),
+                        metadata.ctime(),
+                        metadata.ctime_nsec(),
+                    ),
+                    Err(e) => format!("unreadable: {e}"),
+                };
+                format!(" entry {entry_desc} file {file_desc}")
+            } else {
+                String::new()
+            };
+            panic!(
+                "tracked changes reported in matching-stat test: changes={:?} unverifiable={:?}{}",
+                tracked.changes, tracked.unverifiable, stat_desc
+            );
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
