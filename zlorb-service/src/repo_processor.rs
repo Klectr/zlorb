@@ -4531,7 +4531,7 @@ mod tests {
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    fn assert_cmd_success(output: std::process::Output, what: &str) {
+    fn assert_cmd_success(output: &std::process::Output, what: &str) {
         assert!(
             output.status.success(),
             "{} failed: status={} stdout={} stderr={}",
@@ -4951,7 +4951,7 @@ mod tests {
         let artifact = fixture_artifact(&watched_path);
         assert!(artifact.exists());
         let output = std::process::Command::new(&artifact).output().unwrap();
-        assert!(output.status.success());
+        assert_cmd_success(&output, &format!("run built artifact {}", artifact.display()));
         assert!(
             String::from_utf8_lossy(&output.stdout).contains("fixture-version-two")
         );
@@ -5069,7 +5069,7 @@ mod tests {
         let artifact = fixture_artifact(&watched_path);
         assert!(artifact.exists());
         let output = std::process::Command::new(&artifact).output().unwrap();
-        assert!(output.status.success());
+        assert_cmd_success(&output, &format!("run built artifact {}", artifact.display()));
         assert!(
             String::from_utf8_lossy(&output.stdout).contains("fixture-version-two")
         );
@@ -5136,7 +5136,7 @@ mod tests {
         let artifact = fixture_artifact(&watched_path);
         assert!(artifact.exists());
         let output = std::process::Command::new(&artifact).output().unwrap();
-        assert!(output.status.success());
+        assert_cmd_success(&output, &format!("run built artifact {}", artifact.display()));
         assert!(
             String::from_utf8_lossy(&output.stdout).contains("fixture-version-two")
         );
@@ -5195,7 +5195,7 @@ mod tests {
         let artifact = fixture_artifact(&watched_path);
         assert!(artifact.exists());
         let output = std::process::Command::new(&artifact).output().unwrap();
-        assert!(output.status.success());
+        assert_cmd_success(&output, &format!("run built artifact {}", artifact.display()));
         assert!(
             String::from_utf8_lossy(&output.stdout).contains("fixture-version-one")
         );
@@ -5234,7 +5234,7 @@ mod tests {
         let artifact = fixture_artifact(&watched_path);
         assert!(artifact.exists());
         let output = std::process::Command::new(&artifact).output().unwrap();
-        assert!(output.status.success());
+        assert_cmd_success(&output, &format!("run built artifact {}", artifact.display()));
         assert!(
             String::from_utf8_lossy(&output.stdout).contains("fixture-version-one")
         );
@@ -5302,7 +5302,7 @@ mod tests {
         let artifact = fixture_artifact(&watched_path);
         assert!(artifact.exists());
         let output = std::process::Command::new(&artifact).output().unwrap();
-        assert!(output.status.success());
+        assert_cmd_success(&output, &format!("run built artifact {}", artifact.display()));
         assert!(
             String::from_utf8_lossy(&output.stdout).contains("fixture-version-two")
         );
@@ -5733,7 +5733,7 @@ mod tests {
             .args(["config", key, value])
             .output()
             .unwrap();
-        assert_cmd_success(output, &format!("git config set {}={} in {}", key, value, watched.display()));
+        assert_cmd_success(&output, &format!("git config set {}={} in {}", key, value, watched.display()));
     }
 
     fn set_index_flag(watched: &Path, flag: &str, path: &str) {
@@ -5743,7 +5743,7 @@ mod tests {
             .args(["update-index", flag, path])
             .output()
             .unwrap();
-        assert_cmd_success(output, &format!("git update-index {} {} in {}", flag, path, watched.display()));
+        assert_cmd_success(&output, &format!("git update-index {} {} in {}", flag, path, watched.display()));
     }
 
     fn repo_reset_to_v1_with_upstream_v2(
@@ -7084,7 +7084,7 @@ mod tests {
             .args(["config", "--unset", key])
             .output()
             .unwrap();
-        assert_cmd_success(output, &format!("git config --unset {} in {}", key, watched.display()));
+        assert_cmd_success(&output, &format!("git config --unset {} in {}", key, watched.display()));
     }
 
     fn process_filter_entry_id(watched: &Path) -> Oid {
@@ -7326,7 +7326,7 @@ mod tests {
             .args(["add", "data.txt"])
             .output()
             .unwrap();
-        assert_cmd_success(output, &format!("git add data.txt in {}", watched_path.display()));
+        assert_cmd_success(&output, &format!("git add data.txt in {}", watched_path.display()));
         let processor = processor_for(&watched_path);
         assert_eq!(
             processor._tracked_local_changes().unwrap().changes,
@@ -7577,7 +7577,7 @@ mod tests {
             .args(["add", "-N", "new.txt"])
             .output()
             .unwrap();
-        assert_cmd_success(output, &format!("git add -N new.txt in {}", watched_path.display()));
+        assert_cmd_success(&output, &format!("git add -N new.txt in {}", watched_path.display()));
         let processor = processor_for(&watched_path);
         assert_eq!(
             processor._tracked_local_changes().unwrap().changes,
@@ -12617,7 +12617,7 @@ mod tests {
             .arg(&bare_path)
             .output()
             .unwrap();
-        assert_cmd_success(output, &format!("git clone --bare {} {}", source_path.display(), bare_path.display()));
+        assert_cmd_success(&output, &format!("git clone --bare {} {}", source_path.display(), bare_path.display()));
         let bare = git2::Repository::open(&bare_path).unwrap();
         assert!(bare.workdir().is_none());
         assert!(bare.find_commit(v1).unwrap().tree().is_ok());
@@ -12935,7 +12935,7 @@ mod tests {
             .arg(&bare_tmp)
             .output()
             .unwrap();
-        assert_cmd_success(output, &format!("git clone --bare {} {}", watched_path.join("sub").display(), bare_tmp.display()));
+        assert_cmd_success(&output, &format!("git clone --bare {} {}", watched_path.join("sub").display(), bare_tmp.display()));
         std::fs::remove_dir_all(watched_path.join("sub")).unwrap();
         std::fs::rename(&bare_tmp, watched_path.join("sub")).unwrap();
     }
@@ -13024,7 +13024,7 @@ mod tests {
             .arg(watched_path.join("sub"))
             .output()
             .unwrap();
-        assert_cmd_success(output, &format!("git init --separate-git-dir {} {}", gitdir.display(), watched_path.join("sub").display()));
+        assert_cmd_success(&output, &format!("git init --separate-git-dir {} {}", gitdir.display(), watched_path.join("sub").display()));
     }
 
     #[test]
@@ -13830,6 +13830,7 @@ mod tests {
         drop(watched);
         let artifact = fixture_artifact(&watched_path);
         let output = std::process::Command::new(&artifact).output().unwrap();
+        assert_cmd_success(&output, &format!("run built artifact {}", artifact.display()));
         assert!(
             String::from_utf8_lossy(&output.stdout).contains("fixture-version-two")
         );
@@ -13910,7 +13911,7 @@ mod tests {
             .arg(watched_path.join("fifo.txt"))
             .output()
             .unwrap();
-        assert_cmd_success(output, &format!("mkfifo {}", watched_path.join("fifo.txt").display()));
+        assert_cmd_success(&output, &format!("mkfifo {}", watched_path.join("fifo.txt").display()));
 
         processor_for(&watched_path)._remove_partial_update_files(v1, v2);
 
@@ -14649,7 +14650,7 @@ mod tests {
         let artifact = fixture_artifact(&watched_path);
         assert!(artifact.exists());
         let output = std::process::Command::new(&artifact).output().unwrap();
-        assert!(output.status.success());
+        assert_cmd_success(&output, &format!("run built artifact {}", artifact.display()));
         assert!(
             String::from_utf8_lossy(&output.stdout).contains("fixture-version-two")
         );
@@ -14715,7 +14716,7 @@ mod tests {
         let artifact = fixture_artifact(&watched_path);
         assert!(artifact.exists());
         let output = std::process::Command::new(&artifact).output().unwrap();
-        assert!(output.status.success());
+        assert_cmd_success(&output, &format!("run built artifact {}", artifact.display()));
         assert!(
             String::from_utf8_lossy(&output.stdout).contains("fixture-version-two")
         );
@@ -14913,6 +14914,7 @@ mod tests {
         );
         let artifact = fixture_artifact(&watched_path);
         let output = std::process::Command::new(&artifact).output().unwrap();
+        assert_cmd_success(&output, &format!("run built artifact {}", artifact.display()));
         assert!(
             String::from_utf8_lossy(&output.stdout).contains("fixture-version-three")
         );
